@@ -5,9 +5,13 @@ description: Author `genui` fenced blocks — declarative, stateful, interactive
 
 # GenUI surface authoring
 
-Emit one ```` ```genui ```` fence per interactive surface. The block is two regions:
-`{@state}` directives first, then JSX-like markup. Only a *committed* fence
-(closing ```` ``` ````) renders — a surface never half-mounts.
+Use ordinary Markdown for prose, lists, and tables. Embed a static `icon` or
+`badge` directly in that Markdown. Use a fenced `genui` block for cards, other
+catalog layouts, controls, and values that depend on state. Put every control
+and display that shares state in the same fence, even across several cards.
+
+Start the fence with any `{@state}` directives, followed by JSX-like markup.
+The surface renders once the fence closes.
 
 ```genui
 {@state const [value, setValue] = useState(65)}
@@ -49,20 +53,25 @@ Leaf, presentational tags also work inside ordinary markdown — sentences,
 table cells, list items — with literal props only:
 
 ```markdown
-| 检查项 | #2620 |
-|---|---|
-| CLI tests | <icon name="x-circle" color="danger" inline/> 失败 |
+| 检查项    | #2620                                        |
+| --------- | -------------------------------------------- |
+| CLI tests | <icon name="x-circle" color="danger" /> 失败 |
 
 服务在线 <badge tone="success">running</badge>，一个仍在启动 <badge tone="warning">pending</badge>。
 ```
 
-- Allowed tags: `icon`, `badge` (the `GENUI_INLINE_TAGS` allowlist).
-- Self-closing `<icon ... />`, or the pair form `<badge ...>plain text</badge>`.
-- Literal props and plain-text children only — `{expr}`, events, or nested
-  markup keep the tag as raw text. A half-written tag renders as text until
-  it closes.
-- `icon` inline props: `name`, `color` (danger/success/warning/accent),
-  `size`; `inline` is accepted and ignored — inline tags always render inline.
+- Write a self-closing `<icon ... />` or a pair
+  `<badge tone="warning">Pending</badge>` directly in Markdown. Backticks show
+  the source as code.
+- Use quoted literal prop values and a plain-text badge label. Escape Markdown
+  punctuation that should be visible, for example
+  `<badge tone="warning">\*Pending\*</badge>` for the label `*Pending*`.
+  Markup inside the label prevents the badge pair from rendering.
+- Inline tags have no state or callbacks. Braces in a badge label are literal
+  characters. Use a fenced badge for a dynamic label or tone.
+- Inline `icon` takes quoted `name` and optional `color`
+  (danger/success/warning/accent). It renders at 14 px. Use a fenced icon with
+  `size={20}` for a custom size. The legacy `inline` prop has no effect.
 
 ## Catalog index
 
