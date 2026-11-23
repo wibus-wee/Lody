@@ -1,5 +1,7 @@
 import {
   parseGitHubPullRequestUrl,
+  parsePullRequestUrl,
+  readSessionPullRequestLinks,
   resolveSessionPullRequests,
   type SessionPullRequestSource,
   resolveProjectGitHubRepo,
@@ -27,6 +29,12 @@ export type PrPollStatusTarget = {
   repoFullName: string;
   prNumber: number;
   status: PrStatus;
+  /**
+   * An explicitly linked PR not yet in `pullRequests`: queried by number so a
+   * valid provider result can be associated. `unreadable` once a check failed
+   * for this link generation (retried at the slower discovery cadence).
+   */
+  pendingLink?: 'checking' | 'unreadable';
 };
 
 /**
@@ -165,6 +173,16 @@ export function computePrPollMetaSignature(
   return [
     meta.machineId ?? '',
     meta.parentSessionId ?? '',
+    // Raw membership: an unlinked URL still in the list needs a local removal.
+    (meta.pullRequests ?? []).map((pr) => pr.url).join('\u0001'),
+    JSON.stringify(
+      readSessionPullRequestLinks(meta).map((link) => [
+        link.key,
+        link.state,
+        link.at,
+        link.unreadableAt,
+      ])
+    ),
     meta.isArchived ? '1' : '0',
     meta.lastMessageAt ?? '',
     resolveDiscoveryBranch(meta) ?? '',
@@ -297,14 +315,17 @@ function maxNullable(a: number | null, b: number | null): number | null {
   return Math.max(a, b);
 }
 
-function collectStatusTargets(ownerMeta: SessionMeta): PrPollStatusTarget[] {
+export function collectStatusTargets(
+  ownerMeta: SessionMeta,
+  includeTerminal = false
+): PrPollStatusTarget[] {
   const targets: PrPollStatusTarget[] = [];
   const seen = new Set<string>();
   const resolved = resolveSessionPullRequests(ownerMeta);
   for (const [index, pr] of resolved.entries()) {
     // Refresh once until legacy readers receive the same lifecycle projection.
     const needsProjection = ownerMeta.pullRequests?.[index]?.status !== pr.status;
-    if (pr.status !== 'open' && pr.status !== 'draft' && !needsProjection) {
+    if (!includeTerminal && pr.status !== 'open' && pr.status !== 'draft' && !needsProjection) {
       continue;
     }
     const parsed = parseGitHubPullRequestUrl(pr.url);
@@ -318,6 +339,31 @@ function collectStatusTargets(ownerMeta: SessionMeta): PrPollStatusTarget[] {
       repoFullName: parsed.repoFullName,
       prNumber: parsed.prNumber,
       status: pr.status,
+      ...(includeTerminal && ownerMeta.projectRun
+        ? {
+            nativeCredentials: Object.entries(ownerMeta.projectRun.members).some(
+              ([memberId, member]) =>
+                projectMemberRepositoryContext(ownerMeta, memberId).repoFullName?.toLowerCase() ===
+                  parsed.repoFullName.toLowerCase() &&
+                (member.src.kind === 'local' || member.repositoryCheckout?.kind === 'local')
+            ),
+          }
+        : {}),
+    });
+  }
+  const associatedKeys = new Set(
+    resolved.map((pr) => parsePullRequestUrl(pr.url)?.key ?? pr.url.toLowerCase())
+  );
+  for (const link of readSessionPullRequestLinks(ownerMeta)) {
+    const parts = link.supported ? parsePullRequestUrl(link.url) : null;
+    if (link.state !== 'linked' || !parts || associatedKeys.has(parts.key)) continue;
+    associatedKeys.add(parts.key);
+    targets.push({
+      url: parts.canonicalUrl,
+      repoFullName: parts.repoFullName,
+      prNumber: parts.number,
+      status: 'open',
+      pendingLink: link.unreadableAt === null ? 'checking' : 'unreadable',
     });
   }
   return targets;

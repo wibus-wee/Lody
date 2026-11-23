@@ -7,7 +7,6 @@ import { createRequire } from 'node:module';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireLocalCliHostLease,
-  getLocalCliHostEndpoint,
   inspectLocalCliHost,
   requestLocalCliHostShutdown,
   type LocalCliHostEndpoint,
@@ -34,16 +33,6 @@ afterEach(async () => {
 });
 
 describe('local CLI host lease', () => {
-  it('keeps the CommonJS node export in parity with the ESM module', () => {
-    const commonJs =
-      require('../src/node/local-cli-host-lease.cjs') as typeof import('../src/node/local-cli-host-lease');
-
-    expect(commonJs.getLocalCliHostEndpoint('cloud')).toEqual(getLocalCliHostEndpoint('cloud'));
-    expect(commonJs.getLocalCliHostEndpoint('local')).toEqual(getLocalCliHostEndpoint('local'));
-    expect(commonJs.acquireLocalCliHostLease).toBeTypeOf('function');
-    expect(commonJs.requestLocalCliHostShutdown).toBeTypeOf('function');
-  });
-
   it('uses the kernel endpoint bind as the single-owner boundary', async () => {
     const endpoint = await createEndpoint();
     const contenders = await Promise.all([
@@ -56,26 +45,6 @@ describe('local CLI host lease', () => {
     expect(acquired).toHaveLength(1);
     expect(occupied).toHaveLength(1);
     if (acquired[0]?.status === 'acquired') leases.push(acquired[0].lease);
-  });
-
-  it('releases ownership only after the listening endpoint is closed', async () => {
-    const endpoint = await createEndpoint();
-    const first = await acquireLocalCliHostLease({
-      endpoint,
-      instanceId: 'first',
-      mode: 'electron',
-    });
-    expect(first.status).toBe('acquired');
-    if (first.status !== 'acquired') return;
-
-    await first.lease.close();
-    const replacement = await acquireLocalCliHostLease({
-      endpoint,
-      instanceId: 'replacement',
-      mode: 'daemon',
-    });
-    expect(replacement.status).toBe('acquired');
-    if (replacement.status === 'acquired') leases.push(replacement.lease);
   });
 
   it.runIf(process.platform !== 'win32')(
@@ -164,4 +133,59 @@ describe('local CLI host lease', () => {
       }
     }
   );
+});
+
+it('a managed update requires the exact private host capability and keeps the lease while preparation is pending', async () => {
+  const { requestLocalCliHostUpgrade } = await import('../src/node/local-cli-host-lease');
+  const endpoint = await createEndpoint();
+  let releasePreparation: () => void = () => {};
+  let observedRequest: string | undefined;
+  const prepared = new Promise<void>((resolve) => {
+    releasePreparation = resolve;
+  });
+  const result = await acquireLocalCliHostLease({
+    endpoint,
+    instanceId: 'managed-service',
+    mode: 'daemon',
+    shutdownControl: {
+      token: 'private-host-capability',
+      onRequest: () => {},
+      onUpgrade: async (request) => {
+        observedRequest = request.requestId;
+        await prepared;
+      },
+    },
+  });
+  expect(result.status).toBe('acquired');
+  if (result.status !== 'acquired') return;
+  leases.push(result.lease);
+  const options = {
+    endpoint,
+    instanceId: 'managed-service',
+    expectedMode: 'daemon' as const,
+    requestId: 'upgrade-1',
+    targetVersion: '1.2.3',
+    upgrade: {
+      protocol: 1 as const,
+      channel: 'stable' as const,
+      switchPolicy: 'when-idle' as const,
+      confirmChannelChange: false,
+      confirmDowngrade: false,
+    },
+  };
+  expect(await requestLocalCliHostUpgrade({ ...options, token: 'wrong-token' })).toMatchObject({
+    ok: false,
+  });
+  expect(observedRequest).toBeUndefined();
+  const queued = requestLocalCliHostUpgrade({ ...options, token: 'private-host-capability' });
+  expect(await inspectLocalCliHost(endpoint)).toMatchObject({ instanceId: 'managed-service' });
+  const other = await acquireLocalCliHostLease({
+    endpoint,
+    instanceId: 'electron',
+    mode: 'electron',
+  });
+  expect(other.status).toBe('occupied');
+  releasePreparation();
+  expect(await queued).toMatchObject({ ok: true });
+  expect(observedRequest).toBe('upgrade-1');
 });

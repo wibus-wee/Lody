@@ -20,10 +20,15 @@ import * as React from 'react';
 import type { ContentElement } from './mention-content';
 import {
   applyMentionSplice,
+  getMentionValuesFromMentions,
   resolveMentionInsertPrefix,
   type MentionSplice,
 } from './mention-input-core';
-import type { InputElement } from './mention-input';
+import {
+  getComposerSelection,
+  getComposerText,
+  type ComposerInputElement as InputElement,
+} from './composer-input';
 import type { ItemElement } from './mention-item';
 
 function getDataState(open: boolean) {
@@ -98,37 +103,14 @@ export type MentionPrepare = (request: {
   end: number;
 }) => Promise<PreparedMention | null>;
 
-/**
- * A chip decoration for a committed mention range.
- *
- * The highlighter mirrors the textarea character for character, so the caret
- * only stays aligned while every rendered range keeps the *same advance width*
- * as the raw text underneath it. A chip therefore may only paint — background,
- * colour, and an icon drawn over characters the range already contains. It may
- * not add horizontal padding, margin, or border, nor change font size, weight,
- * family, or letter spacing.
- *
- * `iconSlots` and `trailingSlots` are how a chip buys room without buying
- * width: those leading/trailing characters of the range keep their exact boxes
- * and are simply not painted, so the icon sits over the trigger character and
- * the trailing character reads as right padding.
- */
+/** The custom view of an atomic node; the editor owns its canonical text. */
 interface MentionChip {
-  /** Painted over the range's first `iconSlots` characters. */
   icon?: React.ReactNode;
-  /**
-   * Chip body classes — colour only, per the width rule above.
-   *
-   * The primitive supplies the opaque cover that hides the textarea's own
-   * glyphs, painted in `--mention-chip-surface`. That variable must be set on
-   * whatever container actually paints the background behind the textarea, or
-   * the cover reads as a rectangle instead of disappearing into the surface.
-   */
   className?: string;
-  /** Leading characters of the range surrendered to the icon. @default 1 */
-  iconSlots?: number;
-  /** Trailing characters of the range left blank as right padding. @default 0 */
-  trailingSlots?: number;
+  /** Canonical prefix omitted from the visible label. @default 1 */
+  textPrefixLength?: number;
+  /** Canonical suffix omitted from the visible label. @default 0 */
+  textSuffixLength?: number;
 }
 
 /**
@@ -137,7 +119,7 @@ interface MentionChip {
  */
 type MentionChipResolver = (
   mention: Mention,
-  /** The range's current text, so a resolver can size its slots from it. */
+  /** The canonical text, including any delimiters omitted by the view. */
   text: string
 ) => MentionChip | null | undefined;
 
@@ -221,6 +203,7 @@ interface MentionContextValue {
    * this package.
    */
   onMentionInsert: (request: MentionInsertRequest | MentionInsertRequest[]) => void;
+  onHistoryMove: (direction: -1 | 1) => boolean;
   /**
    * Pop the text between the trigger and the caret back to the bare trigger,
    * undoing one drill-down step. Returns false when there is no trigger to pop
@@ -232,6 +215,7 @@ interface MentionContextValue {
   onMentionsRemove: (mentionsToRemove: Mention[]) => void;
   onMentionClick?: (mention: Mention) => void;
   getMentionChip?: MentionChipResolver;
+
   pendingSelection: MentionSelectionRange | null;
   onPendingSelectionChange: React.Dispatch<React.SetStateAction<MentionSelectionRange | null>>;
   dir: Direction;
@@ -282,6 +266,10 @@ interface MentionRootProps extends Omit<
 
   /** The default mention ranges rendered inside the input. */
   defaultMentions?: Mention[];
+
+  /** Keep text and atomic ranges in the same undo transaction. */
+  undoHistory?: boolean;
+  onHistoryRetainValues?: (values: ReadonlySet<string>) => void;
 
   /** Event handler called when mention ranges change. */
   onMentionsChange?: (mentions: Mention[]) => void;
@@ -404,6 +392,8 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
     onMentionsChange: onMentionsChangeProp,
     onMentionClick,
     getMentionChip,
+    undoHistory = false,
+    onHistoryRetainValues,
     value: valueProp,
     defaultValue,
     onValueChange,
@@ -520,6 +510,63 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
   const [pendingSelection, setPendingSelection] = React.useState<MentionSelectionRange | null>(
     null
   );
+  const editHistory = React.useRef({
+    entries: [{ text: inputValue, mentions: [...mentions] }],
+    index: 0,
+    restoring: false,
+  });
+  React.useLayoutEffect(() => {
+    const history = editHistory.current;
+    if (disabled || readonly) return;
+    const publishRetainedValues = () =>
+      onHistoryRetainValues?.(
+        new Set(history.entries.flatMap((entry) => entry.mentions.map((mention) => mention.value)))
+      );
+    if (!undoHistory) {
+      history.entries = [{ text: inputValue, mentions: [...mentions] }];
+      history.index = 0;
+      publishRetainedValues();
+      return;
+    }
+    const current = history.entries[history.index];
+    const snapshot = { text: inputValue, mentions: [...mentions] };
+    if (history.restoring || current?.text === inputValue) {
+      history.entries[history.index] = snapshot;
+      history.restoring = false;
+      publishRetainedValues();
+      return;
+    }
+    history.entries.splice(history.index + 1);
+    history.entries.push(snapshot);
+    if (history.entries.length > 100) history.entries.shift();
+    history.index = history.entries.length - 1;
+    publishRetainedValues();
+  }, [disabled, inputValue, mentions, onHistoryRetainValues, readonly, undoHistory]);
+  const onHistoryMove = React.useCallback(
+    (direction: -1 | 1) => {
+      if (!undoHistory || disabled || readonly) return false;
+      const history = editHistory.current;
+      const nextIndex = history.index + direction;
+      const next = history.entries[nextIndex];
+      if (!next) return true;
+      history.index = nextIndex;
+      history.restoring = true;
+      setMentions([...next.mentions]);
+      setValue(getMentionValuesFromMentions(next.mentions));
+      setInputValue(next.text);
+      setOpen(false);
+      const caret =
+        direction < 0
+          ? Math.min(
+              inputRef.current ? getComposerSelection(inputRef.current).start : next.text.length,
+              next.text.length
+            )
+          : next.text.length;
+      setPendingSelection({ start: caret, end: caret, expectedValue: next.text });
+      return true;
+    },
+    [disabled, readonly, setInputValue, setMentions, setOpen, setValue, undoHistory]
+  );
 
   const { filterStore, onItemsFilter, getIsItemVisible } = useFilterStore({
     itemMap,
@@ -596,8 +643,8 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
         navigateText ??
         selectedItem?.insertText ??
         `${trigger}${selectedItem?.label ?? payloadValue}`;
-      const sourceValue = input?.value ?? inputValue;
-      const insertionPoint = input?.selectionStart ?? triggerIndex;
+      const sourceValue = input ? getComposerText(input) : inputValue;
+      const insertionPoint = input ? getComposerSelection(input).start : triggerIndex;
       const commit = (prepared: PreparedMention | null = null) => {
         const committedValue = payloadValue;
         const splice: MentionSplice = {
@@ -711,17 +758,14 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
       const requests = Array.isArray(request) ? request : [request];
       if (requests.length === 0) return;
       const input = inputRef.current;
-      const sourceValue = input?.value ?? inputValue;
+      const sourceValue = input ? getComposerText(input) : inputValue;
       // Every insert reads the result of the previous one, then the controlled
       // text and ranges are published once for the entire gesture.
       const applyRequests = (initialMentions: Mention[]) => {
         let result = { value: sourceValue, mentions: initialMentions, caret: sourceValue.length };
         for (const entry of requests) {
           const at = Math.max(0, Math.min(result.value.length, entry.at ?? result.value.length));
-          const replaceEnd = Math.max(
-            at,
-            Math.min(result.value.length, entry.replaceEnd ?? at)
-          );
+          const replaceEnd = Math.max(at, Math.min(result.value.length, entry.replaceEnd ?? at));
           result = applyMentionSplice(result.value, result.mentions, {
             replaceStart: at,
             replaceEnd,
@@ -755,7 +799,7 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
       // The gesture that inserts this happened outside the input (a drop, a
       // toolbar action), so the caret restoration above lands on an input the
       // user is not in. Typing is the expected next step, so take focus.
-      input?.focus();
+      input?.focus({ preventScroll: true });
     },
     [filterStore, inputValue, setInputValue, setMentions, setOpen, setValue]
   );
@@ -763,12 +807,13 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
   const onNavigateBack = React.useCallback(() => {
     const input = inputRef.current;
     if (!input) return false;
-    const caretPosition = input.selectionStart ?? input.value.length;
-    const triggerIndex = input.value.lastIndexOf(trigger, caretPosition);
+    const text = getComposerText(input);
+    const caretPosition = getComposerSelection(input).start;
+    const triggerIndex = text.lastIndexOf(trigger, caretPosition);
     if (triggerIndex === -1) return false;
 
     const caret = triggerIndex + trigger.length;
-    const nextValue = input.value.slice(0, caret) + input.value.slice(caretPosition);
+    const nextValue = text.slice(0, caret) + text.slice(caretPosition);
     setInputValue(nextValue);
     // Same reason as `onMentionAdd`: MentionInput restores the caret once it has
     // rendered this exact value, because touching the DOM selection here races
@@ -782,7 +827,7 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
 
   const onMentionsRemove = React.useCallback(
     (mentionsToRemove: Mention[]) => {
-      const input = inputRef.current;
+      const inputText = getComposerText(inputRef.current);
       setMentions((prev) => {
         // must match their actual order in the text
         const removed = [...mentionsToRemove].sort((a, b) => a.start - b.start);
@@ -800,7 +845,7 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
               .filter((r) => r.start < mention.start)
               .reduce((acc, r) => {
                 const mentionLength = r.end - r.start;
-                const hasTrailingSpace = input?.value[r.end] === ' ';
+                const hasTrailingSpace = inputText[r.end] === ' ';
                 return acc + mentionLength + (hasTrailingSpace ? 1 : 0);
               }, 0);
 
@@ -853,6 +898,7 @@ const MentionRoot = React.forwardRef<RootElement, MentionRootProps>((props, forw
       onMentionsChange={setMentions}
       onMentionAdd={onMentionAdd}
       onMentionInsert={onMentionInsert}
+      onHistoryMove={onHistoryMove}
       onNavigateBack={onNavigateBack}
       onMentionsRemove={onMentionsRemove}
       onMentionClick={onMentionClick}

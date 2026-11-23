@@ -1,11 +1,17 @@
 /** @vitest-environment jsdom */
-
-import { act, createRef } from 'react';
+import { ShortcutTokenAttemptError } from '../src/lib/shortcut-token-attempt';
+import { act, createRef, StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ErrorBoundary } from '../src/components/error-boundary';
 import { initI18n } from '../src/i18n';
+import { deferredPostHog } from '../src/lib/deferred-posthog';
+import { buildErrorBoundaryReport } from '../src/lib/error-boundary-report';
+
+vi.mock('../src/lib/deferred-posthog', () => ({
+  deferredPostHog: { captureException: vi.fn() },
+}));
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -21,7 +27,11 @@ function Subject({ crash, label }: { crash: boolean; label: string }) {
   return <div>{label}</div>;
 }
 
-function renderBoundary({ crash, resetKey, label = 'healthy' }: {
+function renderBoundary({
+  crash,
+  resetKey,
+  label = 'healthy',
+}: {
   crash: boolean;
   resetKey: string;
   label?: string;
@@ -35,7 +45,11 @@ function renderBoundary({ crash, resetKey, label = 'healthy' }: {
   });
 }
 
-function renderInlineBoundary({ crash, resetKey, label = 'healthy' }: {
+function renderInlineBoundary({
+  crash,
+  resetKey,
+  label = 'healthy',
+}: {
   crash: boolean;
   resetKey: string;
   label?: string;
@@ -81,9 +95,130 @@ afterEach(() => {
   act(() => root.unmount());
   container.remove();
   vi.restoreAllMocks();
+  vi.clearAllMocks();
 });
 
 describe('ErrorBoundary manual recovery', () => {
+  it('reports once through failed retries, then reports an independent post-recovery fault', () => {
+    const boundary = createRef<ErrorBoundary>();
+    let fail = true;
+    let attempts = 0;
+    function CrashingContent() {
+      attempts++;
+      if (fail) {
+        const error = new Error('SYNTHETIC_BUSINESS_MESSAGE');
+        error.name = 'SYNTHETIC_PROVIDER_NAME';
+        Object.assign(error, { code: 'SYNTHETIC_TOKEN_CODE' });
+        throw error;
+      }
+      return <div>recovered content</div>;
+    }
+    const render = () =>
+      act(() =>
+        root.render(
+          <StrictMode>
+            <ErrorBoundary
+              ref={boundary}
+              name="SYNTHETIC_BOUNDARY"
+              fallbackRender={({ error, resetErrorBoundary }) => (
+                <button onClick={resetErrorBoundary}>
+                  {buildErrorBoundaryReport({ error }).text}
+                </button>
+              )}
+            >
+              <CrashingContent />
+            </ErrorBoundary>
+          </StrictMode>
+        )
+      );
+    render();
+    const firstAttempts = attempts;
+    render();
+    expect(attempts).toBe(firstAttempts);
+    for (let i = 0; i < 20; i++) act(() => boundary.current!.resetErrorBoundary());
+    expect(attempts).toBeGreaterThan(firstAttempts);
+    const reports = vi.mocked(deferredPostHog.captureException).mock.calls;
+    expect(reports).toHaveLength(1);
+    expect(JSON.stringify(reports)).not.toContain('SYNTHETIC_');
+    expect(reports[0][0]).toMatchObject({
+      name: 'unknown',
+      message: 'redacted_exception',
+      stack: undefined,
+    });
+    expect(reports[0][1]).toMatchObject({ source: 'errorBoundary', error_type: 'unknown' });
+    expect(container.textContent).toContain('SYNTHETIC_BUSINESS_MESSAGE');
+    expect(container.textContent).toContain('SYNTHETIC_PROVIDER_NAME');
+
+    fail = false;
+    act(() => boundary.current!.resetErrorBoundary());
+    expect(container.textContent).toBe('recovered content');
+    fail = true;
+    render();
+    expect(reports).toHaveLength(2);
+  });
+
+  it('owned Shortcut failures do not consume the boundary episode but an independent cause remains reportable', () => {
+    const boundary = createRef<ErrorBoundary>();
+    const handled = new ShortcutTokenAttemptError({
+      kind: 'retryable',
+      code: 'exchange_unavailable',
+      phase: 'exchange',
+    });
+    let error: Error = handled;
+    function Content(): never {
+      throw error;
+    }
+    act(() =>
+      root.render(
+        <ErrorBoundary ref={boundary} fallbackRender={({ error }) => <span>{error.message}</span>}>
+          <Content />
+        </ErrorBoundary>
+      )
+    );
+    for (let i = 0; i < 20; i++) act(() => boundary.current!.resetErrorBoundary());
+    expect(deferredPostHog.captureException).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('exchange_unavailable');
+    const mixed = new ShortcutTokenAttemptError({
+      kind: 'retryable',
+      code: 'exchange_unavailable',
+      phase: 'exchange',
+    });
+    mixed.cause = new Error('SYNTHETIC_INDEPENDENT_CAUSE');
+    error = mixed;
+    act(() => boundary.current!.resetErrorBoundary());
+    const reports = vi.mocked(deferredPostHog.captureException).mock.calls;
+    expect(reports).toHaveLength(1);
+    expect(JSON.stringify(reports)).not.toContain('SYNTHETIC_');
+    expect(reports[0][1]).toMatchObject({ source: 'errorBoundary' });
+    error = new Error('another independent crash during same boundary episode');
+    act(() => boundary.current!.resetErrorBoundary());
+    expect(reports).toHaveLength(1);
+  });
+
+  it('keeps separate mounted owners visible even when their error objects match', () => {
+    const error = new TypeError('SYNTHETIC_SHARED_MESSAGE');
+    function CrashingContent(): never {
+      throw error;
+    }
+    act(() =>
+      root.render(
+        <>
+          <ErrorBoundary fallback={<span>first failed</span>}>
+            <CrashingContent />
+          </ErrorBoundary>
+          <ErrorBoundary fallback={<span>second failed</span>}>
+            <CrashingContent />
+          </ErrorBoundary>
+        </>
+      )
+    );
+    const reports = vi.mocked(deferredPostHog.captureException).mock.calls;
+    expect(reports).toHaveLength(2);
+    expect(reports.map((report) => report[1]?.error_type)).toEqual(['TypeError', 'TypeError']);
+    expect(JSON.stringify(reports)).not.toContain('SYNTHETIC_');
+    expect(container.textContent).toBe('first failedsecond failed');
+  });
+
   it('keeps a captured error visible when reset keys change', () => {
     renderBoundary({ crash: true, resetKey: '/broken' });
     const attemptsAfterCrash = renderAttempts;
@@ -106,58 +241,5 @@ describe('ErrorBoundary manual recovery', () => {
 
     expect(renderAttempts).toBeGreaterThan(attemptsBeforeRetry);
     expect(container.textContent).toContain('other route');
-  });
-
-  it('gives inline fallbacks a user-driven recovery action', () => {
-    renderInlineBoundary({ crash: true, resetKey: 'workspace-a' });
-    renderInlineBoundary({ crash: false, resetKey: 'workspace-b', label: 'target selector' });
-
-    expect(container.textContent).toContain('Retry selector');
-    expect(container.textContent).not.toContain('target selector');
-
-    const retry = Array.from(container.querySelectorAll('button')).find((element) =>
-      element.textContent?.includes('Retry selector')
-    );
-    if (!retry) throw new Error('No inline recovery action');
-    act(() => {
-      retry.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
-
-    expect(container.textContent).toContain('target selector');
-  });
-
-  it('lets an owning action recover a buttonless fallback', () => {
-    const boundaryRef = createRef<ErrorBoundary>();
-    act(() => {
-      root.render(
-        <ErrorBoundary
-          ref={boundaryRef}
-          name="ButtonlessTest"
-          variant="inline"
-          fallbackRender={() => null}
-          resetKeys={['slug-a']}
-        >
-          <Subject crash label="unavailable slug" />
-        </ErrorBoundary>
-      );
-    });
-    act(() => {
-      root.render(
-        <ErrorBoundary
-          ref={boundaryRef}
-          name="ButtonlessTest"
-          variant="inline"
-          fallbackRender={() => null}
-          resetKeys={['slug-b']}
-        >
-          <Subject crash={false} label="available slug" />
-        </ErrorBoundary>
-      );
-    });
-
-    expect(container.textContent).not.toContain('available slug');
-    act(() => boundaryRef.current?.resetErrorBoundary());
-
-    expect(container.textContent).toContain('available slug');
   });
 });

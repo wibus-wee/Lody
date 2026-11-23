@@ -1,5 +1,10 @@
+import i18next from 'i18next';
+import { Effect } from 'effect';
+import { makeAutomaticPairingRuntime } from '@lody/e2ee-client/automatic-pairing';
+import { E2eeAutomaticPairingInbox } from '@/components/pages/e2ee-automatic-pairing';
 import { activeWorkspaceRuntimeAtom } from '@/atoms/runtime';
 import { assertLegacyWorkspaceAccess } from '@/lib/legacy-workspace-admission';
+import { e2eeAccessLoss } from '@/lib/e2ee-member-removal';
 import { E2eeTeamInboxHost } from '@/components/e2ee/email-admission-worker';
 import {
   useCallback,
@@ -22,11 +27,13 @@ import {
 } from '@/lib/posthog-privacy';
 import {
   CLOUD_PLATFORM_CAPABILITIES,
+  accountPairingErrorCode,
   createStore,
   type PlatformProvider,
   type MutableStore,
   type E2eeWorkspaceRuntime,
   type E2eeRuntimeFactory,
+  type PlatformE2eeWorkspaces,
   type PlatformSessionState,
   type WorkspaceSummary,
   type WorkspacesState,
@@ -38,6 +45,7 @@ import { useStableSession } from '@/hooks/useStableSession';
 import { useAuthSignOut } from './convex-provider';
 import { isElectronRenderer } from '@/lib/electron';
 import { cloudPlatformApi, useCloudPlatformClient } from './cloud-platform-api';
+import { accountPairingHints, withAccountPairingCode } from '@/lib/e2ee-account-pairing-ipc';
 import { createCloudE2eeWorkspaces } from './cloud-e2ee-workspaces';
 import { cloudOperations } from '@/lib/cloud-api-operations';
 import { getIpcServices } from '@/lib/electron-ipc-client';
@@ -47,10 +55,13 @@ import { installAttachmentWorkspaceAccess } from '@/lib/attachment-workspace-acc
 import { installCloudHttpPort } from '@/lib/cloud-http-port';
 import { localAgentEnabledAtom } from '@/atoms/local-probe';
 import { resolveCloudPlatformRuntimePolicy } from './cloud-platform-runtime-policy';
+import { createCloudSessionAccess } from './cloud-session-access';
+import { mintAutomationControlProof } from '@/lib/automation-control-api';
 
 const CLOUD_HTTP_PORT = {
   authBaseUrl: import.meta.env.VITE_CONVEX_SITE_URL || null,
   serverBaseUrl: import.meta.env.VITE_API_BASE_URL || null,
+  mintAutomationControlProof,
 } as const;
 
 function toWorkspaceSummary(
@@ -87,9 +98,11 @@ function toWorkspaceSummary(
 export function CloudPlatformProvider({
   children,
   createE2eeRuntime,
+  prepareE2eeCreation,
 }: {
   children: ReactNode;
   createE2eeRuntime?: E2eeRuntimeFactory;
+  prepareE2eeCreation?: PlatformE2eeWorkspaces['prepareCreation'];
 }) {
   const electron = isElectronRenderer();
   const cloudClient = useCloudPlatformClient();
@@ -244,10 +257,11 @@ export function CloudPlatformProvider({
     });
   }, [createE2eeRuntime, electron, hasAuthenticatedConvex, sessionStore]);
 
-  const e2eeWorkspaces = useMemo(() => {
+  const baseE2eeWorkspaces = useMemo(() => {
     const native = electron ? getIpcServices()?.e2ee : undefined;
     return createCloudE2eeWorkspaces({
       session: () => sessionStore.get(),
+      ...(prepareE2eeCreation ? { prepareCreation: prepareE2eeCreation } : {}),
       ...(native
         ? {
             prepareCreation: (request) => native.prepareCreation(request),
@@ -258,6 +272,9 @@ export function CloudPlatformProvider({
               memberJoinRequests: (workspaceId) => native.memberJoinRequests(workspaceId),
               approveMemberJoin: (workspaceId, requestId, mode) =>
                 native.approveMemberJoin(workspaceId, requestId, mode),
+              memberKeyDeliveries: (workspaceId) => native.memberKeyDeliveries(workspaceId),
+              retryMemberKeyDelivery: (workspaceId, requestId) =>
+                native.retryMemberKeyDelivery(workspaceId, requestId),
               rejectMemberJoin: (workspaceId, requestId) =>
                 native.rejectMemberJoin(workspaceId, requestId),
               revokeMemberInvitation: (workspaceId, token) =>
@@ -275,10 +292,46 @@ export function CloudPlatformProvider({
                 native.claimPersonalJoin(workspaceId, pairingSessionId),
               cancelPersonalJoin: (workspaceId, pairingSessionId) =>
                 native.cancelPersonalJoin(workspaceId, pairingSessionId),
+              requestAccountPairing: (input) =>
+                withAccountPairingCode(
+                  native.requestAccountPairing(
+                    {
+                      pairingString: input.pairingString,
+                      expiresAt: input.expiresAt,
+                      preserveExisting: input.preserveExisting,
+                      workspaceId: input.workspace?.workspaceId,
+                    },
+                    input.workspace ? [input.workspace] : accountPairingHints(workspacesStore.get())
+                  )
+                ),
+              accountPairingRequest: () =>
+                withAccountPairingCode(
+                  native.accountPairingRequest(accountPairingHints(workspacesStore.get()))
+                ),
+              cancelAccountPairing: (input) =>
+                withAccountPairingCode(native.cancelAccountPairing(input)),
+              accountPairingCode: () => withAccountPairingCode(native.accountPairingCode()),
+              inspectAccountPairing: (pairingString) =>
+                withAccountPairingCode(
+                  native.inspectAccountPairing(
+                    pairingString,
+                    accountPairingHints(workspacesStore.get())
+                  )
+                ),
+              approveAccountPairing: (input) =>
+                withAccountPairingCode(
+                  native.approveAccountPairing(input, accountPairingHints(workspacesStore.get()))
+                ),
+              declineAccountPairing: (input) =>
+                withAccountPairingCode(
+                  native.declineAccountPairing(input, accountPairingHints(workspacesStore.get()))
+                ),
               removeMember: (workspaceId, membershipId) =>
                 native.removeMember(workspaceId, membershipId),
               setMemberRole: (workspaceId, membershipId, role) =>
                 native.setMemberRole(workspaceId, membershipId, role),
+              transferOwnership: (workspaceId, membershipId) =>
+                native.transferOwnership(workspaceId, membershipId),
 
               beginRemoteMachinePairing: (workspaceId) =>
                 native.beginRemoteMachinePairing(workspaceId),
@@ -293,11 +346,11 @@ export function CloudPlatformProvider({
                 native.admitLocalAgent(workspaceId, pairingSessionId),
               managementState: (workspaceId) => native.managementState(workspaceId),
               updateKeys: (workspaceId) => native.updateKeys(workspaceId),
-              revokeDevice: (workspaceId, signingPublicKey) =>
-                native.revokeDevice(workspaceId, signingPublicKey),
+              revokeDevice: (workspaceId, signingPublicKey, confirmation) =>
+                native.revokeDevice(workspaceId, signingPublicKey, confirmation),
               refresh: (workspaceId, options) => native.refresh(workspaceId, options),
-              contentStreamsToken: (workspaceId, rejectedToken, requestSnapshotFor, rpcOnly) =>
-                native.contentStreamsToken(workspaceId, rejectedToken, requestSnapshotFor, rpcOnly),
+              contentStreamsToken: (workspaceId, rejectedToken, rpcOnly) =>
+                native.contentStreamsToken(workspaceId, rejectedToken, rpcOnly),
               prepareFeatureRpc: (workspaceId, input) =>
                 native.prepareFeatureRpc(workspaceId, input),
               acceptFeatureRpcResponse: (workspaceId, input, frame) =>
@@ -308,8 +361,14 @@ export function CloudPlatformProvider({
                 native.updateMachineSharing(workspaceId, machineId, generation, requestId, change),
               prepareDispatch: (workspaceId, machineId, input) =>
                 native.prepareDispatch(workspaceId, machineId, input),
+              signScheduleDeclaration: (workspaceId, document, manualRunKey) =>
+                native.signScheduleDeclaration(workspaceId, document, manualRunKey),
               acceptDispatchResponse: (workspaceId, machineId, input, frame) =>
                 native.acceptDispatchResponse(workspaceId, machineId, input, frame),
+              irohPath: (workspaceId, machineId) => native.irohPath(workspaceId, machineId),
+              irohReady: (workspaceId, machineId) => native.irohReady(workspaceId, machineId),
+              irohCall: (workspaceId, machineId, envelope, timeoutMs) =>
+                native.irohCall(workspaceId, machineId, envelope, timeoutMs),
               seal: (workspaceId, input) => native.seal(workspaceId, input),
               openContent: (workspaceId, input) => native.openContent(workspaceId, input),
               account: (options) => native.account(options),
@@ -331,9 +390,20 @@ export function CloudPlatformProvider({
           ? { runtime: portableRuntime }
           : {}),
       remote: {
+        reportDeviceProfile: (request) =>
+          cloudClient.mutation(cloudOperations.e2eeWorkspaces.reportDeviceProfile, request),
+        subscribeLedgerHead: (request, changed, failed) =>
+          cloudClient.subscribeValue(
+            cloudOperations.e2eeWorkspaces.ledgerHead,
+            request,
+            changed,
+            failed
+          ),
         memberProfiles: (request) =>
           cloudClient.query(cloudOperations.e2eeWorkspaces.memberProfiles, request),
         create: (request) => cloudClient.action(cloudOperations.e2eeWorkspaces.create, request),
+        deleteWorkspace: (request) =>
+          cloudClient.action(cloudOperations.e2eeWorkspaces.deleteWorkspace, request),
         describe: (request) => cloudClient.query(cloudOperations.e2eeWorkspaces.describe, request),
         history: (request) => cloudClient.action(cloudOperations.e2eeWorkspaces.history, request),
       },
@@ -341,7 +411,152 @@ export function CloudPlatformProvider({
         await readOrganization().refetchOrganizations();
       },
     });
-  }, [cloudClient, electron, portableRuntime, readOrganization, sessionStore]);
+  }, [
+    cloudClient,
+    electron,
+    portableRuntime,
+    prepareE2eeCreation,
+    readOrganization,
+    sessionStore,
+    workspacesStore,
+  ]);
+
+  const automaticPairing = useMemo(() => {
+    const runtime = baseE2eeWorkspaces.runtime;
+    if (!runtime?.requestAccountPairing || !runtime.accountPairingRequest) return undefined;
+    const io = <A,>(work: () => Promise<A>) =>
+      Effect.tryPromise({
+        try: work,
+        catch: (cause) => {
+          const data = cause && typeof cause === 'object' && 'data' in cause ? cause.data : null;
+          const remote = data && typeof data === 'object' && 'code' in data ? data.code : null;
+          const code =
+            remote === 'e2ee_account_pairing_disabled'
+              ? 'pairing-unavailable'
+              : typeof remote === 'string'
+                ? remote.replace(/^e2ee_/, '')
+                : null;
+          const known = accountPairingErrorCode({ code });
+          return known
+            ? Object.assign(new Error(`e2ee_${known}`, { cause }), { code: known })
+            : cause;
+        },
+      });
+    return makeAutomaticPairingRuntime({
+      runtime,
+      account: () => {
+        const state = sessionStore.get();
+        if (state.status === 'authenticated') return state.user.id;
+        return session.data?.user?.id ?? atomStore.get(userAtom)?.id ?? null;
+      },
+      workspaces: () => accountPairingHints(workspacesStore.get()),
+      deviceName: electron ? 'Lody desktop' : 'Lody mobile',
+      // A visible but unfocused window (another app in front, a second screen) still
+      // answers; only a hidden window falls back to the system notification.
+      canPresent: () => document.visibilityState === 'visible',
+      accessLoss: e2eeAccessLoss,
+      includePreparingReviews: Boolean(electron && runtime.accountPairingCode),
+      notifyPending: (id) => {
+        if (!electron) return;
+        void getIpcServices()
+          ?.notifications.showDevicePairingRequest({
+            requestId: id,
+            language: i18next.resolvedLanguage?.startsWith('zh') ? 'zh' : 'en',
+          })
+          .catch(() => {});
+      },
+      crypto: globalThis.crypto,
+      run: (work) => Effect.runPromise(work),
+      relay: {
+        subscribe: (changed) =>
+          cloudClient.subscribe(cloudOperations.e2eeAutomaticPairing.pending, {}, changed),
+        subscribeRead: (id, changed) =>
+          cloudClient.subscribe(cloudOperations.e2eeAutomaticPairing.read, { id }, changed),
+        pending: () =>
+          io(() => cloudClient.query(cloudOperations.e2eeAutomaticPairing.pending, {})),
+        read: (id) =>
+          io(() => cloudClient.query(cloudOperations.e2eeAutomaticPairing.read, { id })),
+        exchange: (command) =>
+          io(() => cloudClient.mutation(cloudOperations.e2eeAutomaticPairing.exchange, command)),
+      },
+    });
+  }, [
+    atomStore,
+    baseE2eeWorkspaces,
+    cloudClient,
+    electron,
+    sessionStore,
+    workspacesStore,
+    session.data?.user.id,
+  ]);
+  useEffect(() => () => automaticPairing?.disposeAutomaticPairing(), [automaticPairing]);
+  const e2eeWorkspaces = useMemo(
+    () =>
+      automaticPairing && baseE2eeWorkspaces.runtime
+        ? {
+            ...baseE2eeWorkspaces,
+            runtime: {
+              ...baseE2eeWorkspaces.runtime,
+              ...automaticPairing,
+              // A hint only: the host still claims and verifies through its own relay.
+              subscribeAccountPairingRequest: (lookupId: string, changed: () => void) =>
+                /^[0-9a-f]{32}$/.test(lookupId)
+                  ? cloudClient.subscribe(
+                      cloudOperations.e2eeAccountPairing.claim,
+                      { lookupId },
+                      changed
+                    )
+                  : () => {},
+              // A hint only: the host still reads and verifies the request itself.
+              subscribeAccountPairingApproval: (lookupId: string, changed: () => void) =>
+                /^[0-9a-f]{32}$/.test(lookupId)
+                  ? cloudClient.subscribe(
+                      cloudOperations.e2eeAccountPairing.read,
+                      { lookupId },
+                      changed
+                    )
+                  : () => {},
+            },
+          }
+        : baseE2eeWorkspaces,
+    [automaticPairing, baseE2eeWorkspaces, cloudClient]
+  );
+
+  const sessionAccess = useMemo(
+    () =>
+      createCloudSessionAccess({
+        client: cloudClient,
+        runtime: e2eeWorkspaces.runtime,
+        assertScope: (workspaceId) => {
+          const runtime = atomStore.get(activeWorkspaceRuntimeAtom);
+          const accountId = atomStore.get(userAtom)?.id ?? runtime?.accountId;
+          const identity = sessionStore.get();
+          if (
+            !runtime ||
+            !accountId ||
+            runtime.workspaceId !== workspaceId ||
+            atomStore.get(currentWorkspaceIdAtom) !== workspaceId ||
+            (runtime.accountId && runtime.accountId !== accountId) ||
+            (identity.status === 'authenticated' && identity.user.id !== accountId) ||
+            (identity.status === 'unauthenticated' && !identity.uncertain)
+          )
+            throw new Error('session_access_scope_changed');
+          if (runtime.contentMode !== 'e2ee')
+            assertLegacyWorkspaceAccess({
+              workspaceId,
+              platformKind: 'cloud',
+              mode: atomStore.get(workspaceContentModeAtom),
+              runtime,
+              accountId,
+              currentWorkspaceId: atomStore.get(currentWorkspaceIdAtom),
+              routeSlug: atomStore.get(currentWorkspaceSlugAtom),
+              workspacesState: workspacesStore.get(),
+            });
+          return { encrypted: runtime.contentMode === 'e2ee', accountId, token: runtime };
+        },
+      }),
+    [cloudClient, e2eeWorkspaces, atomStore, sessionStore, workspacesStore]
+  );
 
   const provider = useMemo<PlatformProvider>(
     () => ({
@@ -351,6 +566,7 @@ export function CloudPlatformProvider({
         signOut: () => signOutRef.current(),
       },
       e2eeWorkspaces,
+      sessionAccess,
       workspaces: {
         state: workspacesStore,
         retry: async () => {
@@ -398,7 +614,14 @@ export function CloudPlatformProvider({
         mode: localAgentSyncMode,
       },
     }),
-    [e2eeWorkspaces, localAgentSyncMode, readOrganization, sessionStore, workspacesStore]
+    [
+      e2eeWorkspaces,
+      sessionAccess,
+      localAgentSyncMode,
+      readOrganization,
+      sessionStore,
+      workspacesStore,
+    ]
   );
 
   useEffect(() => installAttachmentWorkspaceAccess(provider), [provider]);
@@ -411,7 +634,12 @@ export function CloudPlatformProvider({
         runtime={e2eeWorkspaces.runtime}
         accountId={session.data?.user.id}
       />
-      {children}
+      <E2eeAutomaticPairingInbox
+        key={session.data?.user.id ?? 'signed-out'}
+        runtime={e2eeWorkspaces.runtime}
+      >
+        {children}
+      </E2eeAutomaticPairingInbox>
     </PlatformContext.Provider>
   );
 }

@@ -1,3 +1,10 @@
+import {
+  recordIrohObservation,
+  hasIrohDailyRecorder,
+  rememberIrohConnection,
+  wasIrohConnected,
+  type IrohObservation,
+} from '../lib/iroh-daily';
 import { Effect, Exit, Fiber, Scope } from 'effect';
 import type {
   E2eeDispatchInput,
@@ -12,6 +19,15 @@ import type { E2eeFeatureInput } from '@lody/shared/e2ee-rpc';
 import type { LoroStreamsJsonStreamClient } from '@lody/loro-streams-rpc';
 import { callEncryptedReadFeature } from '@lody/loro-streams-rpc';
 import { makeEncryptedStreamsChannel } from '@lody/loro-streams-rpc/e2ee-streams';
+import { clientLossEffects } from '../lib/e2ee-client-loss-effects';
+import {
+  E2EE_MACHINE_NOT_SHARED,
+  EncryptedPrepareTimeout,
+} from '../lib/encrypted-dispatch-outcome';
+
+const PREPARE_DEADLINE_MS = 200;
+/** Longest wait for "is iroh connected?" before a send proceeds on Streams. */
+const IROH_READY_BUDGET_MS = 100;
 
 type Call =
   | { kind: 'dispatch'; input: E2eeDispatchInput }
@@ -41,12 +57,53 @@ export function createEncryptedDispatchLegacy(options: {
   ) => Promise<LocalMachineRpcResponse | null>;
   closeClient?: () => Promise<void>;
   client: (signal: AbortSignal) => Promise<LoroStreamsJsonStreamClient>;
+  /** Preferred route when the host has one; Streams RPC remains the fallback. */
+  iroh?: {
+    path?: (machineId: string) => Promise<'direct' | 'relay' | 'none'>;
+    ready: (machineId: string) => Promise<boolean>;
+    call: (
+      machineId: string,
+      envelope: { id: string; frame: string },
+      timeoutMs: number
+    ) => Promise<string[]>;
+  };
 }) {
   const scope = Scope.makeUnsafe();
   const controller = new AbortController();
   let closed = false;
   let device: string | undefined;
   let flight: Fiber.Fiber<Channel, unknown> | undefined;
+  // E2E-only: count a turn dispatch when the stream client appended its frame.
+  const effects = clientLossEffects(options.workspaceId);
+  const dispatches = new Map<string, { senders: number; appended: boolean }>();
+  // Machines whose withdrawal this runtime saw the host verify. Only a later successful
+  // preparation clears one; timeouts and unverifiable answers keep it known.
+  const withdrawn = new Set<string>();
+  const observeAppends = (client: LoroStreamsJsonStreamClient): LoroStreamsJsonStreamClient => {
+    if (!effects) return client;
+    return new Proxy(client, {
+      get(target, property) {
+        const value: unknown = Reflect.get(target, property, target);
+        if (property !== 'appendJson' || typeof value !== 'function')
+          return typeof value === 'function' ? value.bind(target) : value;
+        return async (...args: unknown[]) => {
+          const id = (args[1] as { id?: unknown } | undefined)?.id;
+          const dispatch = typeof id === 'string' ? dispatches.get(id) : undefined;
+          const result: unknown = await value.apply(target, args);
+          if (
+            typeof id === 'string' &&
+            dispatch &&
+            dispatches.get(id) === dispatch &&
+            !dispatch.appended
+          ) {
+            dispatch.appended = true;
+            effects.turnDispatched();
+          }
+          return result;
+        };
+      },
+    });
+  };
   const channel = (prepared: E2eePreparedDispatch) =>
     Effect.gen(function* () {
       if (closed || (device && device !== prepared.requesterDevice))
@@ -55,10 +112,12 @@ export function createEncryptedDispatchLegacy(options: {
         device = prepared.requesterDevice;
         flight = yield* Effect.forkIn(
           Effect.gen(function* () {
-            const client = yield* Effect.tryPromise({
-              try: () => options.client(controller.signal),
-              catch: () => new Error('e2ee_rpc_transport'),
-            });
+            const client = observeAppends(
+              yield* Effect.tryPromise({
+                try: () => options.client(controller.signal),
+                catch: () => new Error('e2ee_rpc_transport'),
+              })
+            );
             return yield* makeEncryptedStreamsChannel<Call, Reply>({
               workspaceId: options.workspaceId,
               requesterDevice: prepared.requesterDevice,
@@ -85,58 +144,307 @@ export function createEncryptedDispatchLegacy(options: {
         )
       );
     });
+  /**
+   * Route order iroh → Streams RPC (→ durable dispatch, owned by the caller). Iroh is
+   * used only with a live connection to the target device (asking for one starts a
+   * background dial) and only for single-frame originals: chunked feature requests
+   * keep Streams, whose receiver reassembles chunks across envelopes. Replies are
+   * verified exactly as Streams replies are. Any failure or missing reply returns
+   * `undefined`, and the caller sends the same original over Streams; the machine's
+   * journal and claim make the second arrival harmless.
+   */
+  const viaIroh = async (
+    original: E2eePreparedDispatch,
+    call: Call,
+    timeoutMs: number
+  ): Promise<{ reply?: Reply; observation: IrohObservation } | undefined> => {
+    const iroh = options.iroh;
+    if (closed) return undefined;
+    const record = (
+      outcome: import('../lib/iroh-daily').IrohOutcome,
+      extra: Pick<
+        import('../lib/iroh-daily').IrohObservation,
+        'elapsedMs' | 'path' | 'connected' | 'knownAtFallback'
+      > = {}
+    ) =>
+      ({
+        kind: call.kind,
+        outcome,
+        target: original.targetMachineId,
+        ...extra,
+      }) satisfies IrohObservation;
+    if (original.frames && original.frames.length !== 1) {
+      return { observation: record('chunked') };
+    }
+    if (!iroh) {
+      return { observation: record('unavailable') };
+    }
+    // Route evidence only: why this request continues on Streams, never the frame.
+    let connected = false;
+    const fallback = (reason: 'not-ready' | 'call-failed' | 'unverified') => {
+      const observation = record(
+        reason === 'not-ready'
+          ? 'fallback_not_ready'
+          : reason === 'call-failed'
+            ? 'fallback_call_failed'
+            : 'fallback_unverified',
+        {
+          connected,
+          ...(reason === 'not-ready'
+            ? { knownAtFallback: wasIrohConnected(original.targetMachineId) }
+            : {}),
+        }
+      );
+      console.debug('[e2ee-rpc-timing]', {
+        stage: 'iroh-fallback',
+        reason,
+        kind: call.kind,
+        requestId: original.requestId,
+        at: Date.now(),
+      });
+      return { observation };
+    };
+    let budget: ReturnType<typeof setTimeout> | undefined;
+    const ready = await Promise.race([
+      iroh.ready(original.targetMachineId).catch(() => false),
+      new Promise<false>((resolve) => {
+        budget = setTimeout(() => resolve(false), IROH_READY_BUDGET_MS);
+      }),
+    ]).finally(() => clearTimeout(budget));
+    if (!ready) return fallback('not-ready');
+    connected = true;
+    rememberIrohConnection(original.targetMachineId);
+    // The renderer owns the deadline: the host may first wait for its account lock,
+    // and that wait must not hold the same original back from Streams. A late iroh
+    // delivery is deduplicated by the receiver.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const started = performance.now();
+    const frames = await Promise.race([
+      iroh
+        .call(
+          original.targetMachineId,
+          { id: original.requestId, frame: original.frames?.[0] ?? original.frameHex },
+          timeoutMs
+        )
+        .catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        deadline = setTimeout(() => resolve(undefined), timeoutMs);
+      }),
+    ]).finally(() => clearTimeout(deadline));
+    const elapsedMs = performance.now() - started;
+    // A late reply or a broken connection; the same original continues on Streams.
+    if (!frames) return closed ? undefined : fallback('call-failed');
+    if (call.kind === 'dispatch') {
+      const dispatch = dispatches.get(original.requestId);
+      if (effects && dispatch && !dispatch.appended) {
+        dispatch.appended = true;
+        effects.turnDispatched();
+      }
+    }
+    for (const frame of frames) {
+      if (closed) return undefined;
+      const reply =
+        call.kind === 'dispatch'
+          ? await options.accept(original.targetMachineId, call.input, frame).catch(() => undefined)
+          : await options.acceptFeature?.(call.input, frame).catch(() => undefined);
+      if (reply) {
+        let observation: IrohObservation = record('iroh_ok', { elapsedMs });
+        if (hasIrohDailyRecorder()) {
+          let pathTimer: ReturnType<typeof setTimeout> | undefined;
+          const path = Promise.race([
+            Promise.resolve()
+              .then(() => iroh.path?.(original.targetMachineId) ?? 'none')
+              .catch(() => 'none' as const),
+            new Promise<'none'>((resolve) => {
+              pathTimer = setTimeout(() => resolve('none'), IROH_READY_BUDGET_MS);
+            }),
+          ])
+            .then((value) =>
+              value === 'direct' || value === 'relay' ? value : ('unknown' as const)
+            )
+            .finally(() => clearTimeout(pathTimer));
+          // Enqueue the observation now to preserve ordering with the next request.
+          // Its path settles under the statistics lock, never on the RPC hot path.
+          observation = record('iroh_ok', { elapsedMs, path });
+        }
+        // Route evidence only: which transport answered, never the frame.
+        console.debug('[e2ee-rpc-timing]', {
+          stage: 'iroh-reply',
+          kind: call.kind,
+          requestId: original.requestId,
+          at: Date.now(),
+        });
+        return { reply, observation };
+      }
+    }
+    return fallback('unverified');
+  };
+  // A route is counted only once it finishes. Cancellation before Streams send
+  // excludes the whole unfinished request, including its preceding iroh attempt.
+  const viaStreams = async (
+    original: E2eePreparedDispatch,
+    call: Call,
+    observation: IrohObservation | undefined,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ) => {
+    let attempted = false;
+    let entered = false;
+    let success = false;
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          if (closed) return yield* Effect.fail(new Error('e2ee_rpc_closed'));
+          if (signal?.aborted) return yield* Effect.fail(new Error('e2ee_rpc_aborted'));
+          entered = true;
+          const client = yield* channel(original);
+          if (closed) return yield* Effect.fail(new Error('e2ee_rpc_closed'));
+          if (signal?.aborted) return yield* Effect.fail(new Error('e2ee_rpc_aborted'));
+          attempted = true;
+          const reply = yield* client.send(original, call, timeoutMs);
+          success = !!reply && (call.kind === 'dispatch' ? 'type' in reply : 'ok' in reply);
+          return reply;
+        })
+      );
+      return result;
+    } finally {
+      // Setup failures are real Streams attempts too. Only an explicit cancel
+      // before channel.send excludes the unfinished route (owner 2026-11-12).
+      if (observation && (attempted || (entered && !closed && !signal?.aborted))) {
+        recordIrohObservation({ ...observation, streams: { success } });
+        console.debug('[e2ee-rpc-timing]', {
+          stage: 'streams-result',
+          kind: call.kind,
+          requestId: original.requestId,
+          success,
+          at: Date.now(),
+        });
+      }
+    }
+  };
   const requestFeature = async (
-    request: LocalMachineRpcRequest
+    request: LocalMachineRpcRequest,
+    optionsForRequest: {
+      requestId?: string;
+      expectedDevice?: string;
+      onPrepared?: (requesterDevice: string) => void;
+      signal?: AbortSignal;
+    } = {}
   ): Promise<LocalMachineRpcResponse> => {
     if (closed || !options.prepareFeature || !options.acceptFeature)
       throw new Error('e2ee_rpc_unavailable');
-    const input = { requestId: crypto.randomUUID().replaceAll('-', ''), request };
+    if (optionsForRequest.signal?.aborted) throw new Error('e2ee_rpc_aborted');
+    const input = {
+      requestId: optionsForRequest.requestId ?? crypto.randomUUID().replaceAll('-', ''),
+      request,
+    };
     const original = await options.prepareFeature(input);
-    const result = await Effect.runPromise(
-      Effect.gen(function* () {
-        const client = yield* channel(original);
-        return yield* client.send(
-          original,
-          { kind: 'feature', input },
-          request.timeoutMs ?? 30_000
-        );
-      })
+    if (optionsForRequest.signal?.aborted) throw new Error('e2ee_rpc_aborted');
+    if (original.requestId !== input.requestId || original.targetMachineId !== request.machineId)
+      throw new Error('e2ee_rpc_request_binding');
+    if (
+      optionsForRequest.expectedDevice &&
+      original.requesterDevice !== optionsForRequest.expectedDevice
+    )
+      throw new Error('e2ee_rpc_signer_mismatch');
+    optionsForRequest.onPrepared?.(original.requesterDevice);
+    if (optionsForRequest.signal?.aborted) throw new Error('e2ee_rpc_aborted');
+    const fast = await viaIroh(original, { kind: 'feature', input }, request.timeoutMs ?? 30_000);
+    if (fast?.reply && 'ok' in fast.reply) {
+      recordIrohObservation(fast.observation);
+      return fast.reply;
+    }
+    if (optionsForRequest.signal?.aborted) throw new Error('e2ee_rpc_aborted');
+    const result = await viaStreams(
+      original,
+      { kind: 'feature', input },
+      fast?.observation,
+      request.timeoutMs ?? 30_000,
+      optionsForRequest.signal
     );
     return result && 'ok' in result
       ? result
       : { ok: false, error: 'Encrypted machine request timed out.' };
   };
+  const prepared = (original: E2eePreparedDispatch, input: E2eeDispatchInput) => ({
+    original,
+    send: () => {
+      const send = async () => {
+        const fast = await viaIroh(original, { kind: 'dispatch', input }, 800);
+        if (fast?.reply && 'type' in fast.reply) {
+          recordIrohObservation(fast.observation);
+          return fast.reply;
+        }
+        const result = await viaStreams(original, { kind: 'dispatch', input }, fast?.observation);
+        return result && 'type' in result ? result : null;
+      };
+      if (!effects) return send();
+      // A duplicate may settle before the original append. Retain its accounting
+      // until every sender settles, and count chunked requests only once.
+      const dispatch = dispatches.get(original.requestId) ?? { senders: 0, appended: false };
+      dispatches.set(original.requestId, dispatch);
+      dispatch.senders += 1;
+      return effects.track('dispatch', send).finally(() => {
+        dispatch.senders -= 1;
+        if (dispatch.senders === 0) dispatches.delete(original.requestId);
+      });
+    },
+  });
   return {
     prepare: async (machineId: string, input: E2eeDispatchInput) => {
       if (closed) throw new Error('e2ee_rpc_closed');
       const started = Date.now();
-      const original = await Effect.runPromise(
-        Effect.tryPromise({
-          try: () => options.prepare(machineId, input),
-          catch: () => new Error('e2ee_rpc_prepare'),
-        }).pipe(Effect.timeout('200 millis'))
-      );
-      if (closed) throw new Error('e2ee_rpc_closed');
-      console.debug('[e2ee-rpc-timing]', {
-        stage: 'send',
-        requestId: original.requestId,
-        userTurnId: input.userTurnId,
-        at: started,
+      const native = Promise.resolve()
+        .then(() => options.prepare(machineId, input))
+        .then(
+          (prepared) => {
+            withdrawn.delete(machineId);
+            return prepared;
+          },
+          (cause: unknown) => {
+            // Keep the host's verified withdrawal distinct: senders refuse to write that input.
+            if (cause instanceof Error && /(?:^|: )e2ee_machine_not_shared$/.test(cause.message))
+              withdrawn.add(machineId);
+            throw new Error(
+              withdrawn.has(machineId) ? E2EE_MACHINE_NOT_SHARED : 'e2ee_rpc_prepare'
+            );
+          }
+        );
+      const ready = native.then((original) => {
+        if (closed) throw new Error('e2ee_rpc_closed');
+        console.debug('[e2ee-rpc-timing]', {
+          stage: 'send',
+          requestId: original.requestId,
+          userTurnId: input.userTurnId,
+          at: started,
+        });
+        return prepared(original, input);
       });
-      return {
-        original,
-        send: () =>
-          Effect.runPromise(
-            Effect.gen(function* () {
-              const client = yield* channel(original);
-              const result = yield* client.send(original, { kind: 'dispatch', input });
-              return result && 'type' in result ? result : null;
-            })
-          ),
-      };
+      ready.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      return await Promise.race([
+        ready,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                withdrawn.has(machineId)
+                  ? new Error(E2EE_MACHINE_NOT_SHARED)
+                  : new EncryptedPrepareTimeout(ready)
+              ),
+            PREPARE_DEADLINE_MS
+          );
+        }),
+      ]).finally(() => clearTimeout(timer));
     },
     requestFeature,
-    query: (machineId: string, method: string, params: unknown, timeoutMs: number) =>
+    query: (
+      machineId: string,
+      method: string,
+      params: unknown,
+      timeoutMs: number,
+      supportsRemoteControl: () => Promise<boolean>
+    ) =>
       callEncryptedReadFeature({
         workspaceId: options.workspaceId,
         machineId,
@@ -144,6 +452,7 @@ export function createEncryptedDispatchLegacy(options: {
         params,
         timeoutMs,
         request: requestFeature,
+        supportsRemoteControl,
       }),
     close: async () => {
       closed = true;

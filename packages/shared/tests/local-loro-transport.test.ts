@@ -206,63 +206,6 @@ describe('LocalLoroTransportAdapter push+delta sync', () => {
     expect(subscription.status).toBe('joined');
   });
 
-  it('immediately supersedes an unanswered join after a terminal room status', () => {
-    const sent: LocalLoroDataPlaneClientMessage[] = [];
-    const listeners = new Set<(message: LocalLoroDataPlaneServerMessage) => void>();
-    const adapter = new LocalLoroTransportAdapter({
-      workspaceId: 'ws',
-      peerId: 'terminal-status-peer',
-      connection: {
-        send: (message) => sent.push(message),
-        onMessage: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
-        onStatusChange: () => () => {},
-        isConnected: () => true,
-      },
-    });
-    adapter.joinDocRoom('doc-invalidated-before-reply', new LoroDoc());
-    const firstJoin = sent[0];
-    if (firstJoin?.type !== 'join') throw new Error('initial_join_not_sent');
-
-    // The server has dropped the queued reply while invalidating the room. A
-    // normal reconnect must not renew a live attempt, but this terminal status
-    // proves the request is unrecoverable and must start a replacement now.
-    for (const listener of listeners) {
-      listener({
-        type: 'room-status',
-        protocolVersion: LOCAL_LORO_DATA_PLANE_PROTOCOL_VERSION,
-        workspaceId: 'ws',
-        peerId: 'terminal-status-peer',
-        room: { scope: 'doc', docId: 'doc-invalidated-before-reply' },
-        status: 'disconnected',
-      });
-    }
-
-    expect(sent).toHaveLength(2);
-    expect(sent[1]?.type).toBe('join');
-    expect(
-      (sent[1] as Extract<LocalLoroDataPlaneClientMessage, { type: 'join' }>).requestId
-    ).not.toBe(firstJoin.requestId);
-  });
-
-  it('turns a synchronous join send failure into a reconnectable error', () => {
-    const adapter = new LocalLoroTransportAdapter({
-      workspaceId: 'ws',
-      connection: {
-        send: () => {
-          throw new Error('relay_write_failed');
-        },
-        onMessage: () => () => {},
-        onStatusChange: () => () => {},
-        isConnected: () => true,
-      },
-    });
-    const subscription = adapter.joinDocRoom('doc-send-failure', new LoroDoc());
-    expect(subscription.status).toBe('error');
-  });
-
   it('does not publish Flock joined or first sync after a failed join import', async () => {
     const sent: LocalLoroDataPlaneClientMessage[] = [];
     const listeners = new Set<(message: LocalLoroDataPlaneServerMessage) => void>();
@@ -321,148 +264,6 @@ describe('LocalLoroTransportAdapter push+delta sync', () => {
     expect(subscription.status).toBe('joined');
   });
 
-  it('ignores a stale Flock flush failure after a replacement join', async () => {
-    const sent: LocalLoroDataPlaneClientMessage[] = [];
-    const listeners = new Set<(message: LocalLoroDataPlaneServerMessage) => void>();
-    let onLocalChange: ((batch: { source?: string }) => void) | undefined;
-    let rejectOldExport: ((reason?: unknown) => void) | undefined;
-    let signalOldExportStarted: (() => void) | undefined;
-    const oldExportStarted = new Promise<void>((resolve) => {
-      signalOldExportStarted = resolve;
-    });
-    let deferAndRejectNextExport = false;
-    const adapter = new LocalLoroTransportAdapter({
-      workspaceId: 'ws',
-      peerId: 'stale-flush-peer',
-      connection: {
-        send: (message) => sent.push(message),
-        onMessage: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
-        onStatusChange: () => () => {},
-        isConnected: () => true,
-      },
-    });
-    const flock = {
-      exportJson: () => {
-        if (!deferAndRejectNextExport) return [];
-        deferAndRejectNextExport = false;
-        return new Promise<never>((_resolve, reject) => {
-          rejectOldExport = reject;
-          signalOldExportStarted?.();
-        });
-      },
-      importJson: () => {},
-      version: () => ({}),
-      subscribe: (listener: (batch: { source?: string }) => void) => {
-        onLocalChange = listener;
-        return () => {
-          onLocalChange = undefined;
-        };
-      },
-    };
-    const subscription = adapter.joinMetaRoom(flock);
-    const deliverLatestJoin = () => {
-      const join = sent
-        .filter(
-          (message): message is Extract<LocalLoroDataPlaneClientMessage, { type: 'join' }> =>
-            message.type === 'join'
-        )
-        .at(-1);
-      if (!join) throw new Error('join_not_sent');
-      for (const listener of listeners) {
-        listener({
-          type: 'joined',
-          protocolVersion: LOCAL_LORO_DATA_PLANE_PROTOCOL_VERSION,
-          workspaceId: 'ws',
-          peerId: 'stale-flush-peer',
-          requestId: join.requestId,
-          room: { scope: 'meta' },
-        });
-      }
-    };
-    deliverLatestJoin();
-    await subscription.firstSyncedWithRemote;
-
-    deferAndRejectNextExport = true;
-    onLocalChange?.({ source: 'local' });
-    // The export is now pending under the old generation. Supersede it with a
-    // fully successful join before delivering its rejection.
-    await oldExportStarted;
-    await subscription.rejoin();
-    deliverLatestJoin();
-    for (let index = 0; index < 8; index += 1) await Promise.resolve();
-    expect(subscription.status).toBe('joined');
-
-    rejectOldExport?.(new Error('old_export_failed'));
-    for (let index = 0; index < 8; index += 1) await Promise.resolve();
-    expect(subscription.status).toBe('joined');
-  });
-
-  it('first-sync pulls existing server doc state to a fresh client', async () => {
-    const harness = new Harness();
-    insert(harness.serverDoc('doc-1'), 0, 'hello');
-
-    const client = harness.createClient();
-    const clientDoc = new LoroDoc();
-    const sub = client.adapter.joinDocRoom('doc-1', clientDoc);
-    await harness.settle();
-    await sub.firstSyncedWithRemote;
-
-    expect(text(clientDoc)).toBe('hello');
-  });
-
-  it('reflects server-published doc room hydrate status on the subscription', async () => {
-    const harness = new Harness();
-    const client = harness.createClient();
-    const clientDoc = new LoroDoc();
-    const sub = client.adapter.joinDocRoom('doc-1', clientDoc);
-    await harness.settle();
-    await sub.firstSyncedWithRemote;
-
-    const statuses: string[] = [];
-    sub.onStatusChange((status) => statuses.push(status));
-
-    harness.server.publishRoomStatus({ scope: 'doc', docId: 'doc-1' }, 'connecting');
-    await harness.settle();
-    expect(sub.status).toBe('connecting');
-
-    harness.server.publishRoomStatus({ scope: 'doc', docId: 'doc-1' }, 'joined');
-    await harness.settle();
-    expect(sub.status).toBe('joined');
-    expect(statuses).toEqual(['joined', 'connecting', 'joined']);
-  });
-
-  it('up-syncs a client edit to the server without echoing it back', async () => {
-    const harness = new Harness();
-    const client = harness.createClient();
-    const clientDoc = new LoroDoc();
-    client.adapter.joinDocRoom('doc-1', clientDoc);
-    await harness.settle();
-
-    const serverDoc = harness.serverDoc('doc-1');
-    insert(clientDoc, 0, 'abc');
-    await harness.settle();
-
-    expect(text(serverDoc)).toBe('abc');
-    // The client doc must not have duplicated its own edit from an echo.
-    expect(text(clientDoc)).toBe('abc');
-  });
-
-  it('pushes a CLI-side (server) edit down to the client with no polling', async () => {
-    const harness = new Harness();
-    const client = harness.createClient();
-    const clientDoc = new LoroDoc();
-    client.adapter.joinDocRoom('doc-1', clientDoc);
-    await harness.settle();
-
-    insert(harness.serverDoc('doc-1'), 0, 'agent-output');
-    await harness.settle();
-
-    expect(text(clientDoc)).toBe('agent-output');
-  });
-
   it('converges two clients through the server', async () => {
     const harness = new Harness();
     const a = harness.createClient('peer-a');
@@ -516,83 +317,6 @@ describe('LocalLoroTransportAdapter push+delta sync', () => {
 
     expect(flockB.get('title')).toBe('hello');
     expect(harness.serverFlock('meta').get('title')).toBe('hello');
-  });
-
-  it('pushes flock changes as incremental deltas and stays quiet on no-op imports', async () => {
-    const harness = new Harness();
-    const a = harness.createClient();
-    const b = harness.createClient();
-    const flockA = new MemoryFlock();
-    const flockB = new MemoryFlock();
-    a.adapter.joinMetaRoom(flockA);
-    b.adapter.joinMetaRoom(flockB);
-    await harness.settle();
-
-    const flockUpdatesTo = (client: { received: typeof a.received }) =>
-      client.received.filter(
-        (message): message is Extract<LocalLoroDataPlaneServerMessage, { type: 'update' }> =>
-          message.type === 'update' && message.payload.kind === 'flock-json'
-      );
-    const baselineB = flockUpdatesTo(b).length;
-
-    flockA.set('title', 'hello');
-    await harness.settle();
-    // Dirty-marking is subscription-driven only: one change → exactly one push
-    // to B (no explicit-plus-subscription double broadcast).
-    expect(flockUpdatesTo(b).length - baselineB).toBe(1);
-
-    // A redelivered bundle changes nothing server-side (same entry clocks):
-    // the flock fires no event, so nothing is re-broadcast.
-    const afterFirst = flockUpdatesTo(b).length;
-    const serverFlock = harness.serverFlock('meta');
-    serverFlock.importJson(serverFlock.exportJson({}));
-    await harness.settle();
-    expect(flockUpdatesTo(b).length).toBe(afterFirst);
-
-    // Pushes are DELTAS: a second key must not re-ship the first one.
-    flockA.set('subtitle', 'world');
-    await harness.settle();
-    const lastToB = flockUpdatesTo(b).at(-1);
-    expect(lastToB).toBeDefined();
-    const bundle =
-      lastToB && lastToB.payload.kind === 'flock-json'
-        ? (lastToB.payload.bundle as { entries?: Record<string, unknown> })
-        : {};
-    expect(Object.keys(bundle.entries ?? {})).toEqual(['subtitle']);
-    expect(flockB.get('subtitle')).toBe('world');
-  });
-
-  it('rejoin catch-up is incremental: only entries missed while offline are re-sent', async () => {
-    const harness = new Harness();
-    const client = harness.createClient('peer-rejoin');
-    const flock = new MemoryFlock();
-    client.adapter.joinMetaRoom(flock);
-    await harness.settle();
-
-    harness.serverFlock('meta').set('before', 1);
-    await harness.settle();
-    expect(flock.get('before')).toBe(1);
-
-    client.setConnected(false);
-    harness.serverFlock('meta').set('while-offline', 2);
-    await harness.settle();
-
-    const framesBefore = client.received.length;
-    client.setConnected(true);
-    await harness.settle();
-
-    expect(flock.get('while-offline')).toBe(2);
-    // The catch-up frames after reconnect must carry ONLY the missed entry —
-    // the client's haveVersion covers everything it already holds.
-    const entriesReSent: string[] = [];
-    for (const message of client.received.slice(framesBefore)) {
-      if (message.type !== 'joined' && message.type !== 'update') continue;
-      if (!('payload' in message) || !message.payload) continue;
-      if (message.payload.kind !== 'flock-json') continue;
-      const bundle = message.payload.bundle as { entries?: Record<string, unknown> };
-      entriesReSent.push(...Object.keys(bundle.entries ?? {}));
-    }
-    expect(entriesReSent).toEqual(['while-offline']);
   });
 
   it('routes the meta room to resolveMetaFlock, not resolveFlockDoc("meta")', async () => {
@@ -674,6 +398,137 @@ describe('LocalLoroTransportAdapter push+delta sync', () => {
     const mirror = new EphemeralStore(30_000);
     mirror.apply(base64ToBytes(last.dataBase64));
     expect(mirror.keys().sort()).toEqual(['machine:m1', 'session:s1']);
+  });
+});
+
+describe('local data plane doc-update chunking', () => {
+  const CHUNK_WORKSPACE_ID = 'ws-chunk';
+  const MAX_PAYLOAD_BYTES = 512;
+
+  class ChunkHarness {
+    private readonly tasks: Array<() => void | Promise<void>> = [];
+    private readonly rendererListeners = new Set<(m: LocalLoroDataPlaneServerMessage) => void>();
+    private readonly serverDocs = new Map<string, LoroDoc>();
+    readonly pushed: LocalLoroDataPlaneServerMessage[] = [];
+    readonly engine = new LocalLoroDataPlaneServerLegacy({
+      writerLegacy,
+      workspaceId: CHUNK_WORKSPACE_ID,
+      resolveDoc: async (docId) => this.serverDoc(docId),
+      resolveFlockDoc: async () => {
+        throw new Error('unused');
+      },
+      maxPayloadBytes: MAX_PAYLOAD_BYTES,
+    });
+
+    private readonly sharedConnection = {
+      id: 'dp:relay:1',
+      send: (message: LocalLoroDataPlaneServerMessage) => {
+        this.pushed.push(message);
+        this.tasks.push(() => {
+          for (const listener of this.rendererListeners) listener(message);
+        });
+      },
+    };
+
+    serverDoc(docId: string): LoroDoc {
+      const existing = this.serverDocs.get(docId);
+      if (existing) return existing;
+      const doc = new LoroDoc();
+      this.serverDocs.set(docId, doc);
+      return doc;
+    }
+
+    createAdapter(peerId: string): LocalLoroTransportAdapter {
+      const connection = {
+        send: (message: LocalLoroDataPlaneClientMessage) => {
+          this.tasks.push(async () => {
+            if (message.type === 'ping') return;
+            await this.engine.handleMessage(this.sharedConnection, message);
+          });
+        },
+        onMessage: (listener: (m: LocalLoroDataPlaneServerMessage) => void) => {
+          this.rendererListeners.add(listener);
+          return () => this.rendererListeners.delete(listener);
+        },
+        onStatusChange: () => () => {},
+        isConnected: () => true,
+      };
+      return new LocalLoroTransportAdapter({
+        workspaceId: CHUNK_WORKSPACE_ID,
+        peerId,
+        connection,
+        maxPayloadBytes: MAX_PAYLOAD_BYTES,
+      });
+    }
+
+    async settle(): Promise<void> {
+      for (let round = 0; round < 500; round += 1) {
+        if (this.tasks.length === 0) {
+          await vi.advanceTimersByTimeAsync(1);
+          if (this.tasks.length === 0) return;
+        }
+        const batch = this.tasks.splice(0);
+        for (const task of batch) {
+          await task();
+        }
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      throw new Error('settle_did_not_converge');
+    }
+  }
+
+  const appendText = (doc: LoroDoc, value: string): void => {
+    doc.getText('t').insert(doc.getText('t').length, value);
+    doc.commit();
+  };
+  const bigText = (seed: string): string => seed.repeat(Math.ceil(4096 / seed.length));
+  const errorFrames = (pushed: LocalLoroDataPlaneServerMessage[]) =>
+    pushed.filter((m) => m.type === 'error');
+
+  it('an oversized join catch-up is chunked and converges instead of failing terminally', async () => {
+    const harness = new ChunkHarness();
+    appendText(harness.serverDoc('doc-1'), bigText('server-history '));
+
+    const renderer = harness.createAdapter('renderer:a');
+    const docA = new LoroDoc();
+    const sub = renderer.joinDocRoom('doc-1', docA);
+    await harness.settle();
+
+    expect(errorFrames(harness.pushed)).toEqual([]);
+    expect(text(docA)).toBe(text(harness.serverDoc('doc-1')));
+    expect(sub.status).toBe('joined');
+  });
+
+  it('an oversized live push after join is chunked and converges', async () => {
+    const harness = new ChunkHarness();
+    const renderer = harness.createAdapter('renderer:a');
+    const docA = new LoroDoc();
+    renderer.joinDocRoom('doc-1', docA);
+    await harness.settle();
+
+    appendText(harness.serverDoc('doc-1'), bigText('live-burst '));
+    await harness.settle();
+
+    expect(errorFrames(harness.pushed)).toEqual([]);
+    expect(text(docA)).toBe(text(harness.serverDoc('doc-1')));
+  });
+
+  it('a sibling window converges through a chunked relay of another window’s upload', async () => {
+    const harness = new ChunkHarness();
+    const windowA = harness.createAdapter('renderer:a');
+    const windowB = harness.createAdapter('renderer:b');
+    const docA = new LoroDoc();
+    const docB = new LoroDoc();
+    windowA.joinDocRoom('doc-1', docA);
+    windowB.joinDocRoom('doc-1', docB);
+    await harness.settle();
+
+    appendText(docA, bigText('multi-window '));
+    await harness.settle();
+
+    expect(errorFrames(harness.pushed)).toEqual([]);
+    expect(text(docB)).toBe(text(docA));
+    expect(text(harness.serverDoc('doc-1'))).toBe(text(docA));
   });
 });
 

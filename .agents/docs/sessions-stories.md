@@ -11,6 +11,13 @@ this page is the full text of the rules summarised there.
   attachment-rich list case is `SessionChatStream` → `HumanAndAgentAttachments`;
   shared full-page session conversation coverage is `SessionConversationPage.stories.tsx`
   using `session-conversation-page.tsx`.
+- `SessionHistoryReader` uses the real read-only view inside `WorkspaceCard` with
+  the shell's `WindowDragStrip`. Mac window and 390px compact-window states cover
+  English and Chinese, including the real header menu and Copy submenu. The narrow
+  story resizes the actual manager iframe while retaining the desktop layout family.
+  `tests/e2e/session-history-header.spec.ts` checks pointer clicks, hit testing and
+  computed no-drag regions without forced clicks or injected CSS; native Electron
+  window dragging still needs shell acceptance.
 - `SessionConversationPage` → `DesktopReadingReview` combines synthetic thinking,
   tool calls and results, inline diffs, edited-file summaries, comment references,
   visual annotation references, and Markdown in the real conversation renderers.
@@ -39,7 +46,7 @@ this page is the full text of the rules summarised there.
 tests/e2e/session-info-bar-observation.spec.ts --workers=1` for its browser
   regression and ignored screenshot output. The optional `B08_SCREENSHOT_FIXTURES`
   directory supplies scheduler-captured `before.json` / `after.json` for comparison;
-  see the [observation decision](../notes/proposed/bug-fix/2026-10-01-pr-observation-association.md)
+  see the [observation decision](../notes/implemented/bug-fix/2026-10-01-pr-observation-association.md)
   for evidence and acceptance limits.
 - Browser Preview has `States` (`SessionBrowserPreview.stories.tsx`) for deterministic
   presentation and `Controller` (`SessionBrowserPanel.stories.tsx`) for real Enter and

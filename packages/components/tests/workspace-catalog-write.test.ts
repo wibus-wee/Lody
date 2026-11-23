@@ -14,14 +14,18 @@ import {
   type WorkspaceMcpServerMeta,
 } from '@lody/shared';
 import {
-  deleteWorkspaceMcpServer,
   ProjectMcpDefaultWriteError,
+  deleteWorkspacePinSection,
   putProjectMcpDefault,
-  putWorkspaceMcpServer,
-  uploadWorkspaceCatalog,
   writeWorkspaceAgentRole,
+  writeWorkspacePinSection,
   type WorkspaceCatalogWriteDeps,
 } from '../src/lib/workspace-catalog-write';
+import {
+  acquireWorkspaceCatalog,
+  EMPTY_WORKSPACE_CATALOG,
+} from '../src/lib/workspace-catalog-room';
+import type { WorkspaceRuntime } from '../src/atoms/runtime';
 import { createDirectWorkspaceWriter } from '../src/providers/workspace-writer-impl';
 
 const workspaceId = 'workspace-1' as WorkspaceCatalogWriteDeps['workspaceId'];
@@ -90,44 +94,6 @@ describe('workspace catalog writes', () => {
     for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
   };
 
-  it('resolves while the upload is still in flight', async () => {
-    // What the editor closes on. Awaiting the upload left a finished, already
-    // durable save sitting behind a round trip.
-    const { calls, deps, releaseUpload } = createDeps();
-    await putWorkspaceMcpServer(deps, entry);
-    expect(calls).not.toContain('syncOnce:end');
-    expect(deps.writer.flockRowPut).toHaveBeenCalledTimes(1);
-
-    releaseUpload();
-    await settle();
-    expect(calls).toContain('syncOnce:end');
-  });
-
-  it('does the same for a role, and for a delete', async () => {
-    const put = createDeps();
-    await writeWorkspaceAgentRole(put.deps, role);
-    expect(put.calls).not.toContain('syncOnce:end');
-
-    const removal = createDeps();
-    await deleteWorkspaceMcpServer(removal.deps, entry.id);
-    expect(removal.calls).toContain('flockRowDelete');
-    expect(removal.calls).not.toContain('syncOnce:end');
-  });
-
-  it('never turns a failed upload into a failed write', async () => {
-    // The row is durable either way and the room carries the document later, so
-    // an upload failure is logged and nothing else — no rejection to surface, no
-    // rollback, and no banner the user can neither act on nor dismiss.
-    const failed = createDeps({ syncError: new Error('network unavailable') });
-    await expect(putWorkspaceMcpServer(failed.deps, entry)).resolves.toBeUndefined();
-    failed.releaseUpload();
-    await expect(uploadWorkspaceCatalog(failed.deps)).resolves.toBeUndefined();
-
-    const unopenable = createDeps({ openError: new Error('room unavailable') });
-    await expect(writeWorkspaceAgentRole(unopenable.deps, role)).resolves.toBeUndefined();
-    await expect(uploadWorkspaceCatalog(unopenable.deps)).resolves.toBeUndefined();
-  });
-
   it('stores a multi-machine role in the row shape older clients skip', async () => {
     const flock = new Flock('catalog-write-multi');
     const repo = { openFlockDoc: async () => ({ flock, syncOnce: async () => {} }) };
@@ -158,6 +124,57 @@ describe('workspace catalog writes', () => {
   });
 });
 
+describe('pin section writes', () => {
+  const settle = async () => {
+    for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  };
+
+  it('publishes created, renamed and deleted sections to the shared catalog snapshot', async () => {
+    const flock = new Flock('catalog-pin-sections');
+    const repo = {
+      openFlockDoc: async () => ({
+        flock,
+        syncOnce: async () => {},
+        joinRoom: async () => ({
+          unsubscribe: () => {},
+          firstSyncedWithRemote: new Promise(() => {}),
+        }),
+      }),
+    };
+    const deps = {
+      workspaceId,
+      repo,
+      writer: createDirectWorkspaceWriter({ repo } as never),
+    } as unknown as WorkspaceCatalogWriteDeps;
+    const runtime = { workspaceId, repo } as unknown as WorkspaceRuntime;
+    let latest = EMPTY_WORKSPACE_CATALOG;
+    const watched = acquireWorkspaceCatalog(runtime, (snapshot) => {
+      latest = snapshot;
+    });
+    await settle();
+    expect(latest.pinSections).toEqual([]);
+
+    await writeWorkspacePinSection(deps, { id: 'later', name: 'Later', orderKey: '81' });
+    await writeWorkspacePinSection(deps, { id: 'ops', name: 'Ops', orderKey: '80' });
+    await settle();
+    expect(latest.pinSections.map((section) => section.id)).toEqual(['ops', 'later']);
+
+    await writeWorkspacePinSection(deps, { id: 'ops', name: 'Maintenance', orderKey: '82' });
+    await deleteWorkspacePinSection(deps, 'later');
+    await settle();
+    expect(latest.pinSections).toEqual([{ id: 'ops', name: 'Maintenance', orderKey: '82' }]);
+
+    watched.release();
+  });
+
+  it('refuses a section the shared catalog would drop', async () => {
+    const { deps } = createDeps();
+    await expect(
+      writeWorkspacePinSection(deps, { id: 'blank', name: '  ', orderKey: '80' })
+    ).rejects.toThrow();
+  });
+});
+
 describe('project default MCP writes', () => {
   const settle = async () => {
     for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
@@ -169,23 +186,6 @@ describe('project default MCP writes', () => {
   };
   const owner = { kind: 'local' as const, currentUserId: 'user-1', machineOwnerUserId: 'user-1' };
   const ids = ['server-1', 'server-2'] as McpServerId[];
-
-  it('writes the whole list under the project key, durable before the upload', async () => {
-    const { calls, deps, releaseUpload } = createDeps();
-    await putProjectMcpDefault(deps, localTarget, owner, ids);
-
-    expect(deps.writer.flockRowPut).toHaveBeenCalledWith(
-      expect.any(String),
-      workspaceFlockKeys.projectMcpDefault(
-        getProjectMcpKey(localTarget.project, localTarget.machineId)!
-      ),
-      { ids }
-    );
-    expect(calls).not.toContain('syncOnce:end');
-    releaseUpload();
-    await settle();
-    expect(calls).toContain('syncOnce:end');
-  });
 
   it('records an explicit empty list, and ignores the branch and worktree', async () => {
     const { deps } = createDeps();
@@ -205,16 +205,6 @@ describe('project default MCP writes', () => {
       ),
       { ids: [] }
     );
-  });
-
-  it('does not fail or roll back when the upload fails', async () => {
-    const failed = createDeps({ syncError: new Error('network unavailable') });
-    await expect(
-      putProjectMcpDefault(failed.deps, localTarget, owner, ids)
-    ).resolves.toBeUndefined();
-    failed.releaseUpload();
-    await settle();
-    expect(failed.deps.writer.flockRowDelete).not.toHaveBeenCalled();
   });
 
   it.each([

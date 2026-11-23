@@ -1,3 +1,14 @@
+import {
+  CodeCollabOpenDiffManifestRequestSchema,
+  CodeCollabOpenDiffManifestResponseSchema,
+  CodeCollabReadBlobRequestSchema,
+  CodeCollabReadBlobResponseSchema,
+} from './code-collab-diff';
+import {
+  AndroidEmulatorCommandSchema,
+  AndroidEmulatorRequestSchema,
+  AndroidEmulatorResponseSchema,
+} from './android-emulator';
 import { SessionFileRootIdSchema } from './project-path';
 import { FileDownloadRequestSchema, FileDownloadResponseSchema } from './file-download';
 import { ProjectLocalMemberProbeSchema } from './workspace-project';
@@ -11,6 +22,18 @@ import { isWorkspaceMcpServerMeta, type WorkspaceMcpServerMeta } from './workspa
 import { LocalFileResolutionSchema } from './local-file-preview';
 import { MachinePiExtensionsResponseSchema } from './pi-extensions';
 import { z } from 'zod';
+import {
+  LocalProjectBranchListResultSchema,
+  LocalProjectControlRequestSchema,
+  LocalProjectControlResponseSchema,
+  LocalProjectGitStateSchema,
+  MachineAcpBinaryInstallResponseSchema,
+  MachineProviderRateLimitsRefreshResponseSchema,
+  SessionHistoryReadQuerySchema,
+  SessionHistoryReadResponseSchema,
+  SessionHistoryWriteResponseSchema,
+} from './message-schemas';
+import { RpcSecretEnvelopeSchema, RpcSecretPublicKeySchema } from './rpc-secret';
 import { McpAuthenticationResultSchema, McpLocalAuthenticationSchema } from './mcp-authentication';
 import { SESSION_GOAL_ACTIONS } from './goal';
 import {
@@ -33,7 +56,12 @@ import {
   CodeCollabV2SaveTextRequestSchema,
   CodeCollabV2SaveTextResponseSchema,
 } from './code-collab';
-import { FilePreviewV3RequestSchema, FilePreviewV3ResponseSchema } from './file-preview';
+import {
+  FilePreviewV3RequestSchema,
+  FilePreviewV3ResponseSchema,
+  SessionDirectoryListRequestSchema,
+  SessionDirectoryListResponseSchema,
+} from './file-preview';
 import {
   MachineStatusResponseSchema,
   MachinePingResponseSchema,
@@ -46,10 +74,6 @@ import {
   SessionForkSpecSchema,
   SessionIdSchema,
   AgentConfigIdSchema,
-  SessionPreparationCancelSpecSchema,
-  SessionPreparationSpecSchema,
-  SessionPrepareCancelResponseSchema,
-  SessionPrepareResponseSchema,
   SessionPreviewEndpointAcquireResponseSchema,
   SessionPreviewCreateRequestSchema,
   SessionPreviewCreateResponseSchema,
@@ -93,6 +117,14 @@ export const SessionActiveInvocationContextResultSchema = z.discriminatedUnion('
       inputConfig: z.record(z.string(), z.unknown()),
       notificationOriginTurnIds: z.array(z.string().min(1)).optional(),
       notificationProvenancePending: z.boolean().optional(),
+      // Daemon-hosted tools use the frozen sender without rereading input history.
+      // The legacy socket handler omits this field for older strict readers.
+      sender: z
+        .discriminatedUnion('kind', [
+          z.object({ kind: z.literal('user') }).strict(),
+          z.object({ kind: z.literal('agent'), sessionId: SessionIdSchema }).strict(),
+        ])
+        .optional(),
     })
     .strict(),
 ]);
@@ -116,10 +148,232 @@ export const SessionToolResultSchema = z
   })
   .strict();
 
+export const SorbetProviderIdSchema = z.string().min(1).max(1024);
+export const SorbetCredentialTypeSchema = z.string().min(1).max(1024);
+export const SORBET_CREDENTIALS_MAX_COUNT = 1000;
+const SorbetCredentialSchema = z
+  .object({
+    providerId: SorbetProviderIdSchema,
+    type: SorbetCredentialTypeSchema,
+  })
+  .strict();
+export const SorbetCredentialsResultSchema = z.discriminatedUnion('type', [
+  z
+    .object({
+      type: z.literal('sorbet/credentials-list'),
+      credentials: z.array(SorbetCredentialSchema).max(SORBET_CREDENTIALS_MAX_COUNT),
+    })
+    .strict(),
+  z.object({ type: z.literal('sorbet/credentials-logout') }).strict(),
+]);
+
+export type SorbetCredentialsResult = z.infer<typeof SorbetCredentialsResultSchema>;
+
+/**
+ * A custom Provider Sorbet hosts on the Client's behalf. Its identity, protocol and model
+ * list can come from Lody; Sorbet assigns and owns `id` and can discover models.
+ */
+export const SorbetCustomProviderProtocolSchema = z.enum([
+  'anthropic-messages',
+  'openai-responses',
+  'openai-completions',
+]);
+export const SORBET_CUSTOM_PROVIDER_MODELS_MAX_COUNT = 200;
+const SorbetCustomProviderModelSchema = z
+  .object({
+    id: z.string().trim().min(1).max(200),
+    name: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+export const SorbetCustomProviderInputSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+    protocol: SorbetCustomProviderProtocolSchema,
+    baseUrl: z.string().trim().min(1).max(2048),
+    models: z.array(SorbetCustomProviderModelSchema).max(SORBET_CUSTOM_PROVIDER_MODELS_MAX_COUNT),
+  })
+  .strict();
+/**
+ * What the user can change on a stored endpoint. Models stay Sorbet's: the
+ * machine keeps the discovered list and any curated fields it holds.
+ */
+export const SorbetCustomProviderEditSchema = SorbetCustomProviderInputSchema.omit({
+  models: true,
+}).strict();
+export const SorbetCustomProviderSchema = SorbetCustomProviderInputSchema.extend({
+  id: SorbetProviderIdSchema,
+}).strict();
+
+export const SorbetAvailableModelSchema = z
+  .object({
+    selector: z.string().trim().min(1).max(2048),
+    providerId: SorbetProviderIdSchema,
+    modelId: z.string().trim().min(1).max(1024),
+    displayName: z.string().trim().min(1).max(1024),
+  })
+  .strict();
+
+export const SorbetProvidersResultSchema = z.discriminatedUnion('type', [
+  z
+    .object({
+      type: z.literal('sorbet/providers-list'),
+      providers: z.array(SorbetCustomProviderSchema).max(SORBET_CREDENTIALS_MAX_COUNT),
+    })
+    .strict(),
+  z
+    .object({ type: z.literal('sorbet/providers-create'), provider: SorbetCustomProviderSchema })
+    .strict(),
+  z
+    .object({ type: z.literal('sorbet/providers-update'), provider: SorbetCustomProviderSchema })
+    .strict(),
+  z.object({ type: z.literal('sorbet/providers-delete') }).strict(),
+  z.object({ type: z.literal('sorbet/providers-refresh') }).strict(),
+  z
+    .object({
+      type: z.literal('sorbet/models-list'),
+      models: z.array(SorbetAvailableModelSchema).max(10_000),
+    })
+    .strict(),
+]);
+
+export type SorbetCustomProviderInput = z.infer<typeof SorbetCustomProviderInputSchema>;
+export type SorbetCustomProviderEdit = z.infer<typeof SorbetCustomProviderEditSchema>;
+export type SorbetCustomProvider = z.infer<typeof SorbetCustomProviderSchema>;
+export type SorbetProvidersResult = z.infer<typeof SorbetProvidersResultSchema>;
+
+export const E2eeAcpInteractionParamsSchema = z.union([
+  z
+    .object({
+      action: z.literal('start'),
+      kind: z.literal('probe'),
+      configId: AgentConfigIdSchema,
+      force: z.boolean().optional(),
+      responseKey: RpcSecretPublicKeySchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('start'),
+      kind: z.literal('authenticate'),
+      configId: AgentConfigIdSchema,
+      methodId: z.string().trim().min(1).max(1024).optional(),
+      responseKey: RpcSecretPublicKeySchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('activate'),
+      interactionRequestId: z.string().regex(/^[0-9a-f]{32}$/),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('poll'),
+      interactionRequestId: z.string().regex(/^[0-9a-f]{32}$/),
+      progressAck: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('submit'),
+      interactionRequestId: z.string().regex(/^[0-9a-f]{32}$/),
+      interactionId: z.string().trim().min(1).max(1024),
+      inputEnvelope: RpcSecretEnvelopeSchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('cancel'),
+      interactionRequestId: z.string().regex(/^[0-9a-f]{32}$/),
+    })
+    .strict(),
+]);
+
+export const E2eeAcpInteractionResultSchema = z
+  .object({
+    type: z.literal('machine/acp-interaction'),
+    interactionRequestId: z.string().regex(/^[0-9a-f]{32}$/),
+    state: z.enum(['running', 'completed', 'cancelled', 'expired']),
+    inputPublicKey: RpcSecretPublicKeySchema.optional(),
+    responseEnvelope: RpcSecretEnvelopeSchema.optional(),
+  })
+  .strict();
+
 export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
   BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('session/history-write'),
+    params: z
+      .object({
+        sessionId: SessionIdSchema,
+        operation: z.enum(['accept_input', 'accept_input_and_dispatch']),
+        payload: z.object({ entry: z.record(z.string(), z.unknown()) }).strict(),
+      })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('session/history-read'),
+    params: z.object({ sessionId: SessionIdSchema, query: SessionHistoryReadQuerySchema }).strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('machine/acp-interaction'),
+    params: E2eeAcpInteractionParamsSchema,
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/credentials-list'),
+    params: z.object({ configId: AgentConfigIdSchema }).strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/credentials-logout'),
+    params: z
+      .object({ configId: AgentConfigIdSchema, providerId: SorbetProviderIdSchema })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/providers-list'),
+    params: z.object({ configId: AgentConfigIdSchema }).strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/providers-create'),
+    params: z
+      .object({ configId: AgentConfigIdSchema, provider: SorbetCustomProviderInputSchema })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/providers-update'),
+    params: z
+      .object({
+        configId: AgentConfigIdSchema,
+        providerId: SorbetProviderIdSchema,
+        provider: SorbetCustomProviderEditSchema,
+      })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/providers-delete'),
+    params: z
+      .object({ configId: AgentConfigIdSchema, providerId: SorbetProviderIdSchema })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/providers-refresh'),
+    params: z
+      .object({ configId: AgentConfigIdSchema, providerId: SorbetProviderIdSchema.optional() })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/models-list'),
+    params: z
+      .object({ configId: AgentConfigIdSchema, providerId: SorbetProviderIdSchema.optional() })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('machine/status'),
-    params: z.object({}).strict(),
+    params: z
+      .object({
+        includeDisk: z.literal(true).optional(),
+        includeDaemonUpdate: z.literal(true).optional(),
+      })
+      .strict(),
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('machine/ping'),
@@ -131,7 +385,12 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('session/live-status'),
-    params: z.object({ sessionId: z.string().trim().min(1) }).strict(),
+    params: z
+      .object({
+        sessionId: z.string().trim().min(1),
+        includeActivity: z.literal(true).optional(),
+      })
+      .strict(),
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('file/download-chunk'),
@@ -140,7 +399,33 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
 
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('project/probe-local-member'),
-    params: z.object({ localProjectId: z.string().trim().min(1) }).strict(),
+    params: z
+      .object({
+        localProjectId: z.string().trim().min(1),
+        requestedByUserId: z.string().trim().min(1).optional(),
+      })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('local-project/git-state'),
+    params: z
+      .object({
+        localProjectId: z.string().trim().min(1),
+        requestedByUserId: z.string().trim().min(1),
+      })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('local-project/list-branches'),
+    params: z
+      .object({
+        localProjectId: z.string().trim().min(1),
+        requestedByUserId: z.string().trim().min(1),
+        query: z.string().max(256).optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+        cursor: z.string().trim().min(1).max(512).optional(),
+      })
+      .strict(),
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('ios-simulator/agent-control'),
@@ -149,6 +434,16 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('ios-simulator/control'),
     params: IosSimulatorRequestSchema,
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('android-emulator/agent-control'),
+    params: z
+      .object({ sessionId: SessionIdSchema, command: AndroidEmulatorCommandSchema })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('android-emulator/control'),
+    params: AndroidEmulatorRequestSchema,
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('mcp/list-tools'),
@@ -209,6 +504,14 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('code-collab/save-text'),
     params: CodeCollabV2SaveTextRequestSchema,
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('code-collab/open-diff-manifest'),
+    params: CodeCollabOpenDiffManifestRequestSchema,
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('code-collab/read-blob'),
+    params: CodeCollabReadBlobRequestSchema,
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('code-collab/open-current-diff'),
@@ -300,14 +603,6 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
       .strict(),
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
-    method: z.literal('session/prepare'),
-    params: SessionPreparationSpecSchema,
-  }).strict(),
-  BaseLocalMachineRpcRequestSchema.extend({
-    method: z.literal('session/prepare-cancel'),
-    params: SessionPreparationCancelSpecSchema,
-  }).strict(),
-  BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('session/steer'),
     params: z
       .object({
@@ -394,6 +689,33 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
       })
       .strict(),
   }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('session/withdraw-input'),
+    params: z
+      .object({
+        sessionId: z.string().trim().min(1),
+        userTurnId: z.string().trim().min(1),
+        requesterSessionId: z.string().trim().min(1),
+        userId: z.string().trim().min(1),
+      })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('file/list-dir'),
+    params: SessionDirectoryListRequestSchema,
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('local-project/control'),
+    params: z.object({ request: LocalProjectControlRequestSchema }).strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('machine/acp-binary-install'),
+    params: z.object({ agentType: z.string().trim().min(1) }).strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('machine/provider-rate-limits-refresh'),
+    params: z.object({ configId: AgentConfigIdSchema }).strict(),
+  }).strict(),
 ]);
 
 export type LocalMachineRpcRequest = z.infer<typeof LocalMachineRpcRequestSchema>;
@@ -405,7 +727,98 @@ export const ProjectProbeLocalMemberResultSchema = ProjectLocalMemberProbeSchema
 
 export type ProjectProbeLocalMemberResult = z.infer<typeof ProjectProbeLocalMemberResultSchema>;
 
+export const LocalProjectListBranchesRpcResponseSchema = z.discriminatedUnion('success', [
+  z
+    .object({
+      type: z.literal('local-project/list-branches_response'),
+      machineId: z.string().trim().min(1),
+      workspaceId: z.string().trim().min(1),
+      localProjectId: z.string().trim().min(1),
+      success: z.literal(true),
+      result: LocalProjectBranchListResultSchema,
+      observedAtMs: z.number().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('local-project/list-branches_response'),
+      machineId: z.string().trim().min(1),
+      workspaceId: z.string().trim().min(1),
+      localProjectId: z.string().trim().min(1),
+      success: z.literal(false),
+      error: z.string().trim().min(1),
+      message: z.string().trim().min(1).optional(),
+    })
+    .strict(),
+]);
+
+export type LocalProjectListBranchesRpcResponse = z.infer<
+  typeof LocalProjectListBranchesRpcResponseSchema
+>;
+
+export const LocalProjectGitStateRpcResponseSchema = z.discriminatedUnion('success', [
+  z
+    .object({
+      type: z.literal('local-project/git-state_response'),
+      machineId: z.string().trim().min(1),
+      workspaceId: z.string().trim().min(1),
+      localProjectId: z.string().trim().min(1),
+      success: z.literal(true),
+      state: LocalProjectGitStateSchema,
+      observedAtMs: z.number().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('local-project/git-state_response'),
+      machineId: z.string().trim().min(1),
+      workspaceId: z.string().trim().min(1),
+      localProjectId: z.string().trim().min(1),
+      success: z.literal(false),
+      error: z.string().trim().min(1),
+      message: z.string().trim().min(1).optional(),
+    })
+    .strict(),
+]);
+
 const SessionLiveStateSchema = z.enum(['idle', 'initializing', 'running', 'waiting', 'unknown']);
+
+/**
+ * What a busy Session is doing, read on demand by its owning daemon and never
+ * published on presence. Sent only when the request asked with `includeActivity`.
+ */
+export const SessionLiveActivitySchema = z
+  .object({
+    turnStartedAt: z.number().finite().nonnegative().optional(),
+    lastOutputAt: z.number().finite().nonnegative().optional(),
+    currentAction: z.string().max(200).optional(),
+    queuedInputs: z.number().int().nonnegative(),
+  })
+  .strict();
+export type SessionLiveActivity = z.infer<typeof SessionLiveActivitySchema>;
+
+/**
+ * Best-effort withdrawal of a queued input that has not started. `withdrawn`
+ * means the input was still pending and is now canceled; a dispatch racing the
+ * withdrawal may still run it, which callers observe in the target history.
+ */
+export const SessionWithdrawInputResponseSchema = z
+  .object({
+    type: z.literal('session/withdraw-input_response'),
+    sessionId: z.string().trim().min(1),
+    userTurnId: z.string().trim().min(1),
+    outcome: z.enum([
+      'withdrawn',
+      'already_withdrawn',
+      'already_started',
+      'not_found',
+      'not_owner',
+      'error',
+    ]),
+    error: z.string().optional(),
+  })
+  .strict();
+export type SessionWithdrawInputResponse = z.infer<typeof SessionWithdrawInputResponseSchema>;
 
 export const SessionLiveStatusResponseSchema = z.discriminatedUnion('success', [
   z
@@ -417,6 +830,7 @@ export const SessionLiveStatusResponseSchema = z.discriminatedUnion('success', [
       state: SessionLiveStateSchema,
       observedAtMs: z.number().finite().nonnegative(),
       reason: z.string().trim().min(1).optional(),
+      activity: SessionLiveActivitySchema.optional(),
     })
     .strict(),
   z
@@ -432,22 +846,31 @@ export const SessionLiveStatusResponseSchema = z.discriminatedUnion('success', [
 ]);
 
 export const LocalMachineRpcResultSchema = z.union([
+  SessionHistoryReadResponseSchema,
+  SessionHistoryWriteResponseSchema,
+  E2eeAcpInteractionResultSchema,
+  SorbetProvidersResultSchema,
   MachineStatusResponseSchema,
   MachinePingResponseSchema,
   MachineAcpBinaryStatusResponseSchema,
   SessionLiveStatusResponseSchema,
   FileDownloadResponseSchema,
   ProjectProbeLocalMemberResultSchema,
+  LocalProjectListBranchesRpcResponseSchema,
   MemoryProviderResponseSchema,
   IosSimulatorResponseSchema,
+  AndroidEmulatorResponseSchema,
   McpToolListResultSchema,
   McpAuthenticationResultSchema,
+  SorbetCredentialsResultSchema,
   SessionToolResultSchema,
   SessionActiveInvocationContextResultSchema,
   CodeCollabV2FileIndexSnapshotSchema,
   CodeCollabV2OpenTextOkSchema,
   CodeCollabV2RefreshTextResponseSchema,
   CodeCollabV2SaveTextResponseSchema,
+  CodeCollabOpenDiffManifestResponseSchema,
+  CodeCollabReadBlobResponseSchema,
   CodeCollabV2OpenCurrentDiffResponseSchema,
   CodeCollabV2OpenAllChangesDiffResponseSchema,
   CodeCollabV2OpenTurnDiffResponseSchema,
@@ -460,8 +883,6 @@ export const LocalMachineRpcResultSchema = z.union([
   SessionDispatchTurnResponseSchema,
   SessionEditAndResendResponseSchema,
   SessionForkResponseSchema,
-  SessionPrepareResponseSchema,
-  SessionPrepareCancelResponseSchema,
   SessionPreviewEndpointAcquireResponseSchema,
   SessionPreviewEndpointReleaseResponseSchema,
   SessionSteerResponseSchema,
@@ -471,7 +892,30 @@ export const LocalMachineRpcResultSchema = z.union([
   SessionGoalResponseSchema,
   SessionTerminateResponseSchema,
   MachinePiExtensionsResponseSchema,
+  SessionDirectoryListResponseSchema,
+  LocalProjectGitStateRpcResponseSchema,
+  LocalProjectControlResponseSchema,
+  MachineAcpBinaryInstallResponseSchema,
+  MachineProviderRateLimitsRefreshResponseSchema,
+  SessionWithdrawInputResponseSchema,
 ]);
+export type SorbetCredentialsListRequest = Extract<
+  LocalMachineRpcRequest,
+  { method: 'sorbet/credentials-list' }
+>;
+export type SorbetCredentialsLogoutRequest = Extract<
+  LocalMachineRpcRequest,
+  { method: 'sorbet/credentials-logout' }
+>;
+export type SorbetCredentialsListResult = Extract<
+  SorbetCredentialsResult,
+  { type: 'sorbet/credentials-list' }
+>;
+export type SorbetCredentialsLogoutResult = Extract<
+  SorbetCredentialsResult,
+  { type: 'sorbet/credentials-logout' }
+>;
+
 export type LocalMachineRpcResult = z.infer<typeof LocalMachineRpcResultSchema>;
 
 export const LocalMachineRpcResponseSchema = z.union([

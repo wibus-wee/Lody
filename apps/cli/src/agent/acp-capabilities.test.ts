@@ -6,6 +6,7 @@ import os from 'node:os';
 import type { CodexProfileExecution } from './codex-profile-runtime';
 import type { StartLocalAcpAgentOptions } from './acp-runner';
 
+import type { SessionId } from '@lody/shared';
 import type { Logger } from '@/utils/logger';
 
 const mocks = vi.hoisted(() => ({
@@ -28,8 +29,12 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return { ...actual, mkdtemp: vi.fn(actual.mkdtemp), rm: vi.fn(actual.rm) };
 });
 
-import { fetchAcpCapabilities } from './acp-capabilities';
-import { AcpAuthenticationRequiredError } from './agent-client';
+import {
+  ACP_MODEL_OPTIONS_SWITCH_TIMEOUT_MS,
+  ACP_PROBE_COMMANDS_WAIT_MS,
+  fetchAcpCapabilities,
+} from './acp-capabilities';
+import { AcpAuthenticationRequiredError, AgentClient } from './agent-client';
 
 const createSilentLogger = (): Logger => ({
   info: () => {},
@@ -44,7 +49,10 @@ const createSilentLogger = (): Logger => ({
   close: async () => {},
 });
 
-function createSuccessfulStartupResult(sessionResponse?: Record<string, unknown>) {
+function createSuccessfulStartupResult(
+  sessionResponse?: Record<string, unknown>,
+  authMethods: readonly Record<string, unknown>[] = []
+) {
   return {
     agentProcess: {} as never,
     client: {
@@ -52,6 +60,8 @@ function createSuccessfulStartupResult(sessionResponse?: Record<string, unknown>
       getRateLimitsCapability: () => undefined,
       supportsAcknowledgedSteer: () => false,
       getGoalCapability: () => undefined,
+      getAuthMethods: () => authMethods,
+      waitForAvailableCommands: async () => undefined,
     } as never,
     acpSessionId: 'acp-session-1' as never,
     sessionResponse: sessionResponse ?? {
@@ -102,24 +112,113 @@ describe('fetchAcpCapabilities', () => {
     mocks.startLocalAcpAgent.mockImplementation(async () => createSuccessfulStartupResult());
   });
 
-  it('defers builtin Codex authentication to ACP session creation', async () => {
-    const result = await fetchAcpCapabilities('builtin', 'codex', createSilentLogger());
+  it('projects the official registry Antigravity quota reader without enabling custom namesakes', async () => {
+    const official = await fetchAcpCapabilities(
+      'registry',
+      'antigravity-acp',
+      createSilentLogger()
+    );
+    const builtin = await fetchAcpCapabilities('builtin', 'antigravity', createSilentLogger());
+    expect(builtin.rateLimits).toEqual({ version: 1, query: true });
+    const custom = await fetchAcpCapabilities('custom', 'antigravity-acp', createSilentLogger());
+    const other = await fetchAcpCapabilities('registry', 'another-agent', createSilentLogger());
+    expect(official.rateLimits).toEqual({ version: 1, query: true });
+    expect(custom.rateLimits).toBeUndefined();
+    expect(other.rateLimits).toBeUndefined();
+  });
 
-    expect(mocks.startLocalAcpAgent).toHaveBeenCalledTimes(1);
-    expect(mocks.probeBuiltinAuthentication).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cliType: 'builtin',
-        agentType: 'codex',
-      })
+  it('discovers authentication methods only for the Sorbet probe', async () => {
+    mocks.startLocalAcpAgent.mockImplementation(async (options: StartLocalAcpAgentOptions) =>
+      createSuccessfulStartupResult(
+        undefined,
+        options.discoverAuthenticationMethods
+          ? [{ id: 'sorbet:example:oauth', name: 'Example OAuth' }]
+          : []
+      )
     );
-    expect(mocks.startLocalAcpAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cliType: 'builtin',
-        agentType: 'codex',
-        runtimeOverrides: undefined,
-      })
+    const sorbet = await fetchAcpCapabilities('builtin', 'sorbet', createSilentLogger());
+    const other = await fetchAcpCapabilities('builtin', 'bub', createSilentLogger());
+    expect(sorbet.authMethods).toEqual([{ id: 'sorbet:example:oauth', name: 'Example OAuth' }]);
+    expect(other.authMethods).toEqual([]);
+  });
+
+  it('advertises the Provider session defaults as the probe session current values', async () => {
+    const state = { model: 'a/fast', thought_level: 'low', permission_mode: 'ask' };
+    const options = () => [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select' as const,
+        currentValue: state.model,
+        options: [
+          { value: 'a/fast', name: 'Fast' },
+          { value: 'a/deep', name: 'Deep' },
+        ],
+      },
+      {
+        id: 'thought_level',
+        name: 'Thinking',
+        category: 'thought_level',
+        type: 'select' as const,
+        currentValue: state.thought_level,
+        options: (state.model === 'a/deep' ? ['low', 'high'] : ['low']).map((value) => ({
+          value,
+          name: value,
+        })),
+      },
+      {
+        id: 'permission_mode',
+        name: 'Permissions',
+        type: 'select' as const,
+        currentValue: state.permission_mode,
+        options: ['ask', 'auto', 'full-access'].map((value) => ({ value, name: value })),
+      },
+    ];
+    mocks.startLocalAcpAgent.mockImplementation(async () => {
+      const started = createSuccessfulStartupResult({
+        sessionId: 'acp-session-1',
+        configOptions: options(),
+      });
+      Object.assign(started.client as object, {
+        setSessionConfigOption: async (_session: string, id: string, value: string) => {
+          if (id === 'thought_level' && !options()[1]!.options.some((o) => o.value === value))
+            throw new Error('unsupported level for this model');
+          (state as Record<string, string>)[id] = value;
+          return options();
+        },
+      });
+      return started;
+    });
+
+    const probed = await fetchAcpCapabilities(
+      'builtin',
+      'sorbet',
+      createSilentLogger(),
+      {},
+      undefined,
+      undefined,
+      {
+        sessionDefaults: {
+          configOptionValues: {
+            // Listed before the model on purpose: `high` exists only once the model is `a/deep`.
+            thought_level: 'high',
+            model: 'a/deep',
+            permission_mode: 'full-access',
+            sandbox: 'off',
+          },
+        },
+      }
     );
-    expect(result.models.map((model) => model.modelId)).toEqual(['claude-sonnet']);
+
+    const current = Object.fromEntries(
+      (probed.configOptions ?? []).map((option) => [option.id, option.currentValue])
+    );
+    expect(current).toEqual({
+      model: 'a/deep',
+      thought_level: 'high',
+      permission_mode: 'full-access',
+    });
   });
 
   it('reports missing builtin credentials before starting the ACP adapter', async () => {
@@ -224,6 +323,7 @@ describe('fetchAcpCapabilities', () => {
         if (failure === 'startup') throw error;
         const startup = createSuccessfulStartupResult();
         startup.client = {
+          ...(startup.client as object),
           supportsSessionFork: () => {
             throw error;
           },
@@ -387,104 +487,87 @@ describe('fetchAcpCapabilities', () => {
     expect(existsSync(workdir)).toBe(false);
   });
 
-  it('records provider title ownership from the live initialization', async () => {
-    const startup = createSuccessfulStartupResult();
-    Object.assign(startup.client, { supportsSessionTitleGeneration: () => true });
-    mocks.startLocalAcpAgent.mockResolvedValue(startup);
-    const result = await fetchAcpCapabilities('custom', 'title-agent', createSilentLogger());
-    expect(result.sessionTitle).toBe(true);
-  });
-
-  it.each([undefined, { version: 1 }, { version: 1, query: true }])(
-    'preserves the initialized quota capability %j',
-    async (capability) => {
-      const startup = createSuccessfulStartupResult();
-      Object.assign(startup.client, { getRateLimitsCapability: () => capability });
-      mocks.startLocalAcpAgent.mockResolvedValue(startup);
-      const result = await fetchAcpCapabilities('custom', 'quota-agent', createSilentLogger());
-      expect(result.rateLimits).toEqual(capability);
-    }
-  );
-
-  it('records the goal actions the live client advertised', async () => {
-    const startupResult = createSuccessfulStartupResult();
-    startupResult.client = {
-      supportsSessionTitleGeneration: () => false,
-      getRateLimitsCapability: () => undefined,
-      supportsAcknowledgedSteer: () => false,
-      getGoalCapability: () => ({ version: 1, actions: ['pause', 'resume'] }),
-    } as never;
-    mocks.startLocalAcpAgent.mockResolvedValue(startupResult);
-
-    const result = await fetchAcpCapabilities('registry', 'goal-agent', createSilentLogger());
-
-    expect(result.goalActions).toEqual(['pause', 'resume']);
-  });
-
-  it('leaves goal actions absent for a runtime with no goal extension', async () => {
-    mocks.startLocalAcpAgent.mockResolvedValue(createSuccessfulStartupResult());
-
-    const result = await fetchAcpCapabilities('registry', 'plain-agent', createSilentLogger());
-
-    expect(result.goalActions).toBeUndefined();
-  });
-
-  it('preserves acknowledged steering support discovered from the live client', async () => {
-    const startupResult = createSuccessfulStartupResult();
-    startupResult.client = {
-      supportsSessionTitleGeneration: () => false,
-      getRateLimitsCapability: () => undefined,
-      supportsAcknowledgedSteer: () => true,
-      getGoalCapability: () => undefined,
-    } as never;
-    mocks.startLocalAcpAgent.mockResolvedValue(startupResult);
-
-    const result = await fetchAcpCapabilities('registry', 'steering-agent', createSilentLogger());
-
-    expect(result.acknowledgedSteer).toBe(true);
-  });
-
-  it('uses commands from NewSessionResponse and ignores command update notifications', async () => {
-    mocks.startLocalAcpAgent.mockImplementation(async (options) => {
-      options.onUpdateMessage({
+  describe('slash command preview', () => {
+    const startRealClient = (response: Record<string, unknown>) => {
+      const client = new AgentClient({
+        sessionId: 'probe-session' as SessionId,
+        logger: createSilentLogger(),
+        terminalManager: {} as never,
+        onUpdateMessage: () => {},
+        onRequestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
+      });
+      Object.assign(client, { connection: {} });
+      client.adoptPreparedSession({
+        sessionId: 'acp-session-1',
+        ...response,
+      } as Parameters<AgentClient['adoptPreparedSession']>[0]);
+      let markStarted = () => {};
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      mocks.startLocalAcpAgent.mockImplementation(async () => {
+        markStarted();
+        return {
+          ...createSuccessfulStartupResult({ sessionId: 'acp-session-1', ...response }),
+          client,
+        };
+      });
+      return { client, started };
+    };
+    const advertise = (client: AgentClient, name: string) =>
+      client.sessionUpdate({
+        sessionId: 'acp-session-1',
         update: {
           sessionUpdate: 'available_commands_update',
-          availableCommands: [{ name: '/late', description: 'Late update' }],
+          availableCommands: [{ name, description: name }],
         },
-      } as never);
-      return createSuccessfulStartupResult({
-        sessionId: 'acp-session-1',
-        availableCommands: [{ name: '/initial', description: 'Initial response' }],
       });
+
+    afterEach(() => vi.useRealTimers());
+
+    it('uses commands returned by session/new without waiting', async () => {
+      vi.useFakeTimers();
+      startRealClient({ availableCommands: [{ name: 'help', description: 'Help' }] });
+
+      const result = await fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
+
+      expect(result.availableCommands).toEqual([{ name: 'help', description: 'Help' }]);
     });
 
-    const result = await fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
+    it('reads commands a standard agent advertises after session/new', async () => {
+      vi.useFakeTimers();
+      const { client, started } = startRealClient({});
+      let settled = false;
+      const probe = fetchAcpCapabilities('builtin', 'antigravity', createSilentLogger()).finally(
+        () => {
+          settled = true;
+        }
+      );
+      await started;
+      await vi.advanceTimersByTimeAsync(ACP_PROBE_COMMANDS_WAIT_MS - 1);
+      expect(settled).toBe(false);
+      await advertise(client, 'goal');
 
-    expect(result.availableCommands).toEqual([
-      { name: '/initial', description: 'Initial response' },
-    ]);
-  });
-
-  it('preserves an explicit empty command list from NewSessionResponse', async () => {
-    mockStartupWithSessionResponse({
-      sessionId: 'acp-session-1',
-      availableCommands: [],
+      expect((await probe).availableCommands).toEqual([{ name: 'goal', description: 'goal' }]);
+      expect(mocks.shutdownLocalAcpAgent).toHaveBeenCalledTimes(1);
     });
 
-    const result = await fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
+    it('finishes with no commands when the agent never advertises any', async () => {
+      vi.useFakeTimers();
+      const { started } = startRealClient({});
+      let settled = false;
+      const probe = fetchAcpCapabilities('registry', 'quiet-agent', createSilentLogger()).finally(
+        () => {
+          settled = true;
+        }
+      );
+      await started;
+      await vi.advanceTimersByTimeAsync(ACP_PROBE_COMMANDS_WAIT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
 
-    expect(result.availableCommands).toEqual([]);
-  });
-
-  it('ignores a malformed NewSessionResponse command extension', async () => {
-    mockStartupWithSessionResponse({
-      sessionId: 'acp-session-1',
-      availableCommands: [{ name: 123, description: 'invalid' }],
+      expect((await probe).availableCommands).toBeUndefined();
     });
-
-    const result = await fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
-
-    expect(result.availableCommands).toBeUndefined();
   });
 
   it('probes registry agents even when their agent type matches a builtin name', async () => {
@@ -513,49 +596,6 @@ describe('fetchAcpCapabilities', () => {
         runtimeOverrides: { codexPath: '/tmp/lody-test-codex' },
       })
     );
-  });
-
-  it('merges provider env into the capability probe process env', async () => {
-    await fetchAcpCapabilities('registry', 'env-agent', createSilentLogger(), {
-      ACP_PROVIDER_TOKEN: 'secret-token',
-    });
-
-    expect(mocks.startLocalAcpAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cliType: 'registry',
-        agentType: 'env-agent',
-        env: expect.objectContaining({
-          PATH: process.env.PATH,
-          ACP_PROVIDER_TOKEN: 'secret-token',
-        }),
-      })
-    );
-  });
-
-  it('derives models from a model-category config option when present', async () => {
-    mockStartupWithSessionResponse({
-      sessionId: 'acp-session-1',
-      configOptions: [
-        {
-          id: 'model',
-          name: 'Model',
-          category: 'model',
-          type: 'select',
-          currentValue: 'opus',
-          options: [
-            { value: 'opus', name: 'Opus' },
-            { value: 'sonnet', name: 'Sonnet' },
-          ],
-        },
-      ],
-    });
-
-    const result = await fetchAcpCapabilities('registry', 'config-agent', createSilentLogger());
-
-    expect(result.models).toEqual([
-      { modelId: 'opus', name: 'Opus', description: undefined },
-      { modelId: 'sonnet', name: 'Sonnet', description: undefined },
-    ]);
   });
 
   it('falls back to the legacy models field for agents without config options', async () => {
@@ -606,17 +646,6 @@ describe('fetchAcpCapabilities', () => {
     ]);
   });
 
-  it('returns no models when neither config options nor the legacy field provide them', async () => {
-    mockStartupWithSessionResponse({
-      sessionId: 'acp-session-1',
-      modes: { availableModes: [{ id: 'default', name: 'Default' }] },
-    });
-
-    const result = await fetchAcpCapabilities('registry', 'modeless-agent', createSilentLogger());
-
-    expect(result.models).toEqual([]);
-  });
-
   // BC-2026-06-24-ACP-CONFIG-OPTION-AGENT-FILTERED: the current version drops
   // the `agent`-id config option returned by acp-extension-claude.
   it('filters out the `agent` config option while keeping the rest', async () => {
@@ -644,23 +673,117 @@ describe('fetchAcpCapabilities', () => {
 
     expect(result.configOptions?.map((opt) => opt.id)).toEqual(['mode']);
   });
+});
 
-  it('returns no config options when only the `agent` option is present', async () => {
-    mockStartupWithSessionResponse({
+describe('fetchAcpCapabilities model option read', () => {
+  const effort = (values: string[]) => ({
+    id: 'thought_level',
+    name: 'Thinking',
+    category: 'thought_level',
+    type: 'select' as const,
+    currentValue: values[0] ?? '',
+    options: values.map((value) => ({ value, name: value })),
+  });
+  const model = (currentValue: string) => ({
+    id: 'model',
+    name: 'Model',
+    category: 'model',
+    type: 'select' as const,
+    currentValue,
+    options: [
+      { value: 'mimo', name: 'MiMo' },
+      { value: 'deepseek-flash', name: 'DeepSeek Flash' },
+      { value: 'broken', name: 'Broken' },
+      { value: 'qwen', name: 'Qwen' },
+    ],
+  });
+  const answers: Record<string, unknown> = {
+    'deepseek-flash': [model('deepseek-flash'), effort(['auto', 'low', 'max'])],
+    qwen: [model('qwen'), effort(['high'])],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.probeBuiltinAuthentication.mockResolvedValue({ status: 'unknown' });
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const startWith = (setSessionConfigOption: (modelId: string) => Promise<unknown>) => {
+    const startup = createSuccessfulStartupResult({
       sessionId: 'acp-session-1',
-      configOptions: [
-        {
-          id: 'agent',
-          name: 'Agent',
-          type: 'select',
-          currentValue: 'main',
-          options: [{ value: 'main', name: 'Main' }],
+      configOptions: [model('mimo'), effort(['auto', 'none'])],
+    });
+    Object.assign(startup.client as object, {
+      setSessionConfigOption: (_session: unknown, _configId: string, value: string) =>
+        setSessionConfigOption(value),
+    });
+    mocks.startLocalAcpAgent.mockResolvedValue(startup);
+  };
+
+  it('switches to every model, reports each one, and skips a model that fails', async () => {
+    startWith(async (modelId) => {
+      if (modelId === 'broken') throw new Error('rejected');
+      return answers[modelId];
+    });
+    const progress: string[] = [];
+
+    const result = await fetchAcpCapabilities(
+      'builtin',
+      'dimcode',
+      createSilentLogger(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        readModelOptions: {
+          onProgress: ({ modelName, index, total }) =>
+            progress.push(`${index}/${total} ${modelName}`),
         },
-      ],
+      }
+    );
+
+    expect(progress).toEqual(['1/4 MiMo', '2/4 DeepSeek Flash', '3/4 Broken', '4/4 Qwen']);
+    expect(Object.keys(result.modelConfigOptions ?? {})).toEqual([
+      'mimo',
+      'deepseek-flash',
+      'qwen',
+    ]);
+    expect(result.modelConfigOptions?.qwen).toEqual([model('qwen'), effort(['high'])]);
+  });
+
+  it('stops at a switch the agent never answers and keeps what it read', async () => {
+    vi.useFakeTimers();
+    startWith((modelId) =>
+      modelId === 'broken' ? new Promise(() => {}) : Promise.resolve(answers[modelId])
+    );
+    const progress: string[] = [];
+    const pending = fetchAcpCapabilities(
+      'builtin',
+      'dimcode',
+      createSilentLogger(),
+      undefined,
+      undefined,
+      undefined,
+      { readModelOptions: { onProgress: ({ modelId }) => progress.push(modelId) } }
+    );
+    await vi.waitFor(() => expect(progress).toContain('broken'));
+    await vi.advanceTimersByTimeAsync(ACP_MODEL_OPTIONS_SWITCH_TIMEOUT_MS);
+
+    const result = await pending;
+    expect(progress).toEqual(['mimo', 'deepseek-flash', 'broken']);
+    expect(Object.keys(result.modelConfigOptions ?? {})).toEqual(['mimo', 'deepseek-flash']);
+  });
+
+  it('switches nothing unless the refresh asked to read models', async () => {
+    const switched: string[] = [];
+    startWith(async (modelId) => {
+      switched.push(modelId);
+      return answers[modelId];
     });
 
-    const result = await fetchAcpCapabilities('registry', 'filter-agent', createSilentLogger());
+    const result = await fetchAcpCapabilities('builtin', 'dimcode', createSilentLogger());
 
-    expect(result.configOptions).toBeUndefined();
+    expect(switched).toEqual([]);
+    expect(result.modelConfigOptions).toBeUndefined();
   });
 });

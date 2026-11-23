@@ -7,7 +7,7 @@ Decision and rationale:
 - The iOS Simulator is its own side-panel tab (`ios-simulator`, mobile `?simulator=1`),
   never a Browser mode: no address bar, history, annotation or sharing, and no state
   shared with `SessionBrowserPanel`.
-- The tab exists only when the Session's TARGET machine is a Mac; read that and the
+- Encrypted workspaces hide the iOS Simulator tab. Otherwise it exists only when the Session's TARGET machine is a Mac; read that and the
   protocol capability through `getIosSimulatorPanelAvailability` only. An old Mac keeps
   the tab and asks for an update without calling it.
 - Lifecycle calls are `runtime.requestIosSimulatorControl` (`ios-simulator/control`).
@@ -52,10 +52,24 @@ Decision and rationale:
 - `iosSimulatorPreviewRequestId` is a UUID-only agent-start discovery hint, not live
   status or authority. It enables the composer action. Visible desktop conversations
   consume each request once per browser tab in sessionStorage; mobile stays opt-in.
-  Side Chat actions bind the exact originating Session; the panel owner override is
-  fenced to its parent/top-tab selection. Closing the sidebar never starts/stops a device.
+  All child tabs and Side Chats share the main conversation's preview binding.
+  Closing the sidebar never starts/stops a device.
 
 - Connection mode names are Realtime / Compatibility, never infer P2P from WebRTC.
   Optional viewer diagnostics are allowlisted and accepted only after the existing
   source/origin/operation checks. Copy diagnostics appears only for current errors;
   healthy fallback is not an error. Never include SDP, ICE addresses or credentials.
+
+- Encrypted workspaces hide remote Android Emulator tabs and pause their controller reads; local Android control remains available.
+- `SessionDevicePreviewPanel` also serves Android through `android-emulator/control`
+  and the independent `androidEmulator: 1` capability. Keep its state/preferences
+  separate from iOS, never request iOS exterior assets for it, and expose only
+  supported controls. Android IDs are exact AVD names on the wire. Consume Android
+  preview requests once per device in localStorage, independently of iOS, so closing
+  the panel remains effective across app restarts. Preserve this dismissal preference
+  during cache clearing; a new request may reveal the panel again.
+
+- Keep Stop preview directly accessible in ready desktop/mobile headers, bound to
+  the current operation. Android starts Clear on the local machine and Balanced remotely, and exposes quality switching while ready inside the controls' More menu; switching
+  replaces the capture operation, not the AVD. Send quality only to hosts advertising
+  `androidEmulatorQuality: 1`; old hosts receive no new field.

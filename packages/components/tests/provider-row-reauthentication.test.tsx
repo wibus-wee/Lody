@@ -1,12 +1,27 @@
-import { getRateLimitEntryKey } from '@lody/shared';
 // @vitest-environment jsdom
+import { getRateLimitEntryKey } from '@lody/shared';
 
-import { act, useState } from 'react';
+import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { createStore, Provider } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AgentConfigId, AgentConfigMeta, MachineId, MachineViewMeta } from '@lody/shared';
+import type {
+  AgentConfigId,
+  AgentConfigMeta,
+  ClientToServer,
+  MachineAcpBinaryProgressMessage,
+  MachineId,
+  MachineViewMeta,
+  WorkspaceId,
+} from '@lody/shared';
 
+import { runtimeAtom, type WorkspaceRuntime } from '../src/atoms/runtime';
+import { currentWorkspaceIdAtom } from '../src/atoms/workspace-context';
 import { ProviderRow } from '../src/components/settings/provider-row';
+import {
+  useRefreshMachineAcpCapabilities,
+  type AcpModelOptionsRefreshProgress,
+} from '../src/hooks/use-refresh-machine-acp-capabilities';
 import { initI18n } from '../src/i18n';
 import {
   createCodexResetForecastStore,
@@ -158,40 +173,6 @@ describe('ProviderRow reauthentication', () => {
       button.textContent?.includes('Sign in')
     );
 
-  // Signing in again lives in the provider detail dialog, so no list row shows it.
-  it.each([
-    { cliType: 'builtin', agentType: 'claude' },
-    { cliType: 'builtin', agentType: 'codex' },
-    { cliType: 'builtin', agentType: 'kimi' },
-    { cliType: 'registry', agentType: 'auggie' },
-  ] as const)('does not offer Sign in again for the $agentType provider row', async (overrides) => {
-    await renderConfig(makeConfig(overrides));
-
-    expect(hasSignInAction()).toBe(false);
-  });
-
-  it('still opens the provider detail when the row is clicked', async () => {
-    const config = makeConfig({ cliType: 'builtin', agentType: 'claude' });
-    function DetailHarness() {
-      const [selected, setSelected] = useState<AgentConfigMeta | null>(null);
-      return selected ? (
-        <p>Opened detail for {selected.name}</p>
-      ) : (
-        <ProviderRow config={config} machine={machine} onEdit={setSelected} />
-      );
-    }
-    await act(async () => {
-      root.render(<DetailHarness />);
-    });
-
-    const row = container.querySelector<HTMLButtonElement>('button[aria-label="Edit Config"]');
-    await act(async () => {
-      row?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
-
-    expect(container.textContent).toContain('Opened detail for claude');
-  });
-
   it('loads the forecast only after its direct action is selected', async () => {
     const store = createCodexResetForecastStore({
       fetchStatus: async () => ({
@@ -215,56 +196,151 @@ describe('ProviderRow reauthentication', () => {
   });
 });
 
-describe('ProviderRow meta line', () => {
+describe('ProviderRow model option refresh', () => {
   let container: HTMLDivElement;
   let root: Root;
-  const now = new Date('2026-09-26T08:00:00.000Z');
 
-  beforeEach(() => {
+  beforeEach(async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(now);
+    await initI18n('en');
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     act(() => root.unmount());
     container.remove();
-    vi.useRealTimers();
-    await initI18n('en');
   });
 
-  const renderCustom = async () => {
-    const config = { ...makeConfig({ cliType: 'custom', agentType: 'e2e' }), name: 'E2E Agent' };
+  it('names each model while the refresh reads its options, then clears', async () => {
+    let reportProgress!: (progress: {
+      modelId: string;
+      modelName: string;
+      index: number;
+      total: number;
+    }) => void;
+    let finish!: () => void;
+    const onRefresh = vi.fn(
+      (_config: AgentConfigMeta, options?: { onModelOptionsProgress?: typeof reportProgress }) =>
+        new Promise<void>((resolve) => {
+          reportProgress = (progress) => options?.onModelOptionsProgress?.(progress);
+          finish = resolve;
+        })
+    );
     await act(async () => {
       root.render(
         <ProviderRow
-          config={config}
+          config={makeConfig({ cliType: 'builtin', agentType: 'dimcode' })}
           machine={machine}
           onEdit={vi.fn()}
-          usage={{ conversations: 1, lastUsedAt: now.getTime() - 2 * 60_000 }}
+          onRefresh={onRefresh}
         />
       );
     });
-  };
+    const trigger = container.querySelector<HTMLButtonElement>('button[aria-label^="Manage"]');
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+      trigger?.click();
+    });
+    const item = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((node) =>
+      node.textContent?.includes('Refresh models and modes')
+    );
+    await act(async () => item?.click());
 
-  // The kind is a fact of the meta line, in the reader's language, not an
-  // English pill beside the name; the time reads as a sentence of that language.
-  it('names a custom provider and when it was used in Chinese', async () => {
-    await initI18n('zh_CN');
-    await renderCustom();
+    await act(async () =>
+      reportProgress({
+        modelId: 'deepseek-flash',
+        modelName: 'DeepSeek Flash',
+        index: 2,
+        total: 40,
+      })
+    );
+    const statusText = () =>
+      [...container.querySelectorAll('[role="status"]')].map((node) => node.textContent).join('');
+    expect(statusText()).toContain('Reading options for DeepSeek Flash (2/40)');
 
-    expect(container.textContent).toContain('自定义 · 1 个对话 · 2 分钟前用过');
-    expect(container.textContent).not.toContain('Custom');
-    expect(container.textContent).not.toContain('2m');
+    await act(async () => finish());
+    expect(statusText()).not.toContain('Reading options');
   });
 
-  it('keeps the compact units in English', async () => {
-    await initI18n('en');
-    await renderCustom();
+  it('omits readModelOptions by default and opts in only when explicitly requested', async () => {
+    type RefreshMessage = Extract<ClientToServer, { type: 'machine/acp-capabilities-refresh' }>;
+    const sent: RefreshMessage[] = [];
+    const requestMachineAcpCapabilitiesRefresh = vi.fn(
+      async (
+        message: RefreshMessage,
+        options?: { onProgress?: (progress: MachineAcpBinaryProgressMessage) => void }
+      ) => {
+        sent.push(message);
+        options?.onProgress?.({
+          type: 'machine/acp-binary-progress',
+          machineId,
+          agentType: 'devin',
+          status: 'reading-model-options',
+          configId: message.configId,
+          modelId: 'fusion-1',
+          modelName: 'Fusion 1',
+          modelIndex: 1,
+          modelCount: 169,
+        });
+        return {
+          type: 'machine/acp-capabilities-refresh_response' as const,
+          machineId,
+          configId: message.configId,
+          cliType: 'builtin' as const,
+          agentType: 'devin',
+          success: false,
+          authRequired: true,
+        };
+      }
+    );
 
-    expect(container.textContent).toContain('Custom · 1 conversation · Used 2m ago');
+    const store = createStore();
+    store.set(currentWorkspaceIdAtom, 'ws-test' as WorkspaceId);
+    store.set(runtimeAtom, {
+      workspaceId: 'ws-test' as WorkspaceId,
+      requestMachineAcpCapabilitiesRefresh,
+    } as unknown as WorkspaceRuntime);
+
+    let refresh!: ReturnType<typeof useRefreshMachineAcpCapabilities>;
+    function Harness() {
+      refresh = useRefreshMachineAcpCapabilities();
+      return null;
+    }
+
+    await act(async () => {
+      root.render(
+        <Provider store={store}>
+          <Harness />
+        </Provider>
+      );
+    });
+
+    const configId = 'config-devin' as AgentConfigId;
+    await act(async () => {
+      await refresh({ machineId, configId });
+    });
+    expect(sent[0]).toMatchObject({
+      type: 'machine/acp-capabilities-refresh',
+      machineId,
+      configId,
+      force: true,
+    });
+    expect(sent[0]?.readModelOptions).toBeUndefined();
+
+    const observedProgress: AcpModelOptionsRefreshProgress[] = [];
+    await act(async () => {
+      await refresh({
+        machineId,
+        configId,
+        readModelOptions: true,
+        onModelOptionsProgress: (progress) => observedProgress.push(progress),
+      });
+    });
+    expect(sent[1]?.readModelOptions).toBe(true);
+    expect(observedProgress).toEqual([
+      { modelId: 'fusion-1', modelName: 'Fusion 1', index: 1, total: 169 },
+    ]);
   });
 });

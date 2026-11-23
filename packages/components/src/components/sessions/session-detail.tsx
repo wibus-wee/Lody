@@ -1,22 +1,40 @@
-import { writeTextToClipboard } from '@/lib/clipboard';
+import { clsx } from 'clsx';
+import { useMySessionScope } from '@/hooks/use-visible-session-metas';
+import { useSessionOwnerAccess } from '@/hooks/use-session-owner-access';
+import { useIosSimulatorPreviewRequest } from './ios-simulator/use-ios-simulator-preview-request';
+import { machineSupportsAndroidEmulatorProtocol } from '@lody/shared';
+import { copyTextToClipboard, writeTextToClipboard } from '@/lib/clipboard';
+import { SessionHistoryAccessBoundary } from './session-history-access-boundary';
 import { useSessionForkCapabilities } from '@/hooks/use-session-fork-capabilities';
 import { requireWorkspaceFeature } from '@/lib/workspace-feature';
-import { useWorkspaceFeature } from '@/hooks/use-workspace-feature';
+import { useLegacyWorkspaceQuery } from '@/hooks/use-legacy-workspace-query';
+import { useLegacyWorkspaceQueryStatus, useWorkspaceFeature } from '@/hooks/use-workspace-feature';
+import { cloudOperations } from '@/lib/cloud-api-operations';
+import { resolveLinkedWorkspaceGitHubRepo, resolveSessionRepoFullName } from '@/lib/session-repo';
+import { usePlatformCapability } from '@lody/platform/react';
 import {
   useArchiveConfirmationRequest,
   useArchiveSessionWithConfirmation,
-} from './session-archive-confirmation';
+} from './session-sub-conversation-confirmation';
 import { buildDraftUserHistoryEntry } from '@/lib/session-attachment-draft';
 import { pendingSessionLinkAtom } from '@/lib/session-deep-link';
 import { windowPreparationAtom } from '@/lib/window-preparation';
 import { useEmptySessionDraft } from '@/hooks/use-empty-session-draft';
 import { sessionHasUnreadMessages } from '@/lib/session-read-receipt';
+import { getEffectiveSessionActivitySummary } from './session-list-rows';
+import { MobileLaterSheet } from '../mobile/mobile-later-sheet';
+import {
+  useCanManageSessionStatus,
+  useMobileStatusActions,
+} from '../mobile/use-mobile-status-actions';
 import {
   Archive,
   ArchiveRestore,
   ArrowLeft,
-  Copy,
+  CircleCheck,
+  Clock,
   Ellipsis,
+  Focus,
   FileText,
   Folder,
   GitBranch,
@@ -30,17 +48,20 @@ import {
   Search,
   Trash2,
   Users,
+  SquareArrowOutUpRight,
 } from 'lucide-react';
 import { CuidaSidebarExpandOutline } from '@lody/ui';
+import { SidebarHistoryControls } from '../sidebar-history-controls';
 import { Spinner } from '@lody/ui/spinner';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@lody/ui/button';
 import { useRouter } from '@tanstack/react-router';
 import { useComposerNavigationFocus } from '../chat/submission/use-composer-navigation-focus';
-import { usePostHog } from '@posthog/react';
+import { usePostHog } from '@/lib/posthog-context';
 import {
   getProjectRefBranch,
   getServerNow,
+  statusViewTier,
   getSessionPullRequestLegacyFields,
   getSessionRoomId,
   isLoroRepoDocDeleted,
@@ -53,6 +74,7 @@ import {
   type LocalProjectId,
   type LocalProjectMeta,
   type ProjectRef,
+  type SessionFilePayload,
   type SessionId,
   type SessionMeta,
   type SessionStatus,
@@ -109,7 +131,7 @@ import {
 } from '@/ui/window-drag-region';
 import {
   getZenAwarePanelToggleState,
-  navigationSidebarVisibleAtom,
+  mainPageAtWindowEdgeAtom,
   showNavigationSidebarAtom,
   zenLayoutModeAtom,
   zenRightPanelAtom,
@@ -122,6 +144,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from 'react';
 import { useNativeSideRail } from '../mobile/native-side-rail';
@@ -154,6 +177,7 @@ import {
   getSidePanelTabSelection,
   getSidePanelTabCloseFallback,
   getSidePanelTabStateAfterClose,
+  getEffectiveSidePanelTabSplit,
   getSideSessionPanelTabId,
   isViewerTabId,
   parseSideSessionPanelTabId,
@@ -161,8 +185,14 @@ import {
   SessionSidePanelTabBar,
   type SessionSidePanelOption,
   type SessionSidePanelTabItem,
+  type SidePanelTabSplit,
 } from './session-side-panel-tab-bar';
 import { getSessionTabCloseTarget, type SessionTabFocusRegion } from './session-tab-close-target';
+import {
+  SIDE_PANEL_SPLIT_RATIO_DEFAULT,
+  SIDE_PANEL_SPLIT_RATIO_VAR,
+  SidePanelSplitHandle,
+} from './side-panel-split-handle';
 import {
   MobileSessionTabButton,
   MobileSessionTabSheet,
@@ -184,10 +214,14 @@ import { toast } from '@/lib/toast';
 
 import { SessionConversationDiffPanel } from './session-conversation-diff-panel';
 import { SessionFileContentView, type SessionFileSaveViewState } from './session-file-content-view';
+import { SessionFileAttachmentPane } from '../ai-gui/session-file-attachment';
 import { SessionFileQuickOpen } from './session-file-quick-open';
 import { PrTabContainer } from './pr-tab-container';
 import { SessionBrowserPanel } from './session-browser-panel';
-import { SessionIosSimulatorPanel } from './ios-simulator/session-ios-simulator-panel';
+import {
+  SessionDevicePreviewPanel,
+  SessionIosSimulatorPanel,
+} from './ios-simulator/session-ios-simulator-panel';
 import { getIosSimulatorPanelAvailability } from '@/lib/ios-simulator/ios-simulator-model';
 import { getMachineMetaByIdAtomFamily } from '@/atoms/machines';
 import { deletePrCacheEntriesForSession } from '@/lib/github-pr-cache';
@@ -199,12 +233,13 @@ import {
   type MobileProjectFileBrowserHandle,
 } from '@/components/files/mobile-project-file-browser';
 import { buildSessionLink } from '@lody/shared/session-link';
+import { buildAppSessionUrl } from '@/lib/session-app-url';
 import { getCommandKeybindings, useCommand } from '@/lib/commands';
 import { useDesktopTabCloser } from '@/lib/desktop-tab-or-window-close';
 import { useSemanticActionRouter } from '@/lib/commands/use-semantic-action-router';
 import type { SemanticActionRouter } from '@/lib/commands/semantic-action-router';
 import { allChangesDiffScopeAtom, semanticShortcutsFeatureEnabledAtom } from '@/atoms/settings';
-import { cn, getBasename } from '@/lib';
+import { getBasename } from '@/lib';
 
 import {
   resolveSessionFileOpenTarget,
@@ -314,10 +349,7 @@ import {
   resolveSessionDetailPresenceState,
   resolveSessionDetailVisibilityState,
 } from '@/lib/session-detail-presence';
-import {
-  getSessionDetailSkipTargetId,
-  getSessionDetailTouchIconButtonClassName,
-} from '@/lib/session-detail-a11y';
+import { getSessionDetailSkipTargetId } from '@/lib/session-detail-a11y';
 import {
   canUseProjectHistoryProjectControl,
   importProjectHistoryForLocalProject,
@@ -381,7 +413,19 @@ type ViewerTab =
       focusRequestSeq: number;
       mode?: 'conversation' | 'base';
       label: string;
+    }
+  | {
+      /** A message attachment: bytes come from the attachment store, not a workspace path. */
+      id: string;
+      type: 'attachment';
+      file: SessionFilePayload;
+      /** The Session whose message carried it; `file.storageSessionId` wins when set. */
+      sessionId: SessionId;
+      label: string;
     };
+
+const getViewerTabAnalyticsType = (tabId: string): 'file' | 'diff' | 'attachment' =>
+  tabId.startsWith('file:') ? 'file' : tabId.startsWith('attachment:') ? 'attachment' : 'diff';
 
 type SessionDetailOpenFileOptions = {
   /** Analytics only. */
@@ -500,6 +544,7 @@ const MOBILE_DRAWER_HEADER_INSET = 'calc(3.5rem + var(--safe-area-top))';
 const EMPTY_LOCAL_PROJECTS: Record<LocalProjectId, LocalProjectMeta> = {};
 const MOBILE_PR_VIEWER_ID = 'mobile-viewer:pr';
 const MOBILE_BROWSER_VIEWER_ID = 'mobile-viewer:browser';
+const MOBILE_ANDROID_EMULATOR_VIEWER_ID = 'mobile-viewer:android-emulator';
 const MOBILE_IOS_SIMULATOR_VIEWER_ID = 'mobile-viewer:ios-simulator';
 const MOBILE_FILES_VIEWER_ID = 'mobile-viewer:files';
 
@@ -508,8 +553,30 @@ const MOBILE_FILES_VIEWER_ID = 'mobile-viewer:files';
    conversation) is unreadably cramped at the default ~25% split. Honored only
    when the window is wide enough; see DesktopSessionDetailLayout. */
 const PR_SIDEBAR_MIN_WIDTH_PX = 500;
+/** Two device screens side by side need roughly two portrait phones' width. */
+const DEVICE_SPLIT_SIDEBAR_MIN_WIDTH_PX = 720;
 
 const detailStyles = stylex.create({
+  muted: { color: 'hsl(var(--muted-foreground) / 1)' },
+  confirmSmall: { maxWidth: '24rem' },
+  confirmMedium: { maxWidth: '28rem' },
+  mobileHeader: {
+    position: 'absolute',
+    insetInline: 'calc(var(--spacing) * 0)',
+    top: 'calc(var(--spacing) * 0)',
+    zIndex: 30,
+    borderBottomWidth: 0,
+    backgroundColor: 'color-mix(in oklab, hsl(var(--background) / 1) 55%, transparent)',
+    backdropFilter: 'blur(var(--blur-xl))',
+  },
+  fullDrawer: {
+    width: '100%',
+    maxWidth: 'none',
+    inset: 'calc(var(--spacing) * 0)',
+    borderWidth: 0,
+    borderRadius: 0,
+  },
+  touchBackButton: { marginLeft: 'calc(var(--spacing) * -1)', flexShrink: 0 },
   projectInfo: {
     display: 'flex',
     minWidth: 0,
@@ -672,6 +739,27 @@ const detailStyles = stylex.create({
     visibility: 'hidden',
     pointerEvents: 'none',
   },
+  // Split device panels slide between full width and their half.
+  splitSlide: {
+    transitionProperty: 'left, right',
+    transitionDuration: {
+      default: '220ms',
+      '@media (prefers-reduced-motion: reduce)': '0ms',
+    },
+    transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)',
+  },
+  splitStart: {
+    // StyleX evaluates this at build time and cannot resolve a constant
+    // imported from a non-`.stylex` module, so the variable name is spelled
+    // out; it must match SIDE_PANEL_SPLIT_RATIO_VAR.
+    right: 'calc((1 - var(--side-panel-split, 0.5)) * 100%)',
+  },
+  splitEnd: {
+    left: 'calc(var(--side-panel-split, 0.5) * 100%)',
+    borderInlineStartWidth: '1px',
+    borderInlineStartStyle: 'solid',
+    borderInlineStartColor: 'hsl(var(--border) / 0.7)',
+  },
   sidebarBody: {
     position: 'relative',
     minHeight: 0,
@@ -808,6 +896,16 @@ const areViewerTabsEquivalent = (prev: ViewerTab, next: ViewerTab): boolean => {
       prev.endLine === next.endLine &&
       prev.focusRequestSeq === next.focusRequestSeq &&
       prev.htmlPreviewRequestSeq === next.htmlPreviewRequestSeq
+    );
+  }
+
+  if (prev.type === 'attachment' && next.type === 'attachment') {
+    // A re-click hands over a fresh payload object for the same upload; keeping
+    // the existing tab avoids refetching the preview it already shows.
+    return (
+      prev.sessionId === next.sessionId &&
+      prev.file.fileId === next.file.fileId &&
+      prev.file.storageSessionId === next.file.storageSessionId
     );
   }
 
@@ -955,7 +1053,7 @@ function AdaptiveMobileSessionHeader({
     <BaseHeader
       truncateTitle={false}
       hideMenuButton
-      className="absolute inset-x-0 top-0 z-30 border-b-0 bg-background/55 backdrop-blur-xl"
+      xstyle={detailStyles.mobileHeader}
       style={{ height: inset, paddingTop: 'var(--safe-area-top, 0px)' }}
       leading={sideRailVisible ? undefined : <MobileSessionHeaderBackButton onBack={onBack} />}
       title={title}
@@ -1033,6 +1131,7 @@ function SessionChatSurface({
   const openBrowser = useStableCallback(() => props.onOpenBrowser?.());
   const openExistingBrowser = useStableCallback(() => props.onOpenExistingBrowser?.());
   const openIosSimulator = useStableCallback(() => props.onOpenIosSimulator?.());
+  const openAndroidEmulator = useStableCallback(() => props.onOpenAndroidEmulator?.());
   const forkLastAssistant = useStableCallback(
     (...args: Parameters<NonNullable<SessionChatInterfaceProps['onForkLastAssistant']>>) =>
       props.onForkLastAssistant?.(...args)
@@ -1064,6 +1163,7 @@ function SessionChatSurface({
       onOpenBrowser={props.onOpenBrowser ? openBrowser : undefined}
       onOpenExistingBrowser={props.onOpenExistingBrowser ? openExistingBrowser : undefined}
       onOpenIosSimulator={props.onOpenIosSimulator ? openIosSimulator : undefined}
+      onOpenAndroidEmulator={props.onOpenAndroidEmulator ? openAndroidEmulator : undefined}
       onForkLastAssistant={props.onForkLastAssistant ? forkLastAssistant : undefined}
       onVisualAnnotationReferencesSubmitted={
         props.onVisualAnnotationReferencesSubmitted ? annotationReferencesSubmitted : undefined
@@ -1111,10 +1211,12 @@ const SessionDetail = ({
   });
   const macTrafficLightRowPadClass = useMacTrafficLightRowPadClass({
     insideWorkspaceFrame: true,
+    includeDesktopWeb: true,
   });
   const macTrafficLightBorderedRowPadClass = useMacTrafficLightRowPadClass({
     bottomBorder: true,
     insideWorkspaceFrame: true,
+    includeDesktopWeb: true,
   });
   // Publish ephemeral "viewing this session" presence (drives the owning
   // machine's PR poller priority); actively cleared on switch/hide/unmount.
@@ -1165,9 +1267,18 @@ const SessionDetail = ({
   const [openedSidebarTabs, setOpenedSidebarTabs] = useState<SidebarTab[]>(
     () => initialTabState.sidePanel.tabs
   );
+  /* Two fixed panels the user dragged together; both render side by side
+     whenever either is selected. Closing either dissolves it. */
+  const [sidePanelSplit, setSidePanelSplit] = useState<readonly [SidebarTab, SidebarTab] | null>(
+    () => initialTabState.sidePanel.split
+  );
+  /** The start half's share of a split; kept per member pair, not persisted. */
+  const [sidePanelSplitRatio, setSidePanelSplitRatio] = useState(SIDE_PANEL_SPLIT_RATIO_DEFAULT);
+  const [sidePanelSplitResizing, setSidePanelSplitResizing] = useState(false);
   /* One-shot request for DesktopSessionDetailLayout to widen the sidebar for
-     the PR tab; `seq` bumps per request so repeats are not dropped. */
-  const [prSidebarWidthRequest, setPrSidebarWidthRequest] = useState<{
+     the PR tab or a device split; `seq` bumps per request so repeats are not
+     dropped. */
+  const [sidebarWidthRequest, setSidebarWidthRequest] = useState<{
     seq: number;
     minWidthPx: number;
   } | null>(null);
@@ -1232,7 +1343,8 @@ const SessionDetail = ({
   const currentWorkspaceId = useAtomValue(currentWorkspaceIdAtom) as WorkspaceId | null;
   const pendingSessionLink = useAtomValue(pendingSessionLinkAtom);
   const clearPendingSessionLink = useSetAtom(pendingSessionLinkAtom);
-  const isLeftSidebarHidden = !useAtomValue(navigationSidebarVisibleAtom);
+  // Hidden sidebar and no pinned Today in front: this page owns the window's left edge.
+  const isLeftSidebarHidden = useAtomValue(mainPageAtWindowEdgeAtom);
   const showNavigationSidebar = useSetAtom(showNavigationSidebarAtom);
   const exportAllowed = useWorkspaceFeature('export');
   const previewAllowed = useWorkspaceFeature('remote-preview');
@@ -1242,6 +1354,13 @@ const SessionDetail = ({
   const localHomeDir = useAtomValue(localHomeDirAtom);
   const user = useAtomValue(userAtom);
   const {
+    members: workspaceMembers,
+    isMultiMember: isMultiMemberWorkspace,
+    isLoading: sharingMembersLoading,
+    error: sharingMembersError,
+    retry: retrySharingMembers,
+  } = useWorkspaceMembers();
+  const {
     accessByMachineId: sharingMachineAccessById,
     accessByProjectKey: sharingProjectAccessByKey,
     machineVisibilityLoading,
@@ -1249,7 +1368,12 @@ const SessionDetail = ({
     showSessionSharing,
     resolve: resolveSessionSharing,
     shareWithTeam: shareSessionWithTeam,
-  } = useSessionSharing();
+  } = useSessionSharing({
+    members: workspaceMembers,
+    membersLoading: sharingMembersLoading,
+    membersError: sharingMembersError,
+    retryMembers: retrySharingMembers,
+  });
   const controlConnectionState = useAtomValue(lodyControlConnectionStateAtom);
   // The local-token route can render before Convex workspace access fills
   // currentWorkspaceIdAtom. The workspace runtime already resolved the same id
@@ -1272,6 +1396,35 @@ const SessionDetail = ({
   const docMetaCacheReady = useAtomValue(docMetaCacheReadyAtom);
   const docMetaCacheSettled = useAtomValue(sessionMetaCacheSettledAtomFamily(sessionId));
   const activeSession = session ?? null;
+  const hasHostedGitHub = usePlatformCapability('githubIntegration');
+  const legacyQueryStatus = useLegacyWorkspaceQueryStatus(currentWorkspaceId);
+  const workspaceRepositories = useLegacyWorkspaceQuery(
+    cloudOperations.github.getWorkspaceRepositories,
+    currentWorkspaceId ? { workspaceId: currentWorkspaceId } : 'skip'
+  );
+  const activeSessionRepoFullName = useMemo(
+    () => (activeSession ? resolveSessionRepoFullName(activeSession) : ''),
+    [activeSession]
+  );
+  const activeSessionLinkedRepo = useMemo(
+    () => resolveLinkedWorkspaceGitHubRepo(activeSessionRepoFullName, workspaceRepositories),
+    [activeSessionRepoFullName, workspaceRepositories]
+  );
+  const activeSessionIsRepoLinked = useMemo(() => {
+    if (!activeSessionRepoFullName || !hasHostedGitHub || legacyQueryStatus === 'blocked') {
+      return false;
+    }
+    if (activeSession?.project?.kind === 'local') return Boolean(activeSessionLinkedRepo);
+    if (workspaceRepositories !== undefined) return Boolean(activeSessionLinkedRepo);
+    return undefined;
+  }, [
+    activeSession?.project?.kind,
+    activeSessionLinkedRepo,
+    activeSessionRepoFullName,
+    hasHostedGitHub,
+    legacyQueryStatus,
+    workspaceRepositories,
+  ]);
   const activeSessionSharing = useMemo(
     () => (showSessionSharing && activeSession ? resolveSessionSharing(activeSession) : null),
     [activeSession, resolveSessionSharing, showSessionSharing]
@@ -1290,8 +1443,16 @@ const SessionDetail = ({
     () => viewerTabs.some((tab) => tab.type === 'file' || tab.type === 'diff'),
     [viewerTabs]
   );
+  const isChangesSidebarActive =
+    isSidebarVisible &&
+    (activeSidebarTab === 'changes' ||
+      Boolean(
+        activeSidebarTab &&
+        sidePanelSplit?.includes('changes') &&
+        sidePanelSplit.includes(activeSidebarTab)
+      ));
   const isFileProviderSidebarActive =
-    isSidebarVisible && (activeSidebarTab === 'files' || activeSidebarTab === 'changes');
+    isChangesSidebarActive || (isSidebarVisible && activeSidebarTab === 'files');
   const isSessionStateCurrent = localStateSessionId === sessionId;
   const activeSessionFileProviderRequested = Boolean(
     activeSession &&
@@ -1441,6 +1602,8 @@ const SessionDetail = ({
     setActiveSidebarTab(nextInitialTabState.sidePanel.tab);
     setActiveSideSessionId(nextInitialTabState.sidePanel.sideSessionId);
     setOpenedSidebarTabs(nextInitialTabState.sidePanel.tabs);
+    setSidePanelSplit(nextInitialTabState.sidePanel.split);
+    setSidePanelSplitRatio(SIDE_PANEL_SPLIT_RATIO_DEFAULT);
     setDraftTabsState(readPersistedDraftTabs(sessionId));
     setPendingDraftChildSessionIds({});
     setPendingForks(readPendingWorktreeForks(sessionId));
@@ -1798,20 +1961,44 @@ const SessionDetail = ({
     }
     return sourceByTarget;
   }, [pendingForks]);
+  // `useResolvedMachineMeta` already merged the Machine Flock local-project rows
+  // (honouring deletions) into `sessionMachine`; do not re-scan the raw rows.
+  const sessionMachineLocalProjects = sessionMachine?.localProjects ?? EMPTY_LOCAL_PROJECTS;
+  const getSourceLocalProjectMeta = useCallback(
+    (source: SessionMeta): LocalProjectMeta | null => {
+      if (source.project?.kind !== 'local') return null;
+      if (sessionMachine?.id === source.machineId) {
+        return sessionMachineLocalProjects[source.project.localProjectId] ?? null;
+      }
+      return null;
+    },
+    [sessionMachine?.id, sessionMachineLocalProjects]
+  );
   const getForkWorktreeAvailability = useCallback(
     (source: SessionMeta): SessionForkWorktreeAvailability => {
       if (!canForkSessionToWorktree(source)) return 'hidden';
       if (source.project?.kind === 'github') return 'available';
+      if (source.project?.kind === 'local') {
+        if (source.isWorktree === true || source.project.useWorktree === true) {
+          return 'available';
+        }
+        const projectMeta = getSourceLocalProjectMeta(source);
+        if (projectMeta?.git === true) return 'available';
+        if (projectMeta?.git === false) return 'hidden';
+      }
       const cached = worktreeAvailabilityBySessionId[source.id];
       if (cached === 'unavailable') return 'hidden';
       if (cached === 'available') return 'available';
       return 'checking';
     },
-    [canForkSessionToWorktree, worktreeAvailabilityBySessionId]
+    [canForkSessionToWorktree, getSourceLocalProjectMeta, worktreeAvailabilityBySessionId]
   );
   const resolveForkWorktreeAvailability = useCallback(
     async (source: SessionMeta) => {
       if (!canForkSessionToWorktree(source) || source.project?.kind !== 'local') return;
+      if (source.isWorktree === true || source.project.useWorktree === true) return;
+      const projectMeta = getSourceLocalProjectMeta(source);
+      if (typeof projectMeta?.git === 'boolean') return;
       if (!runtime || !user?.id) return;
       if (worktreeAvailabilityRequestRef.current.has(source.id)) return;
       worktreeAvailabilityRequestRef.current.add(source.id);
@@ -1820,13 +2007,13 @@ const SessionDetail = ({
         [source.id]: 'checking',
       }));
       try {
-        const gitState = await runtime.requestLocalProjectGitState(
+        const response = await runtime.requestLocalProjectBranches(
           source.machineId,
           source.project.localProjectId,
           user.id,
-          { timeoutMs: 15_000 }
+          { limit: 1, timeoutMs: 15_000 }
         );
-        const available = gitState?.success === true && gitState.state.git === true;
+        const available = response?.success === true && response.result.git === true;
         setWorktreeAvailabilityBySessionId((current) => ({
           ...current,
           [source.id]: available ? 'available' : 'unavailable',
@@ -1840,7 +2027,7 @@ const SessionDetail = ({
         });
       }
     },
-    [canForkSessionToWorktree, runtime, user?.id]
+    [canForkSessionToWorktree, getSourceLocalProjectMeta, runtime, user?.id]
   );
   const handleForkDestination = useCallback(
     (source: SessionMeta, turnId: string, destination: SessionForkDestination = 'shared') => {
@@ -1883,9 +2070,6 @@ const SessionDetail = ({
       ),
     [isActiveSessionLocalMachine, localHomeDir, machineFlockRows]
   );
-  // `useResolvedMachineMeta` already merged the Machine Flock local-project rows
-  // (honouring deletions) into `sessionMachine`; do not re-scan the raw rows.
-  const sessionMachineLocalProjects = sessionMachine?.localProjects ?? EMPTY_LOCAL_PROJECTS;
   const sessionMachineSupportsLocalProjectHistoryRpc =
     sessionMachine?.supportsLocalProjectHistoryRpc === true;
   const resolvedLocalProjectMeta = useMemo(() => {
@@ -1899,7 +2083,11 @@ const SessionDetail = ({
     ready: sessionDiffReady,
     synced: sessionDiffSynced,
     unavailableMessage: sessionDiffUnavailableMessage,
+    changesReady = sessionDiffReady,
+    changesSynced = sessionDiffSynced,
+    changesUnavailableMessage = sessionDiffUnavailableMessage,
     revision: allChangesRefreshToken,
+    liveDiffStat,
     summary: {
       changeEntries,
       changeFilePaths,
@@ -1911,40 +2099,44 @@ const SessionDetail = ({
     enabled: activeSessionTabId !== null || isEmptyConversation,
     fileProvider: activeSessionFileProvider,
     fileProviderPending: activeSessionFileProviderPending,
+    refreshChanges: isChangesSidebarActive || mobileDiffState?.view === 'files',
   });
   const messageFileDiffEntriesByTurn = useMemo(
     () => (Object.keys(diffEntriesByTurn).length > 0 ? diffEntriesByTurn : undefined),
     [diffEntriesByTurn]
   );
 
-  // Keep the info bar aligned with the left sidebar session row. Both surfaces
-  // use the same durable session-meta snapshot instead of independently
-  // totaling provider entries that can resolve at different times.
-  const changesDiffStat = activeSession?.diffStats?.allChange ?? null;
+  // A completed live Changes list supplies the same totals to the composer.
+  const changesDiffStat = liveDiffStat ?? activeSession?.diffStats?.allChange ?? null;
   // Closing the conversation does not close workspace tools. Keep their owner
   // explicit without making the parent an active conversation again.
   const activeBrowserSession = activeDraftTab ? null : (activeTabSession ?? activeSession);
-  // Simulator follows the selected conversation unless explicitly opened by a
-  // Side Chat. Keep that origin while the side panel switches away from the chat.
-  const [iosSimulatorTarget, setIosSimulatorTarget] = useState<{
-    parentId: SessionId;
-    tabId: SessionId | undefined;
-    sessionId: SessionId;
-  } | null>(null);
-  const simulatorOwnerSession =
-    iosSimulatorTarget?.parentId === sessionId &&
-    iosSimulatorTarget.tabId === activeBrowserSession?.id
-      ? ([activeBrowserSession, ...visibleSideSessions].find(
-          (candidate) => candidate?.id === iosSimulatorTarget.sessionId
-        ) ?? activeBrowserSession)
-      : activeBrowserSession;
+  // Device previews belong to the main conversation, across child and draft tabs.
+  const simulatorOwnerSession = activeSession;
   const iosSimulatorMachine = useAtomValue(
     getMachineMetaByIdAtomFamily(simulatorOwnerSession?.machineId)
   );
   const activeIosSimulatorSession =
-    simulatorOwnerSession && getIosSimulatorPanelAvailability(iosSimulatorMachine) !== 'hidden'
+    simulatorOwnerSession && getIosSimulatorPanelAvailability(iosSimulatorMachine, runtime?.contentMode) !== 'hidden'
       ? simulatorOwnerSession
       : null;
+  const activeAndroidEmulatorSession =
+    simulatorOwnerSession &&
+    (runtime?.contentMode !== 'e2ee' || simulatorOwnerSession.machineId === localMachineId) &&
+    machineSupportsAndroidEmulatorProtocol(iosSimulatorMachine)
+      ? simulatorOwnerSession
+      : null;
+  const [androidEmulatorOpen, setAndroidEmulatorOpen] = useState(false);
+  useIosSimulatorPreviewRequest(
+    activeAndroidEmulatorSession ? `android:${activeAndroidEmulatorSession.id}` : undefined,
+    activeAndroidEmulatorSession?.androidEmulatorPreviewRequestId,
+    !isMobile,
+    () => {
+      activateSidebarTab('android-emulator');
+      revealRightSidebar();
+    },
+    'device'
+  );
   const workspaceOwnerSession =
     activeTabSession?.parentSessionId || isEmptyConversation ? activeSession : activeTabSession;
   const activeSessionProject = activeSession?.project;
@@ -2328,8 +2520,7 @@ const SessionDetail = ({
     setSessionPinned,
     transferSessionOwner,
   } = useSessionActions();
-  const { members: workspaceMembers, isMultiMember: isMultiMemberWorkspace } =
-    useWorkspaceMembers();
+  const getOwnerAccessReason = useSessionOwnerAccess();
   const handleTransferSessionOwner = useCallback(
     async (targetSessionId: SessionId, nextUserId: string) => {
       try {
@@ -3052,7 +3243,18 @@ const SessionDetail = ({
     [router, workspaceSlug]
   );
 
-  const archiveSessionWithConfirmation = useArchiveSessionWithConfirmation(archiveSession);
+  const confirmAndArchiveSession = useArchiveSessionWithConfirmation(archiveSession);
+  const archiveSessionWithConfirmation = useCallback(
+    async (...args: Parameters<typeof confirmAndArchiveSession>) => {
+      try {
+        return await confirmAndArchiveSession(...args);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    },
+    [confirmAndArchiveSession]
+  );
   const requestArchiveConfirmation = useArchiveConfirmationRequest();
   // Archive the parent session from the header menu (desktop)
   const handleArchiveCurrentSession = useCallback(async () => {
@@ -3164,11 +3366,19 @@ const SessionDetail = ({
   }, [activeSession, currentWorkspaceId, deleteArchivedSession, handleBackToList, repoFullName, t]);
 
   const handleCopyUrl = useCallback(
-    async (successMessage?: string, failureMessage?: string) => {
+    async (
+      successMessage?: string,
+      failureMessage?: string,
+      linkFormat: 'https' | 'deeplink' = 'https'
+    ) => {
       try {
-        if (!currentWorkspaceId || !activeSessionTabId) throw new Error('Session is not ready');
-        await navigator.clipboard.writeText(
-          buildSessionLink({ sessionId: activeSessionTabId, workspaceId: currentWorkspaceId })
+        if (!currentWorkspaceId || !workspaceSlug || !activeSessionTabId) {
+          throw new Error('Session is not ready');
+        }
+        await copyTextToClipboard(
+          linkFormat === 'deeplink'
+            ? buildSessionLink({ sessionId: activeSessionTabId, workspaceId: currentWorkspaceId })
+            : buildAppSessionUrl(workspaceSlug, activeSessionTabId)
         );
         captureSessionDetailEvent('session/share_link_copied');
         toast.success(successMessage ?? t('sessions.urlCopied', 'Session URL copied to clipboard'));
@@ -3177,7 +3387,7 @@ const SessionDetail = ({
         toast.error(failureMessage ?? t('sessions.copyFailed', 'Unable to copy'));
       }
     },
-    [captureSessionDetailEvent, t, currentWorkspaceId, activeSessionTabId]
+    [captureSessionDetailEvent, t, currentWorkspaceId, activeSessionTabId, workspaceSlug]
   );
 
   const handleRequestShareSession = useCallback(
@@ -3229,8 +3439,7 @@ const SessionDetail = ({
 
   const handleCopyText = useCallback(
     (text: string, successMessage?: string) => {
-      void navigator.clipboard
-        .writeText(text)
+      void copyTextToClipboard(text)
         .then(() => {
           if (successMessage) toast.success(successMessage);
         })
@@ -3915,7 +4124,7 @@ const SessionDetail = ({
         const sidebarEmpty =
           activeSidebarTab === null && activeSideSessionId === null && activeViewerTabId === null;
         if (!isSidebarOpen || sidebarEmpty) {
-          setPrSidebarWidthRequest((current) => ({
+          setSidebarWidthRequest((current) => ({
             seq: (current?.seq ?? 0) + 1,
             minWidthPx: PR_SIDEBAR_MIN_WIDTH_PX,
           }));
@@ -3947,7 +4156,7 @@ const SessionDetail = ({
   }, [replaceSessionUrlPr]);
 
   const handleOpenBrowser = useCallback(
-    (tabSessionId?: SessionId, navigateCandidate = false) => {
+    (tabSessionId?: SessionId, navigateCandidate = isMobile) => {
       requireWorkspaceFeature(
         { mode: runtime?.contentMode === 'e2ee' ? 'protected' : 'plaintext' },
         'remote-preview'
@@ -4004,17 +4213,15 @@ const SessionDetail = ({
     }
   }, [activateSidebarTab, isMobile, replaceSessionUrlSimulator, revealRightSidebar]);
 
-  const handleOpenIosSimulatorForSession = useCallback(
-    (targetSessionId: SessionId) => {
-      setIosSimulatorTarget({
-        parentId: sessionId,
-        tabId: activeBrowserSession?.id,
-        sessionId: targetSessionId,
-      });
-      handleOpenIosSimulator();
-    },
-    [sessionId, activeBrowserSession?.id, handleOpenIosSimulator]
-  );
+  const handleOpenAndroidEmulator = useCallback(() => {
+    if (isMobile) {
+      setAndroidEmulatorOpen(true);
+    } else {
+      revealRightSidebar();
+      activateSidebarTab('android-emulator');
+      semanticRouterRef.current?.activate('side-panel');
+    }
+  }, [isMobile, revealRightSidebar, activateSidebarTab]);
 
   const handleCloseIosSimulator = useCallback(() => {
     replaceSessionUrlSimulator(false);
@@ -4101,6 +4308,21 @@ const SessionDetail = ({
       previewHtml: true,
     });
   });
+
+  /** Desktop opens a message attachment as a side-panel tab; mobile keeps its Drawer. */
+  const handleOpenFileAttachment = useStableCallback(
+    (file: SessionFilePayload, chatSessionId: SessionId): boolean => {
+      if (isMobile) return false;
+      upsertViewerTab({
+        id: `attachment:${file.storageSessionId ?? chatSessionId}:${file.fileId}`,
+        type: 'attachment',
+        file,
+        sessionId: chatSessionId,
+        label: file.fileName,
+      });
+      return true;
+    }
+  );
 
   /**
    * Every entry point whose path came from the file index. Kept stable so the
@@ -4397,7 +4619,7 @@ const SessionDetail = ({
       }
       captureSessionDetailEvent('session/viewer_tab_selected', {
         viewer_tab_id: tabId,
-        viewer_tab_type: tabId.startsWith('file:') ? 'file' : 'diff',
+        viewer_tab_type: getViewerTabAnalyticsType(tabId),
       });
     },
     [captureSessionDetailEvent, isMobile, revealRightSidebar, selectSidePanelTab]
@@ -4458,6 +4680,13 @@ const SessionDetail = ({
         kind: 'ios-simulator',
       });
     }
+    if (activeAndroidEmulatorSession) {
+      options.push({
+        id: 'android-emulator',
+        label: t('sessions.detailTabs.androidEmulator', 'Android Emulator'),
+        kind: 'android-emulator',
+      });
+    }
     if (latestPr && repoFullName && latestPrNumber != null) {
       options.push({
         id: 'pr',
@@ -4466,7 +4695,15 @@ const SessionDetail = ({
       });
     }
     return options;
-  }, [activeBrowserSession, activeIosSimulatorSession, latestPr, latestPrNumber, repoFullName, t]);
+  }, [
+    activeBrowserSession,
+    activeIosSimulatorSession,
+    activeAndroidEmulatorSession,
+    latestPr,
+    latestPrNumber,
+    repoFullName,
+    t,
+  ]);
   const sideChatOption = useMemo<SessionSidePanelOption | null>(() => {
     const launcherState = getSideChatLauncherState({
       providerSupportsFork: Boolean(
@@ -4516,9 +4753,15 @@ const SessionDetail = ({
     () =>
       viewerTabs.map((tab) => ({
         id: tab.id,
-        type: tab.type,
+        // An attachment tab reads as a file tab: same glyph by name, same strip slot.
+        type: tab.type === 'diff' ? 'diff' : 'file',
         label: tab.label,
-        filePath: tab.type === 'file' ? tab.filePath : undefined,
+        filePath:
+          tab.type === 'file'
+            ? tab.filePath
+            : tab.type === 'attachment'
+              ? tab.file.fileName
+              : undefined,
         dirty: tab.type === 'file' ? viewerTabSaveStates[tab.id]?.dirty === true : false,
         saving: tab.type === 'file' ? viewerTabSaveStates[tab.id]?.saving === true : false,
         conflict:
@@ -4564,6 +4807,35 @@ const SessionDetail = ({
     visibleSideSessions,
   ]);
   const sidePanelTabIds = useMemo(() => sidePanelTabs.map((tab) => tab.id), [sidePanelTabs]);
+  const effectiveSidePanelSplit = useMemo(
+    () =>
+      getEffectiveSidePanelTabSplit(sidePanelSplit, visibleOpenedSidebarTabs) as
+        | readonly [SidebarTab, SidebarTab]
+        | null,
+    [sidePanelSplit, visibleOpenedSidebarTabs]
+  );
+  const handleSidePanelTabsSplit = useCallback(
+    (split: SidePanelTabSplit, draggedTabId: string) => {
+      // A swap keeps each screen's width; a new pair starts even.
+      const swapped =
+        effectiveSidePanelSplit?.[0] === split[1] && effectiveSidePanelSplit[1] === split[0];
+      setSidePanelSplitRatio((ratio) => (swapped ? 1 - ratio : SIDE_PANEL_SPLIT_RATIO_DEFAULT));
+      setSidePanelSplit(split as readonly [SidebarTab, SidebarTab]);
+      handleSidebarTabSelect(draggedTabId as SidebarTab);
+      setSidebarWidthRequest((current) => ({
+        seq: (current?.seq ?? 0) + 1,
+        minWidthPx: DEVICE_SPLIT_SIDEBAR_MIN_WIDTH_PX,
+      }));
+    },
+    [effectiveSidePanelSplit, handleSidebarTabSelect]
+  );
+  const handleSidePanelTabUnsplit = useCallback(
+    (tabId: string) => {
+      setSidePanelSplit(null);
+      handleSidebarTabSelect(tabId as SidebarTab);
+    },
+    [handleSidebarTabSelect]
+  );
 
   const handleCloseSidebarTab = useCallback(
     (tabId: SidebarTab) => {
@@ -4573,6 +4845,8 @@ const SessionDetail = ({
         tabId
       ) as SidebarTab | null;
       setOpenedSidebarTabs((current) => current.filter((candidate) => candidate !== tabId));
+      // Reopening a closed member must not silently re-form its old split.
+      setSidePanelSplit((current) => (current?.includes(tabId) ? null : current));
       if (!sidebarOpen) {
         setIsSidebarOpen(false);
       }
@@ -4674,7 +4948,7 @@ const SessionDetail = ({
         }
         captureSessionDetailEvent('session/viewer_tab_closed', {
           viewer_tab_id: tabId,
-          viewer_tab_type: tabId.startsWith('file:') ? 'file' : 'diff',
+          viewer_tab_type: getViewerTabAnalyticsType(tabId),
           remaining_viewer_tab_count: Math.max(0, viewerTabs.length - 1),
         });
       }
@@ -4785,6 +5059,10 @@ const SessionDetail = ({
     });
   }, [activeTabSessionId, isMobile]);
 
+  const mobileStatusActions = useMobileStatusActions();
+  const canManageActiveStatus = useCanManageSessionStatus(activeSession);
+  const [mobileLaterSheetOpen, setMobileLaterSheetOpen] = useState(false);
+
   // Drafts and pending children can resolve to the parent for display only.
   const canRenameCurrentSession =
     activeTabSession?.id === activeTabSessionId &&
@@ -4821,21 +5099,6 @@ const SessionDetail = ({
       const nextIndex =
         (safeCurrentIndex + direction + orderedSessionTabIds.length) % orderedSessionTabIds.length;
       const nextTabId = orderedSessionTabIds[nextIndex];
-      if (!nextTabId || nextTabId === activeTabSessionId) {
-        return;
-      }
-      void handleSessionTabSelect(nextTabId);
-    },
-    [activeTabSessionId, handleSessionTabSelect, orderedSessionTabIds]
-  );
-
-  // ⌘1–⌘8 jump to that conversation tab, ⌘9 to the last one (index < 0) — the
-  // same ordered list next/previousTab steps through, so digit positions match
-  // what the tab strip shows.
-  const handleSwitchSessionTabToIndex = useCallback(
-    (index: number) => {
-      const targetIndex = index < 0 ? orderedSessionTabIds.length - 1 : index;
-      const nextTabId = orderedSessionTabIds[targetIndex];
       if (!nextTabId || nextTabId === activeTabSessionId) {
         return;
       }
@@ -4996,87 +5259,6 @@ const SessionDetail = ({
     run: () => handleSwitchSessionTab(-1),
   });
 
-  useCommand({
-    id: 'session.switchToTab1',
-    title: t('commands.session.switchToTab1', 'Switch to Tab 1'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab1'),
-    when: () => orderedSessionTabIds.length > 0,
-    run: () => handleSwitchSessionTabToIndex(0),
-  });
-
-  useCommand({
-    id: 'session.switchToTab2',
-    title: t('commands.session.switchToTab2', 'Switch to Tab 2'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab2'),
-    when: () => orderedSessionTabIds.length > 1,
-    run: () => handleSwitchSessionTabToIndex(1),
-  });
-
-  useCommand({
-    id: 'session.switchToTab3',
-    title: t('commands.session.switchToTab3', 'Switch to Tab 3'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab3'),
-    when: () => orderedSessionTabIds.length > 2,
-    run: () => handleSwitchSessionTabToIndex(2),
-  });
-
-  useCommand({
-    id: 'session.switchToTab4',
-    title: t('commands.session.switchToTab4', 'Switch to Tab 4'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab4'),
-    when: () => orderedSessionTabIds.length > 3,
-    run: () => handleSwitchSessionTabToIndex(3),
-  });
-
-  useCommand({
-    id: 'session.switchToTab5',
-    title: t('commands.session.switchToTab5', 'Switch to Tab 5'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab5'),
-    when: () => orderedSessionTabIds.length > 4,
-    run: () => handleSwitchSessionTabToIndex(4),
-  });
-
-  useCommand({
-    id: 'session.switchToTab6',
-    title: t('commands.session.switchToTab6', 'Switch to Tab 6'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab6'),
-    when: () => orderedSessionTabIds.length > 5,
-    run: () => handleSwitchSessionTabToIndex(5),
-  });
-
-  useCommand({
-    id: 'session.switchToTab7',
-    title: t('commands.session.switchToTab7', 'Switch to Tab 7'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab7'),
-    when: () => orderedSessionTabIds.length > 6,
-    run: () => handleSwitchSessionTabToIndex(6),
-  });
-
-  useCommand({
-    id: 'session.switchToTab8',
-    title: t('commands.session.switchToTab8', 'Switch to Tab 8'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToTab8'),
-    when: () => orderedSessionTabIds.length > 7,
-    run: () => handleSwitchSessionTabToIndex(7),
-  });
-
-  useCommand({
-    id: 'session.switchToLastTab',
-    title: t('commands.session.switchToLastTab', 'Switch to Last Tab'),
-    category: 'Navigation',
-    keybindings: getCommandKeybindings('session.switchToLastTab'),
-    when: () => orderedSessionTabIds.length > 0,
-    run: () => handleSwitchSessionTabToIndex(-1),
-  });
-
   useEffect(() => {
     /* Only a RESOLVED tab is worth remembering as last-active: persisting a
        still-syncing child would make the next entry restore a tab that may
@@ -5089,12 +5271,14 @@ const SessionDetail = ({
         : activeTabSessionId;
     writeStoredLastActiveTabState(sessionId, {
       sessionTabId: persistedSessionTabId,
-      viewerTab: activeViewerTab,
+      // Attachment tabs are not restored: their payload is message data, not a path.
+      viewerTab: activeViewerTab?.type === 'attachment' ? null : activeViewerTab,
       sidePanel: {
         open: isSidebarOpen,
         tab: activeSidebarTab,
         tabs: openedSidebarTabs,
         sideSessionId: activeSideSessionId,
+        split: sidePanelSplit,
       },
     });
   }, [
@@ -5107,6 +5291,7 @@ const SessionDetail = ({
     isSidebarOpen,
     openedSidebarTabs,
     sessionId,
+    sidePanelSplit,
   ]);
 
   // Side Chat always stays available: it launches another session rather than
@@ -5371,6 +5556,29 @@ const SessionDetail = ({
     [conversationSessionIds]
   );
   const conversationLiveStatusMap = useAtomValue(conversationLiveStatusAtom);
+  /** The conversation's tier, from the same Tab roll-up the home list classifies with. */
+  const activeStatusTier = useMemo(() => {
+    if (!activeSession || activeSession.isArchived || activeSession.isPinned) return null;
+    const live = new Map<string, SessionStatus>();
+    for (const [id, status] of Object.entries(conversationLiveStatusMap))
+      if (status) live.set(id, status);
+    const activity = getEffectiveSessionActivitySummary(
+      activeSession,
+      new Map([[activeSession.id, [...visibleChildSessions, ...visibleSideSessions]]]),
+      live
+    );
+    return statusViewTier(
+      {
+        activityAt: activity.latestMessageAt,
+        isWorking: activity.isWorking,
+        isWaitingPermission: activity.isWaitingPermission,
+        snoozedUntil: activeSession.snoozedUntil ?? null,
+        settledAt: activeSession.settledAt ?? null,
+        focusRestoredAt: activeSession.focusRestoredAt ?? null,
+      },
+      getServerNow()
+    );
+  }, [activeSession, conversationLiveStatusMap, visibleChildSessions, visibleSideSessions]);
 
   const mobileConversations = useMemo<ConversationTabEntry[]>(() => {
     const conversationTabActive = effectiveActiveViewerTabId == null;
@@ -5437,6 +5645,14 @@ const SessionDetail = ({
         active: false,
       });
     }
+    if (activeAndroidEmulatorSession) {
+      list.push({
+        id: MOBILE_ANDROID_EMULATOR_VIEWER_ID,
+        label: t('sessions.detailTabs.androidEmulator', 'Android Emulator'),
+        kind: 'android-emulator',
+        active: false,
+      });
+    }
     if (canShowGitHubActions && latestPr && latestPrNumber != null && latestPrRepoFullName) {
       list.push({
         id: MOBILE_PR_VIEWER_ID,
@@ -5464,6 +5680,7 @@ const SessionDetail = ({
     latestPrRepoFullName,
     activeBrowserSession,
     activeIosSimulatorSession,
+    activeAndroidEmulatorSession,
     viewerTabItems,
     effectiveActiveViewerTabId,
     mobileFileViewerOpen,
@@ -5521,6 +5738,10 @@ const SessionDetail = ({
         if (activeBrowserSession) handleOpenBrowser(activeBrowserSession.id);
         return;
       }
+      if (id === MOBILE_ANDROID_EMULATOR_VIEWER_ID) {
+        if (activeAndroidEmulatorSession) setAndroidEmulatorOpen(true);
+        return;
+      }
       if (id === MOBILE_IOS_SIMULATOR_VIEWER_ID) {
         if (activeIosSimulatorSession) handleOpenIosSimulator();
         return;
@@ -5544,6 +5765,7 @@ const SessionDetail = ({
       latestPrRepoFullName,
       activeBrowserSession,
       activeIosSimulatorSession,
+      activeAndroidEmulatorSession,
       handleOpenPrTab,
       handleOpenBrowser,
       handleOpenIosSimulator,
@@ -5552,6 +5774,7 @@ const SessionDetail = ({
     ]
   );
 
+  const { currentUserId: myAccountId, ownedMachineIds } = useMySessionScope();
   const visibleMachineIds = useMemo(
     () => new Set(sharingMachineAccessById.keys()),
     [sharingMachineAccessById]
@@ -5577,7 +5800,9 @@ const SessionDetail = ({
       visibleLocalProjectKeys,
       machineVisibilityLoading,
       localProjectVisibilityLoading,
-      currentUserId: user?.id ?? null,
+      currentUserId: myAccountId,
+      ownedMachineIds,
+      workspaceId: currentWorkspaceId,
     });
   }, [
     activeSession,
@@ -5591,6 +5816,8 @@ const SessionDetail = ({
     user?.id,
     visibleLocalProjectKeys,
     visibleMachineIds,
+    ownedMachineIds,
+    myAccountId,
   ]);
 
   /* One compact line per SessionDetail render into the crash-report ring
@@ -5653,6 +5880,7 @@ const SessionDetail = ({
         onDeleteSession: handleRequestDeleteCurrentSession,
         onOpenSearch: handleOpenSearch,
         onCopyConversationHistory: exportAllowed ? handleCopyConversationHistory : undefined,
+        onCopyUrl: (linkFormat) => handleCopyUrl(undefined, undefined, linkFormat),
         onRequestRename: canRenameCurrentSession ? handleRenameCurrentSession : undefined,
         onForkSession:
           !activeDraftTab && activeTabSession && canForkSession(activeTabSession)
@@ -5694,6 +5922,7 @@ const SessionDetail = ({
     handleOpenSearch,
     exportAllowed,
     handleCopyConversationHistory,
+    handleCopyUrl,
     activeDraftTab,
     canRenameCurrentSession,
     handleRenameCurrentSession,
@@ -5785,7 +6014,10 @@ const SessionDetail = ({
     <div {...stylex.props(detailStyles.loading)}>
       {showPendingChildTabState ? (
         <>
-          <Spinner className="h-5 w-5 text-muted-foreground" />
+          <Spinner
+            diameter="calc(var(--spacing) * 5)"
+            className={stylex.props(detailStyles.muted).className}
+          />
           <p {...stylex.props(detailStyles.loadingText)}>
             {t('sessions.tabWaitingForSync', 'Waiting for this conversation to sync…')}
           </p>
@@ -5799,7 +6031,7 @@ const SessionDetail = ({
 
   const deleteConfirmDialog = (
     <Dialog.Root open={deleteConfirmOpen} onOpenChange={(open) => setDeleteConfirmOpen(open)}>
-      <Dialog.Content className={cn(isMobile ? '' : 'max-w-sm')}>
+      <Dialog.Content xstyle={!isMobile && detailStyles.confirmSmall}>
         <Dialog.Header>
           <Dialog.Title>{t('archive.deleteConfirm.title', 'Delete permanently?')}</Dialog.Title>
           <Dialog.Description>
@@ -5867,7 +6099,7 @@ const SessionDetail = ({
         if (!open) cancelDirtyFork();
       }}
     >
-      <Dialog.Content className={cn(isMobile ? '' : 'max-w-md')}>
+      <Dialog.Content xstyle={!isMobile && detailStyles.confirmMedium}>
         <Dialog.Header>
           <Dialog.Title>{t('sessions.forkDirty.title', 'Uncommitted changes found')}</Dialog.Title>
           <Dialog.Description>
@@ -5911,8 +6143,20 @@ const SessionDetail = ({
     />
   );
 
-  const renderViewerTabContent = (tab: ViewerTab, className = 'h-full', active = true) =>
-    tab.type === 'file' ? (
+  const renderViewerTabContent = (
+    tab: ViewerTab,
+    className = stylex.props(detailStyles.rootFill).className,
+    active = true
+  ) =>
+    tab.type === 'attachment' ? (
+      <SessionFileAttachmentPane
+        key={`${activeSession.id}:${tab.id}`}
+        file={tab.file}
+        sessionId={tab.sessionId}
+        active={active}
+        className={className}
+      />
+    ) : tab.type === 'file' ? (
       <SessionFileContentView
         key={`${activeSession.id}:${tab.id}`}
         sessionId={activeSession.id}
@@ -5927,6 +6171,7 @@ const SessionDetail = ({
         copyMarkdownRequestSeq={viewerTabSaveStates[tab.id]?.copyMarkdownRequestSeq ?? 0}
         sessionLinksEnabled={!!handleNavigateSession}
         defaultHtmlPreview={isMobile}
+        defaultReadOnly={isMobile}
         preferNativeMarkdownSelection={isMobile}
         onAddSelectionToChat={
           activeSession.isArchived
@@ -6090,7 +6335,7 @@ const SessionDetail = ({
           ) : activeSessionSharing.visibility === 'private' ? (
             <LockKeyhole {...stylex.props(detailStyles.icon14)} />
           ) : (
-            <Spinner className="h-3.5 w-3.5" />
+            <Spinner diameter="calc(var(--spacing) * 3.5)" />
           ),
         label: t('sessions.sharing.visibility', 'Visibility'),
         value: `${getSessionSharingLabel(t, activeSessionSharing)} — ${getSessionSharingDescription(t, activeSessionSharing)}`,
@@ -6114,7 +6359,7 @@ const SessionDetail = ({
           mobileMenuActions.push({
             id: 'fork',
             icon: pendingFork ? (
-              <Spinner className="h-3.5 w-3.5" />
+              <Spinner diameter="calc(var(--spacing) * 3.5)" />
             ) : (
               <GitFork {...stylex.props(detailStyles.icon14)} />
             ),
@@ -6139,6 +6384,32 @@ const SessionDetail = ({
           }
         }
       }
+      if (activeStatusTier && canManageActiveStatus) {
+        const statusSessionId = activeSession.id;
+        mobileMenuActions.push({
+          id: 'later',
+          icon: <Clock {...stylex.props(detailStyles.icon14)} />,
+          label: t('sessions.contextMenu.snooze', 'Later'),
+          onClick: () => setMobileLaterSheetOpen(true),
+          separatorBefore: true,
+        });
+        if (activeStatusTier !== 'settled') {
+          mobileMenuActions.push({
+            id: 'settle',
+            icon: <CircleCheck {...stylex.props(detailStyles.icon14)} />,
+            label: t('sessions.contextMenu.settle', 'Settle'),
+            onClick: () => mobileStatusActions.settle(statusSessionId),
+          });
+        }
+        if (activeStatusTier !== 'focus') {
+          mobileMenuActions.push({
+            id: 'move-to-focus',
+            icon: <Focus {...stylex.props(detailStyles.icon14)} />,
+            label: t('sessions.contextMenu.moveToFocus', 'Move to Focus'),
+            onClick: () => mobileStatusActions.moveToFocus(statusSessionId),
+          });
+        }
+      }
       if (canRenameCurrentSession) {
         mobileMenuActions.push({
           id: 'rename',
@@ -6151,7 +6422,7 @@ const SessionDetail = ({
     mobileMenuActions.push(
       {
         id: 'copy-path',
-        icon: <Copy {...stylex.props(detailStyles.icon14)} />,
+        icon: <Folder {...stylex.props(detailStyles.icon14)} />,
         label: t('sessions.copyPath', 'Copy path'),
         onClick: () =>
           handleCopyText(
@@ -6175,6 +6446,14 @@ const SessionDetail = ({
       label: t('sessions.copyUrl', 'Copy URL'),
       onClick: () => {
         void handleCopyUrl();
+      },
+    });
+    mobileMenuActions.push({
+      id: 'copy-deeplink',
+      icon: <SquareArrowOutUpRight {...stylex.props(detailStyles.icon14)} />,
+      label: t('sessions.copyDeepLink', 'Copy deeplink'),
+      onClick: () => {
+        void handleCopyUrl(undefined, undefined, 'deeplink');
       },
     });
     // Share-as-image arms message selection inside the chat surface, so it is
@@ -6201,7 +6480,7 @@ const SessionDetail = ({
         id: 'share-with-team',
         icon:
           activeSessionSharing.visibility === 'unknown' ? (
-            <Spinner className="h-3.5 w-3.5" />
+            <Spinner diameter="calc(var(--spacing) * 3.5)" />
           ) : activeSessionSharing.privateReason === 'machine-not-registered' ? (
             <Monitor {...stylex.props(detailStyles.icon14)} />
           ) : activeSessionSharing.canManage ? (
@@ -6259,6 +6538,8 @@ const SessionDetail = ({
 
     // Floating frosted header: absolutely positioned over the conversation so
     // content scrolls UNDER it and gets frosted by the backdrop blur. The
+    // scrim is 90% opaque: WKWebView often does not blur a sibling scroller,
+    // and at 55% the transcript stayed sharp under the title. The
     // conversation scroll + viewer panels read `--conversation-top-inset` so
     // their content clears the header at rest (see ai-gui/view.tsx VList).
     const mobileHeaderInset = isNativeAppShell()
@@ -6302,6 +6583,13 @@ const SessionDetail = ({
             void handleTabClose(id);
           }}
         />
+        <MobileLaterSheet
+          open={mobileLaterSheetOpen}
+          onOpenChange={setMobileLaterSheetOpen}
+          title={activeSession.title ?? undefined}
+          nowMs={getServerNow()}
+          onPick={(until) => mobileStatusActions.snooze(activeSession.id, until)}
+        />
         <SessionShareMobileMenu
           key={`${currentWorkspaceId}:${activeTabSessionId}`}
           workspaceId={currentWorkspaceId}
@@ -6320,6 +6608,7 @@ const SessionDetail = ({
             isMultiMemberWorkspace && !activeSession.isArchived
               ? {
                   members: workspaceMembers,
+                  getDisabledReason: (userId) => getOwnerAccessReason(activeSession, userId),
                   ownerUserId: activeSession.userId,
                   onSelect: (userId) => {
                     void handleTransferSessionOwner(activeSession.id, userId);
@@ -6380,7 +6669,8 @@ const SessionDetail = ({
                   )}
                   onOpenPrTab={handleOpenPrTab}
                   onOpenAllChanges={handleOpenAllChanges}
-                  onOpenIosSimulator={() => handleOpenIosSimulatorForSession(tabSession.id)}
+                  onOpenIosSimulator={() => handleOpenIosSimulator()}
+                  onOpenAndroidEmulator={() => handleOpenAndroidEmulator()}
                   onOpenBrowser={
                     previewAllowed ? () => handleOpenBrowser(tabSession.id, true) : undefined
                   }
@@ -6424,6 +6714,8 @@ const SessionDetail = ({
                   ref={(el) => setChatTabRef(draft.id, el)}
                   draft={draft}
                   parentSession={activeSession}
+                  isRepoPublic={activeSessionLinkedRepo?.isPublic}
+                  isRepoLinked={activeSessionIsRepoLinked}
                   commandsEnabled={isActive}
                   onDraftChange={handleDraftChange}
                   onSendDraft={handleSendDraft}
@@ -6466,9 +6758,9 @@ const SessionDetail = ({
           view={mobileDiffState?.view}
           onBackToFiles={mobileDiffState?.mode === 'base' ? handleBackToMobileChanges : undefined}
           changes={{
-            ready: sessionDiffReady,
-            synced: sessionDiffSynced,
-            unavailableMessage: sessionDiffUnavailableMessage,
+            ready: changesReady,
+            synced: changesSynced,
+            unavailableMessage: changesUnavailableMessage,
             changeEntries,
             changeFilePaths,
             onOpenChangesDiff: handleSelectMobileChange,
@@ -6585,7 +6877,8 @@ const SessionDetail = ({
         >
           <DrawerContent
             nativeKeyboardInset
-            className="w-full! max-w-none! inset-0 border-0 border-l-0! rounded-none"
+            width="full"
+            xstyle={detailStyles.fullDrawer}
             data-sidebar-swipe-open-disabled
           >
             <DrawerTitle className={stylex.props(detailStyles.srOnly).className}>
@@ -6598,7 +6891,9 @@ const SessionDetail = ({
                     type="button"
                     variant="ghost"
                     icon
-                    className={getSessionDetailTouchIconButtonClassName('-ml-1')}
+                    width="calc(var(--spacing) * 11)"
+                    height="calc(var(--spacing) * 11)"
+                    xstyle={detailStyles.touchBackButton}
                     /* Same order as the edge swipe: pop a directory level
                        first, close the drawer only at the root. */
                     onClick={() => {
@@ -6653,7 +6948,8 @@ const SessionDetail = ({
         >
           <DrawerContent
             nativeKeyboardInset
-            className="w-full! max-w-none! inset-0 border-0 border-l-0! rounded-none"
+            width="full"
+            xstyle={detailStyles.fullDrawer}
             data-sidebar-swipe-open-disabled
           >
             <DrawerTitle className={stylex.props(detailStyles.srOnly).className}>
@@ -6673,7 +6969,9 @@ const SessionDetail = ({
                       type="button"
                       variant="ghost"
                       icon
-                      className={getSessionDetailTouchIconButtonClassName('-ml-1')}
+                      width="calc(var(--spacing) * 11)"
+                      height="calc(var(--spacing) * 11)"
+                      xstyle={detailStyles.touchBackButton}
                       onClick={handleClosePrTab}
                       aria-label={t('common.back', 'Back')}
                     >
@@ -6706,7 +7004,8 @@ const SessionDetail = ({
         >
           <DrawerContent
             nativeKeyboardInset
-            className="w-full! max-w-none! inset-0 border-0 border-l-0! rounded-none"
+            width="full"
+            xstyle={detailStyles.fullDrawer}
             data-sidebar-swipe-open-disabled
           >
             <DrawerTitle className={stylex.props(detailStyles.srOnly).className}>
@@ -6741,7 +7040,9 @@ const SessionDetail = ({
                       type="button"
                       variant="ghost"
                       icon
-                      className={getSessionDetailTouchIconButtonClassName('-ml-1')}
+                      width="calc(var(--spacing) * 11)"
+                      height="calc(var(--spacing) * 11)"
+                      xstyle={detailStyles.touchBackButton}
                       onClick={handleCloseBrowserTab}
                       aria-label={t('common.back', 'Back')}
                     >
@@ -6765,7 +7066,8 @@ const SessionDetail = ({
         >
           <DrawerContent
             nativeKeyboardInset
-            className="w-full! max-w-none! inset-0 border-0 border-l-0! rounded-none"
+            width="full"
+            xstyle={detailStyles.fullDrawer}
             data-sidebar-swipe-open-disabled
           >
             <DrawerTitle className={stylex.props(detailStyles.srOnly).className}>
@@ -6785,8 +7087,57 @@ const SessionDetail = ({
                       type="button"
                       variant="ghost"
                       icon
-                      className={getSessionDetailTouchIconButtonClassName('-ml-1')}
+                      width="calc(var(--spacing) * 11)"
+                      height="calc(var(--spacing) * 11)"
+                      xstyle={detailStyles.touchBackButton}
                       onClick={handleCloseIosSimulator}
+                      aria-label={t('common.back', 'Back')}
+                    >
+                      <ArrowLeft {...stylex.props(detailStyles.icon16)} />
+                    </Button>
+                  }
+                />
+              )}
+            </VaulDrawerBody>
+          </DrawerContent>
+        </Drawer>
+        {/* Android owns its mobile drawer independently of iOS and Browser. */}
+        <Drawer
+          direction="right"
+          repositionInputs={isNativeAppShell()}
+          open={Boolean(androidEmulatorOpen && activeAndroidEmulatorSession)}
+          onOpenChange={(open) => {
+            if (!open) setAndroidEmulatorOpen(false);
+          }}
+        >
+          <DrawerContent
+            nativeKeyboardInset
+            width="full"
+            xstyle={detailStyles.fullDrawer}
+            data-sidebar-swipe-open-disabled
+          >
+            <DrawerTitle className={stylex.props(detailStyles.srOnly).className}>
+              {t('sessions.detailTabs.androidEmulator', 'Android Emulator')}
+            </DrawerTitle>
+            <VaulDrawerBody topInset={MOBILE_DRAWER_HEADER_INSET}>
+              {activeAndroidEmulatorSession && (
+                <SessionDevicePreviewPanel
+                  platform="android"
+                  session={activeAndroidEmulatorSession}
+                  active={Boolean(androidEmulatorOpen)}
+                  controlsLayout="menu"
+                  onAttachScreenshot={(file) =>
+                    handleAttachSimulatorScreenshot(activeAndroidEmulatorSession.id, file)
+                  }
+                  leadingSlot={
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      icon
+                      width="calc(var(--spacing) * 11)"
+                      height="calc(var(--spacing) * 11)"
+                      xstyle={detailStyles.touchBackButton}
+                      onClick={() => setAndroidEmulatorOpen(false)}
                       aria-label={t('common.back', 'Back')}
                     >
                       <ArrowLeft {...stylex.props(detailStyles.icon16)} />
@@ -6838,6 +7189,11 @@ const SessionDetail = ({
   const hasMacOSTitlebarInset =
     !isNativeAppShell() && isMacOSElectronRenderer() && !isElectronFullscreen;
 
+  // Viewers and side chats render their own absolutely positioned surfaces on
+  // top; the fixed-panel body only shows when neither owns the panel.
+  const showFixedSidePanelBody =
+    effectiveActiveViewerTabId === null && effectiveActiveSideSessionId === null;
+
   const nonBrowserSidebarContent =
     activeSidebarTab === 'files' ? (
       <FileTreeView
@@ -6863,24 +7219,58 @@ const SessionDetail = ({
         className={stylex.props(detailStyles.background).className}
         // The side panel stays mounted while collapsed, so GitHub polling has
         // to be paused explicitly — same signal SessionBrowserPanel takes.
-        visible={isSidebarVisible}
+        visible={showFixedSidePanelBody && isSidebarVisible}
       />
     ) : activeSidebarTab === 'changes' ? (
       <SessionChangesSidebar
-        ready={sessionDiffReady}
-        synced={sessionDiffSynced}
-        unavailableMessage={sessionDiffUnavailableMessage}
+        ready={changesReady}
+        synced={changesSynced}
+        unavailableMessage={changesUnavailableMessage}
         changeEntries={changeEntries}
         changeFilePaths={changeFilePaths}
         onOpenChangesDiff={handleOpenChangesDiff}
       />
     ) : null;
 
-  // Keep the browser mounted while another sidebar tab is selected. Managed
-  // pages retain DOM state and Electron's native view is only hidden, so tab
-  // switching behaves like a browser rather than rebuilding the page.
+  // A split shows both of its panels whenever either one is selected.
+  const fixedPanelSplitVisible =
+    effectiveSidePanelSplit !== null &&
+    activeSidebarTab !== null &&
+    effectiveSidePanelSplit.includes(activeSidebarTab);
+  const getFixedPanelPlacement = (tabId: SidebarTab): 'full' | 'start' | 'end' | 'hidden' => {
+    if (fixedPanelSplitVisible && effectiveSidePanelSplit?.includes(tabId)) {
+      return effectiveSidePanelSplit[0] === tabId ? 'start' : 'end';
+    }
+    return activeSidebarTab === tabId ? 'full' : 'hidden';
+  };
+  const iosSimulatorPlacement = getFixedPanelPlacement('ios-simulator');
+  const androidEmulatorPlacement = getFixedPanelPlacement('android-emulator');
+  const getFixedPanelFillClassName = (placement: ReturnType<typeof getFixedPanelPlacement>) =>
+    stylex.props(
+      detailStyles.absoluteFill,
+      !sidePanelSplitResizing && detailStyles.splitSlide,
+      placement === 'start' && detailStyles.splitStart,
+      placement === 'end' && detailStyles.splitEnd,
+      placement === 'hidden' && detailStyles.invisibleFill
+    ).className;
+
+  // Keep the browser and device previews mounted while another sidebar tab,
+  // file viewer, or side chat is selected. Managed pages and device streams
+  // stay alive in memory and Electron's native view is only hidden, so tab
+  // switching never reconnects an active preview.
   const sidebarContent = (
-    <div {...stylex.props(detailStyles.sidebarContentRoot)}>
+    <div
+      {...stylex.props(detailStyles.sidebarContentRoot)}
+      style={{ [SIDE_PANEL_SPLIT_RATIO_VAR]: sidePanelSplitRatio } as CSSProperties}
+    >
+      {fixedPanelSplitVisible ? (
+        <SidePanelSplitHandle
+          ratio={sidePanelSplitRatio}
+          label={t('sessions.sidebar.resizeSplit', 'Resize split view')}
+          onRatioChange={setSidePanelSplitRatio}
+          onDraggingChange={setSidePanelSplitResizing}
+        />
+      ) : null}
       {previewAllowed && activeBrowserSession && openedSidebarTabs.includes('browser') ? (
         <div
           className={
@@ -6893,7 +7283,7 @@ const SessionDetail = ({
         >
           <SessionBrowserPanel
             session={activeBrowserSession}
-            active={activeSidebarTab === 'browser' && isSidebarVisible}
+            active={showFixedSidePanelBody && activeSidebarTab === 'browser' && isSidebarVisible}
             candidateNavigationRequestId={
               browserCandidateNavigationRequest?.sessionId === activeBrowserSession.id
                 ? browserCandidateNavigationRequest.id
@@ -6915,49 +7305,52 @@ const SessionDetail = ({
       ) : null}
       {activeIosSimulatorSession && openedSidebarTabs.includes('ios-simulator') ? (
         <div
-          className={
-            stylex.props(
-              detailStyles.absoluteFill,
-              activeSidebarTab !== 'ios-simulator' && detailStyles.invisibleFill
-            ).className
-          }
-          aria-hidden={activeSidebarTab !== 'ios-simulator'}
+          className={getFixedPanelFillClassName(iosSimulatorPlacement)}
+          aria-hidden={iosSimulatorPlacement === 'hidden'}
         >
           <SessionIosSimulatorPanel
             session={activeIosSimulatorSession}
-            active={activeSidebarTab === 'ios-simulator' && isSidebarVisible}
+            active={
+              showFixedSidePanelBody && iosSimulatorPlacement !== 'hidden' && isSidebarVisible
+            }
             onAttachScreenshot={(file) =>
               handleAttachSimulatorScreenshot(activeIosSimulatorSession.id, file)
             }
           />
         </div>
       ) : null}
-      {activeSidebarTab !== 'browser' && activeSidebarTab !== 'ios-simulator' ? (
+      {activeAndroidEmulatorSession && openedSidebarTabs.includes('android-emulator') ? (
+        <div
+          className={getFixedPanelFillClassName(androidEmulatorPlacement)}
+          aria-hidden={androidEmulatorPlacement === 'hidden'}
+        >
+          <SessionDevicePreviewPanel
+            platform="android"
+            session={activeAndroidEmulatorSession}
+            active={
+              showFixedSidePanelBody && androidEmulatorPlacement !== 'hidden' && isSidebarVisible
+            }
+            onAttachScreenshot={(file) =>
+              handleAttachSimulatorScreenshot(activeAndroidEmulatorSession.id, file)
+            }
+          />
+        </div>
+      ) : null}
+      {showFixedSidePanelBody &&
+      activeSidebarTab !== 'browser' &&
+      activeSidebarTab !== 'ios-simulator' &&
+      activeSidebarTab !== 'android-emulator' ? (
         <div {...stylex.props(detailStyles.absoluteFill)}>{nonBrowserSidebarContent}</div>
       ) : null}
     </div>
   );
-
-  // Viewers and side chats render their own absolutely positioned surfaces on
-  // top; the fixed-panel body only shows when neither owns the panel.
-  const showFixedSidePanelBody =
-    effectiveActiveViewerTabId === null && effectiveActiveSideSessionId === null;
   const defaultSizes = showFixedSidePanelBody
     ? { main: 75, sidebar: 25 }
     : { main: 60, sidebar: 40 };
 
+  // The hidden sidebar's own header controls: Toggle, Back and Forward.
   const leftSidebarExpandButton = isLeftSidebarHidden ? (
-    <Button
-      type="button"
-      variant="ghost"
-      size="small"
-      icon
-      onClick={() => showNavigationSidebar()}
-      aria-label={t('sessions.leftSidebar.show', 'Show navigation sidebar')}
-      className={stylex.props(detailStyles.shrink).className}
-    >
-      <CuidaSidebarExpandOutline {...stylex.props(detailStyles.icon16)} aria-hidden="true" />
-    </Button>
+    <SidebarHistoryControls onToggleSidebar={() => showNavigationSidebar()} />
   ) : null;
 
   const desktopHeaderToolbar = <div ref={setDesktopToolbarContainer} />;
@@ -6988,7 +7381,7 @@ const SessionDetail = ({
       onMentionSession={handleInsertDroppedSessionMention}
       leftSlot={leftSidebarExpandButton}
       rightSlot={desktopHeaderToolbar}
-      className={cn(
+      className={clsx(
         stylex.props(
           detailStyles.topBarHeight,
           detailStyles.parentActiveScope,
@@ -7022,6 +7415,7 @@ const SessionDetail = ({
         isActive && chatSession.id === sessionId ? claimNavigationFocus : undefined,
       session: chatSession,
       workspaceSession: activeSession,
+      onRestoreSession: handleRestoreCurrentSession,
       className: stylex.props(detailStyles.rootFill).className,
       hideHeader: true,
       toolbar: chatSession.id === sessionId ? desktopToolbar : undefined,
@@ -7030,7 +7424,9 @@ const SessionDetail = ({
       onFileDiffClick: handleOpenFileDiffForChat,
       onFilePathClick: handleOpenFile,
       onOpenHtmlFile: handleOpenHtmlFile,
-      onOpenIosSimulator: () => handleOpenIosSimulatorForSession(chatSession.id),
+      onOpenFileAttachment: handleOpenFileAttachment,
+      onOpenIosSimulator: () => handleOpenIosSimulator(),
+      onOpenAndroidEmulator: () => handleOpenAndroidEmulator(),
       onOpenBrowser: previewAllowed ? () => handleOpenBrowser(chatSession.id, true) : undefined,
       onOpenExistingBrowser: () => handleOpenBrowser(chatSession.id, false),
       onNavigateToComment: handleNavigateToComment,
@@ -7128,6 +7524,8 @@ const SessionDetail = ({
               ref={(el) => setChatTabRef(draft.id, el)}
               draft={draft}
               parentSession={activeSession}
+              isRepoPublic={activeSessionLinkedRepo?.isPublic}
+              isRepoLinked={activeSessionIsRepoLinked}
               commandsEnabled={isActive}
               onDraftChange={handleDraftChange}
               onSendDraft={handleSendDraft}
@@ -7196,7 +7594,7 @@ const SessionDetail = ({
     <div
       data-lody-session-tab-region="side-panel"
       data-lody-action-scope="side-panel"
-      className={cn(
+      className={clsx(
         'group/close-scope',
         stylex.props(stylex.defaultMarker(), detailStyles.desktopPanelShell).className
       )}
@@ -7212,6 +7610,9 @@ const SessionDetail = ({
         closeTabLabel={(tabLabel) =>
           t('sessions.fileViewer.closeTab', 'Close {{fileName}}', { fileName: tabLabel })
         }
+        split={effectiveSidePanelSplit}
+        onTabsSplit={handleSidePanelTabsSplit}
+        onTabUnsplit={handleSidePanelTabUnsplit}
         moreSlot={
           <SessionFileActionsMenu
             filePath={activeViewerFilePath}
@@ -7219,7 +7620,7 @@ const SessionDetail = ({
           />
         }
         endSlot={sidebarToggleButton}
-        className={cn(
+        className={clsx(
           stylex.props(detailStyles.sideTabBar).className,
           // Right panel is never under the macOS traffic lights (top-left) —
           // it must not reserve the titlebar inset the left sidebar needs. It
@@ -7230,7 +7631,19 @@ const SessionDetail = ({
         )}
       />
       <div {...stylex.props(detailStyles.sidebarBody)}>
-        {showFixedSidePanelBody && activeSidebarTab !== null ? sidebarContent : null}
+        {openedSidebarTabs.length > 0 ? (
+          <div
+            className={
+              stylex.props(
+                detailStyles.absoluteFill,
+                (!showFixedSidePanelBody || activeSidebarTab === null) && detailStyles.invisibleFill
+              ).className
+            }
+            aria-hidden={!showFixedSidePanelBody || activeSidebarTab === null}
+          >
+            {sidebarContent}
+          </div>
+        ) : null}
         {showFixedSidePanelBody && activeSidebarTab === null && sidePanelTabs.length === 0 ? (
           <SessionSidePanelEmptyState
             panels={sidePanelOptions}
@@ -7273,7 +7686,7 @@ const SessionDetail = ({
         sidebarOpen={isSidebarVisible}
         onSidebarCollapse={handleToggleSidebar}
         deleteConfirmDialog={deleteConfirmDialog}
-        sidebarMinWidthRequest={prSidebarWidthRequest}
+        sidebarMinWidthRequest={sidebarWidthRequest}
         sidebarRestoreSeq={sidebarRestoreSeq}
       />
       {/* These dialogs live at the desktop root too (the mobile branch renders its own
@@ -7315,4 +7728,15 @@ const SessionDetail = ({
   );
 };
 
-export default SessionDetail;
+export default function SessionDetailWithHistoryAccess(props: Parameters<typeof SessionDetail>[0]) {
+  return (
+    <SessionHistoryAccessBoundary
+      sessionId={props.sessionId}
+      urlTab={props.urlTab}
+      onMobileBack={props.onMobileBack}
+      onMobilePresented={props.onMobilePresented}
+    >
+      <SessionDetail {...props} />
+    </SessionHistoryAccessBoundary>
+  );
+}

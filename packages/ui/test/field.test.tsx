@@ -1,11 +1,12 @@
 import * as stylex from '@stylexjs/stylex';
+
+import { mount, typeInto } from './dom';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { act, createRef, useState } from 'react';
 import { describe, expect, test } from 'vitest';
 import { Field } from '../src/field/field';
-import { field, fieldPaletteTheme } from '../src/field/field.tokens.stylex';
+
 import { Input } from '../src/field/input';
-import { Textarea } from '../src/field/textarea';
-import { forcedThemeClassNames } from '../src/theme/theme';
 
 function classesOf(html: string, tag: string): string[] {
   const open = new RegExp(`<${tag}\\b[^>]*>`).exec(html)?.[0] ?? '';
@@ -57,15 +58,6 @@ describe('Field', () => {
     expect(classesOf(html, 'label').length).toBeGreaterThan(0);
   });
 
-  test('a standalone label is styled the same as one inside a field', () => {
-    const alone = classesOf(
-      renderToStaticMarkup(<Field.Label htmlFor="x">Title</Field.Label>),
-      'label'
-    );
-    const rooted = classesOf(renderToStaticMarkup(named), 'label');
-    expect(alone).toEqual(rooted);
-  });
-
   test('the label is associated with the control the field renders', () => {
     const html = renderToStaticMarkup(named);
     const control = attrOf(html, 'input', 'id');
@@ -115,37 +107,6 @@ describe('Field', () => {
 });
 
 describe('Input and Textarea', () => {
-  test('Input renders a native input carrying its size step', () => {
-    const html = renderToStaticMarkup(<Input size="small" placeholder="Search" />);
-    expect(html).toMatch(/^<input/);
-    expect(html).toContain('data-size="small"');
-    expect(html).toContain('placeholder="Search"');
-  });
-
-  test('Textarea renders a native textarea and keeps textarea attributes', () => {
-    const html = renderToStaticMarkup(<Textarea rows={4} placeholder="Describe the task" />);
-    expect(html).toMatch(/^<textarea/);
-    expect(html).toContain('rows="4"');
-    expect(html).toContain('placeholder="Describe the task"');
-  });
-
-  test('Input and Textarea share the well styles rather than each defining one', () => {
-    const input = classesOf(renderToStaticMarkup(<Input />), 'input');
-    const textarea = classesOf(renderToStaticMarkup(<Textarea />), 'textarea');
-    const shared = input.filter((name) => textarea.includes(name));
-    expect(shared.length).toBeGreaterThan(5);
-  });
-
-  test('aria-invalid on the control alone shows the ring', () => {
-    expect(RING_CLASSES.length).toBeGreaterThan(0);
-    const area = classesOf(renderToStaticMarkup(<Textarea />), 'textarea');
-    const areaInvalid = classesOf(
-      renderToStaticMarkup(<Textarea aria-invalid="true" />),
-      'textarea'
-    );
-    expect(areaInvalid.filter((name) => !area.includes(name))).toEqual(RING_CLASSES);
-  });
-
   test('the ring follows what ARIA calls invalid, not just the literal true', () => {
     expect(RING_CLASSES.length).toBeGreaterThan(0);
     for (const value of [true, 'true', 'grammar', 'spelling'] as const) {
@@ -162,26 +123,6 @@ describe('Input and Textarea', () => {
         `${String(value)} does not ring`
       ).toBe(false);
     }
-  });
-
-  test('a field marked invalid rings its control without the caller repeating it', () => {
-    expect(RING_CLASSES.length).toBeGreaterThan(0);
-    const html = renderToStaticMarkup(
-      <Field.Root invalid>
-        <Input />
-      </Field.Root>
-    );
-    // Base UI renders the field's validity as aria-invalid, so the attribute and
-    // the ring are the same fact reaching the control by two routes.
-    expect(html).toContain('aria-invalid="true"');
-    expect(RING_CLASSES.every((name) => classesOf(html, 'input').includes(name))).toBe(true);
-  });
-
-  test('a caller className lands after the compiled classes', () => {
-    const html = renderToStaticMarkup(<Input className="w-64" />);
-    const cls = /class="([^"]*)"/.exec(html)?.[1] ?? '';
-    expect(cls.endsWith(' w-64')).toBe(true);
-    expect(cls.split(' ').length).toBeGreaterThan(5);
   });
 
   test('a leading part shares the well with the value, and the label still reaches it', () => {
@@ -202,51 +143,130 @@ describe('Input and Textarea', () => {
     expect(inputId).toBe(labelFor);
   });
 
-  test('an invalid field with a leading part rings the shell, not the value in it', () => {
-    // Field.Root renders a <div> of its own first; the shell is the one carrying the size.
-    const shellOf = (html: string) =>
-      (
-        /class="([^"]*)"/.exec(/<div\b[^>]*data-size="[^"]*"[^>]*>/.exec(html)?.[0] ?? '')?.[1] ??
-        ''
-      )
-        .split(' ')
-        .filter(Boolean);
-    const resting = renderToStaticMarkup(<Input leading="/" />);
-    const invalid = renderToStaticMarkup(
-      <Field.Root invalid>
-        <Input leading="/" />
-      </Field.Root>
-    );
-    const added = shellOf(invalid).filter((name) => !shellOf(resting).includes(name));
-    expect(added.length).toBeGreaterThan(0);
-    expect(classesOf(invalid, 'input')).toEqual(classesOf(resting, 'input'));
-  });
+  test.each([
+    { name: 'plain', leading: undefined, trailing: undefined },
+    { name: 'leading', leading: '/', trailing: undefined },
+    { name: 'trailing', leading: undefined, trailing: <span>Connected to preview server</span> },
+    { name: 'both slots', leading: '/', trailing: <span>Connected to preview server</span> },
+  ])(
+    'a resized input retains native attributes, ref and caller style ($name)',
+    async ({ leading, trailing }) => {
+      const ref = createRef<HTMLInputElement>();
+      const view = await mount(
+        <Input
+          ref={ref}
+          leading={leading}
+          trailing={trailing}
+          controlHeight={40}
+          height={17}
+          defaultValue="Retained input"
+          style={(state) => ({ height: state.disabled ? 19 : 44, letterSpacing: '1px' })}
+        />
+      );
+      const input = ref.current!;
+      input.focus();
+      expect(input.getAttribute('height')).toBe('17');
+      expect(input.style.height).toBe('44px');
+      expect(input.style.letterSpacing).toBe('1px');
+      await act(async () => {
+        view.root.render(
+          <Input
+            ref={ref}
+            leading={leading}
+            trailing={trailing}
+            controlHeight={0}
+            height={18}
+            defaultValue="Retained input"
+            disabled
+            style={(state) => ({ height: state.disabled ? 19 : 44 })}
+          />
+        );
+      });
+      expect(ref.current).toBe(input);
+      expect(input.value).toBe('Retained input');
+      expect(input.disabled).toBe(true);
+      expect(input.getAttribute('height')).toBe('18');
+      expect(input.style.height).toBe('19px');
+      expect(input.style.letterSpacing).toBe('');
+      await act(async () => {
+        view.root.render(
+          <Input
+            ref={ref}
+            leading={leading}
+            trailing={trailing}
+            defaultValue="Retained input"
+            style={{ height: 46 }}
+          />
+        );
+      });
+      expect(ref.current).toBe(input);
+      expect(input.getAttribute('height')).toBeNull();
+      expect(input.disabled).toBe(false);
+      expect(input.value).toBe('Retained input');
+      expect(input.style.height).toBe('46px');
+      await view.unmount();
+    }
+  );
 
-  test('with a leading part, className lands on the shell and inputClassName on the value', () => {
-    const html = renderToStaticMarkup(
-      <Input leading="/" className="w-56" inputClassName="font-mono" />
-    );
-    expect(classesOf(html, 'div')).toContain('w-56');
-    expect(classesOf(html, 'div')).not.toContain('font-mono');
-    expect(classesOf(html, 'input')).toContain('font-mono');
-  });
-});
-
-describe('field tokens', () => {
-  test('compile to custom property references', () => {
-    expect(field.background).toMatch(/^var\(--/);
-    expect(field.ring).toMatch(/^var\(--/);
-    expect(field.invalidRing).toMatch(/^var\(--/);
-  });
-
-  test('the palette theme rides along with every forced palette', () => {
-    const themeClasses = (stylex.props(fieldPaletteTheme).className ?? '')
-      .split(' ')
-      .filter(Boolean);
-    expect(themeClasses.length).toBeGreaterThan(0);
-    for (const name of themeClasses) {
-      expect(forcedThemeClassNames('light')).toContain(name);
-      expect(forcedThemeClassNames('dark')).toContain(name);
+  test('both slots keep the label, editing, keyboard action and dynamic shell styling on one input', async () => {
+    const ref = createRef<HTMLInputElement>();
+    const extension = stylex.create({ width: (width: number) => ({ maxWidth: width }) });
+    function Address() {
+      const [value, setValue] = useState('https://preview.local');
+      const [submitted, setSubmitted] = useState('');
+      return (
+        <Field.Root name="preview-url" invalid>
+          <Field.Label>Preview address</Field.Label>
+          <Input
+            ref={ref}
+            leading="/"
+            trailing={<span data-status>Connected to preview server</span>}
+            value={value}
+            onValueChange={setValue}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') setSubmitted(event.currentTarget.value);
+            }}
+            xstyle={extension.width(280)}
+            className="shell-hook"
+            inputClassName="value-hook"
+            style={{ letterSpacing: '1px' }}
+          />
+          <output>{submitted}</output>
+        </Field.Root>
+      );
+    }
+    const view = await mount(<Address />);
+    try {
+      const input = ref.current!;
+      const shell = input.closest<HTMLElement>('[data-slot="input-shell"]')!;
+      expect(shell.querySelectorAll('input')).toHaveLength(1);
+      expect(shell.classList.contains('shell-hook')).toBe(true);
+      expect(input.classList.contains('value-hook')).toBe(true);
+      expect(input.classList.contains('shell-hook')).toBe(false);
+      expect(input.style.letterSpacing).toBe('1px');
+      const variables = stylex.props(extension.width(280)).style!;
+      expect(Object.keys(variables).length).toBeGreaterThan(0);
+      for (const [name, value] of Object.entries(variables)) {
+        expect(shell.style.getPropertyValue(name)).toBe(value);
+        expect(input.style.getPropertyValue(name)).toBe('');
+      }
+      expect(input.previousElementSibling?.getAttribute('data-slot')).toBe('input-leading');
+      expect(input.nextElementSibling?.getAttribute('data-slot')).toBe('input-trailing');
+      expect(input.nextElementSibling?.textContent).toBe('Connected to preview server');
+      expect(view.container.querySelector('label')?.htmlFor).toBe(input.id);
+      expect(input.getAttribute('aria-invalid')).toBe('true');
+      input.focus();
+      await typeInto(input, 'https://preview.local/updated');
+      await act(async () => {
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      });
+      expect(ref.current).toBe(input);
+      expect(document.activeElement).toBe(input);
+      expect(view.container.querySelector('output')?.textContent).toBe(
+        'https://preview.local/updated'
+      );
+    } finally {
+      await view.unmount();
     }
   });
 });

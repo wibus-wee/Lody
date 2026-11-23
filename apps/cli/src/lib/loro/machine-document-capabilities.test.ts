@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ACP_CAPABILITY_FETCH_TIME_RENEW_AFTER_MS,
   machineFlockKeys,
+  type AcpConfigOptionSummary,
+  type SessionGoalAction,
+  getMachineFlockAcpCapabilities,
   getMachineFlockAgentConfigs,
+  getMachineFlockRateLimits,
   readMachineFlockRowsFromFlock,
   type AgentConfigMeta,
   type AgentConfigId,
@@ -12,7 +16,13 @@ import {
   type WorkspaceId,
 } from '@lody/shared';
 import type { LoroRepo } from 'loro-repo';
+import { Flock } from '@loro-dev/flock-wasm';
 import { MachineDocument } from './doc';
+import { normalizeAcpSessionCapabilities } from '@/agent/acp-capability-normalization';
+import {
+  canShowSubscriptionRateLimits,
+  getAgentRateLimitEntries,
+} from '../../../../../packages/components/src/lib/session-usage';
 
 class FakeMachineFlock implements MachineFlockWritableFlock {
   readonly rows = new Map<string, { key: MachineFlockKey; value: unknown }>();
@@ -42,56 +52,183 @@ afterEach(() => {
 });
 
 describe('MachineDocument ACP capabilities', () => {
-  it('does not write or sync when only the fetch time changed', async () => {
+  it('publishes no native Flock delta for session selections, but persists real changes and renewal', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-18T00:00:00Z'));
+    const flock = new Flock();
+    const document = new MachineDocument(
+      { openFlockDoc: async () => ({ flock }), flush: async () => {} } as unknown as LoroRepo,
+      'workspace-1' as WorkspaceId,
+      'machine-1' as MachineId,
+      () => {}
+    );
+    const configId = 'provider' as AgentConfigId;
+    const selections = (model: string, mode: string, effort: string): AcpConfigOptionSummary[] =>
+      [
+        { id: 'model', category: 'model', values: ['a', 'b'], currentValue: model },
+        { id: 'mode', category: 'mode', values: ['normal', 'plan'], currentValue: mode },
+        { id: 'effort', category: 'thought_level', values: ['low', 'high'], currentValue: effort },
+      ].map(({ values, ...option }) => ({
+        ...option,
+        name: option.id,
+        type: 'select',
+        options: values.map((value) => ({ value, name: value })),
+      }));
+    const commands = [{ name: 'help', description: 'Synthetic command catalog '.repeat(1000) }];
+    const write = (
+      configOptions: AcpConfigOptionSummary[],
+      sourceVersion = 'runtime-1',
+      goalActions?: SessionGoalAction[]
+    ) =>
+      document.updateAcpCapabilities(
+        configId,
+        'registry',
+        'example',
+        [],
+        [],
+        configOptions,
+        commands,
+        false,
+        sourceVersion,
+        undefined,
+        false,
+        goalActions
+      );
+    const defaults = selections('a', 'normal', 'low');
+    await write(defaults);
+    // Record both model declarations first; new observations are legitimate writes.
+    await write(selections('b', 'plan', 'high'));
+    const checkpoint = flock.version();
+    const initial = await document.getAcpCapabilities(configId);
+    for (const options of [selections('a', 'plan', 'high'), selections('b', 'normal', 'low')]) {
+      expect(await write(options)).toEqual(initial);
+      expect(flock.version()).toEqual(checkpoint);
+    }
+    expect(initial?.configOptions).toEqual(defaults);
+    // Renewal must retain the defaults and complete legacy row for older readers.
+    vi.advanceTimersByTime(ACP_CAPABILITY_FETCH_TIME_RENEW_AFTER_MS);
+    const renewed = await write(selections('b', 'plan', 'high'));
+    expect(renewed.fetchedAt).toBeGreaterThan(initial?.fetchedAt ?? 0);
+    expect(renewed.configOptions).toEqual(defaults);
+    expect(flock.version()).not.toEqual(checkpoint);
+    expect(flock.get(machineFlockKeys.acpCapability(configId))).toEqual(
+      JSON.parse(JSON.stringify(renewed))
+    );
+    const goals = await write(defaults, 'runtime-1', ['pause']);
+    expect((await document.getAcpCapabilities(configId))?.goalActions).toEqual(['pause']);
+    expect(goals.goalActions).toEqual(['pause']);
+    await write(defaults);
+    expect((await document.getAcpCapabilities(configId))?.goalActions).toBeUndefined();
+    const nextDefaults = selections('b', 'plan', 'high');
+    await write(nextDefaults, 'runtime-2');
+    expect((await document.getAcpCapabilities(configId))?.configOptions).toEqual(nextDefaults);
+    const changed = nextDefaults.map((option) =>
+      option.id === 'effort'
+        ? { ...option, options: [...option.options, { value: 'max', name: 'Max' }] }
+        : option
+    );
+    await write(changed, 'runtime-2');
+    expect((await document.getAcpCapabilities(configId))?.configOptions).toEqual(changed);
+    await document.updateAcpAuthMethods(configId, []);
+    expect((await document.getAcpCapabilities(configId))?.authMethods).toEqual([]);
+    const authenticatedCheckpoint = flock.version();
+    await document.updateAcpAuthMethods(configId, []);
+    expect(flock.version()).toEqual(authenticatedCheckpoint);
+    await document.updateAcpAuthMethods(configId, [{ type: 'agent', id: 'login', name: 'Login' }]);
+    expect((await document.getAcpCapabilities(configId))?.authMethods).toEqual([
+      { type: 'agent', id: 'login', name: 'Login' },
+    ]);
+    expect((await document.getAcpCapabilities(configId))?.availableCommands).toEqual(commands);
+  });
+
+  it.each([
+    { cliType: 'builtin' as const, agentType: 'antigravity' },
+    { cliType: 'registry' as const, agentType: 'antigravity-acp' },
+  ])(
+    'keeps all Antigravity quota windows visible after $cliType session snapshots',
+    async (agent) => {
+      const flock = new FakeMachineFlock();
+      const document = new MachineDocument(
+        {
+          openFlockDoc: async () => ({ flock, syncOnce: async () => {} }),
+          flush: async () => {},
+        } as unknown as LoroRepo,
+        'workspace-1' as WorkspaceId,
+        'machine-1' as MachineId
+      );
+      const configId = 'quota-provider' as AgentConfigId;
+      const windows = ['Gemini Models', 'Claude and GPT models'].flatMap((label) =>
+        [604_800, 18_000].map((windowDurationSeconds) => ({
+          label,
+          windowDurationSeconds,
+          usedPercent: 25,
+          resetsAtEpochSeconds: null,
+        }))
+      );
+      await document.updateRateLimits(configId, agent.agentType, {
+        limitId: agent.agentType,
+        scope: { providerId: 'antigravity' },
+        windows,
+      });
+      const write = async (rateLimits?: { version: 1; query?: true }) => {
+        await document.updateAcpCapabilities(
+          configId,
+          agent.cliType,
+          agent.agentType,
+          [],
+          [],
+          undefined,
+          undefined,
+          false,
+          'same-runtime',
+          undefined,
+          false,
+          undefined,
+          { rateLimits }
+        );
+        const rows = readMachineFlockRowsFromFlock(flock);
+        const capability = getMachineFlockAcpCapabilities(rows)[configId]?.rateLimits;
+        expect(capability).toEqual({ version: 1, query: true });
+        expect(
+          canShowSubscriptionRateLimits({
+            ...agent,
+            config: { env: { LANG: 'en_US.UTF-8', HTTPS_PROXY: 'http://localhost:8080' } },
+            capability,
+          })
+        ).toBe(true);
+        expect(
+          getAgentRateLimitEntries(getMachineFlockRateLimits(rows), agent.agentType, configId)[0]
+            ?.limits.windows
+        ).toEqual(windows);
+      };
+      // Capability probing first records Lody's compatibility reader.
+      await write({ version: 1, query: true });
+      // Both a new session and a resumed session report no native Core quota extension.
+      for (const modelId of ['model-a', 'model-b']) {
+        const session = normalizeAcpSessionCapabilities(
+          {
+            configOptions: [
+              {
+                id: 'model',
+                name: 'Model',
+                category: 'model',
+                type: 'select',
+                currentValue: modelId,
+                options: [{ value: modelId, name: modelId }],
+              },
+            ],
+          },
+          { agent }
+        );
+        await write(session.rateLimits);
+      }
+    }
+  );
+
+  it('keeps advertised sign-in methods when the writer did not ask the agent again', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-15T00:00:00.000Z'));
     const flock = new FakeMachineFlock();
-    const flush = vi.fn(async () => undefined);
-    const syncOnce = vi.fn(async () => undefined);
-    const markDirty = vi.fn();
-    const repo = {
-      openFlockDoc: vi.fn(async () => ({ flock, syncOnce })),
-      flush,
-    } as unknown as LoroRepo;
-    const document = new MachineDocument(
-      repo,
-      'workspace-1' as WorkspaceId,
-      'machine-1' as MachineId,
-      markDirty
-    );
-    const write = () =>
-      document.updateAcpCapabilities(
-        'config-1' as AgentConfigId,
-        'builtin',
-        'codex',
-        [{ id: 'agent', name: 'Agent' }],
-        [{ modelId: 'gpt-5', name: 'GPT-5' }],
-        undefined,
-        [{ name: '/help', description: 'Help' }],
-        false,
-        'builtin:codex:test',
-        undefined,
-        true
-      );
-
-    const first = await write();
-    vi.setSystemTime(new Date('2026-07-15T00:01:00.000Z'));
-    const second = await write();
-
-    expect(flock.commits).toBe(1);
-    expect(flush).toHaveBeenCalledTimes(1);
-    expect(markDirty).toHaveBeenCalledTimes(1);
-    expect(syncOnce).not.toHaveBeenCalled();
-    expect(second.fetchedAt).toBe(first.fetchedAt);
-    expect([...flock.rows.values()][0]?.value).toMatchObject({ acknowledgedSteer: true });
-  });
-
-  it('rewrites an unchanged entry only once it is old enough to need renewing', async () => {
-    vi.useFakeTimers();
-    const start = new Date('2026-07-15T00:00:00.000Z').getTime();
-    vi.setSystemTime(start);
-    const flock = new FakeMachineFlock();
-    const markDirty = vi.fn();
     const repo = {
       openFlockDoc: vi.fn(async () => ({ flock, syncOnce: vi.fn(async () => undefined) })),
       flush: vi.fn(async () => undefined),
@@ -99,10 +236,9 @@ describe('MachineDocument ACP capabilities', () => {
     const document = new MachineDocument(
       repo,
       'workspace-1' as WorkspaceId,
-      'machine-1' as MachineId,
-      markDirty
+      'machine-1' as MachineId
     );
-    const write = () =>
+    const write = (authMethods?: { type: 'agent'; id: string; name: string }[]) =>
       document.updateAcpCapabilities(
         'config-1' as AgentConfigId,
         'registry',
@@ -112,33 +248,44 @@ describe('MachineDocument ACP capabilities', () => {
         undefined,
         undefined,
         false,
-        'opencode@1.0.0'
+        'opencode@1.0.0',
+        undefined,
+        true,
+        undefined,
+        { authMethods }
       );
-    const storedFetchedAt = () =>
-      ([...flock.rows.values()][0]?.value as { fetchedAt: number } | undefined)?.fetchedAt;
 
-    await write();
-    vi.setSystemTime(start + ACP_CAPABILITY_FETCH_TIME_RENEW_AFTER_MS - 1);
-    await write();
+    await write([{ type: 'agent', id: 'oauth', name: 'OAuth' }]);
+    // A session-created capability update never asked the agent again.
+    await expect(write()).resolves.toMatchObject({
+      authMethods: [{ type: 'agent', id: 'oauth', name: 'OAuth' }],
+    });
+    // A probe that did ask, and found none, clears the list.
+    await expect(write([])).resolves.toMatchObject({ authMethods: [] });
+  });
+});
 
-    // Still young: identical content costs no Flock write, flush or sync.
-    expect(flock.commits).toBe(1);
-    expect(markDirty).toHaveBeenCalledTimes(1);
-    expect(storedFetchedAt()).toBe(start);
-
-    vi.setSystemTime(start + ACP_CAPABILITY_FETCH_TIME_RENEW_AFTER_MS);
-    const renewed = await write();
-
-    expect(flock.commits).toBe(2);
-    expect(markDirty).toHaveBeenCalledTimes(2);
-    expect(renewed.fetchedAt).toBe(start + ACP_CAPABILITY_FETCH_TIME_RENEW_AFTER_MS);
-    expect(storedFetchedAt()).toBe(start + ACP_CAPABILITY_FETCH_TIME_RENEW_AFTER_MS);
+describe('MachineDocument per-model option lists', () => {
+  const effort = (values: string[], currentValue = values[0] ?? '') => ({
+    id: 'thought_level',
+    name: 'Thinking',
+    category: 'thought_level',
+    type: 'select' as const,
+    currentValue,
+    options: values.map((value) => ({ value, name: value })),
+  });
+  const model = (currentValue: string) => ({
+    id: 'model',
+    name: 'Model',
+    category: 'model',
+    type: 'select' as const,
+    currentValue,
+    options: ['mimo', 'deepseek-flash'].map((value) => ({ value, name: value })),
   });
 
-  it('persists a capability change that only updates per-model reasoning efforts', async () => {
+  it('keeps every model’s own answer and writes only when what it offers changes', async () => {
     const flock = new FakeMachineFlock();
     const flush = vi.fn(async () => undefined);
-    const markDirty = vi.fn();
     const repo = {
       openFlockDoc: vi.fn(async () => ({ flock, syncOnce: vi.fn(async () => undefined) })),
       flush,
@@ -146,175 +293,90 @@ describe('MachineDocument ACP capabilities', () => {
     const document = new MachineDocument(
       repo,
       'workspace-1' as WorkspaceId,
-      'machine-1' as MachineId,
-      markDirty
+      'machine-1' as MachineId
     );
-    const write = (efforts: string[]) =>
-      document.updateAcpCapabilities(
-        'config-1' as AgentConfigId,
-        'registry',
-        'deepseek',
-        [],
-        [{ modelId: 'kimi-k3', name: 'Kimi K3' }],
-        undefined,
-        undefined,
-        false,
-        'registry:deepseek:test',
-        { 'kimi-k3': efforts }
-      );
-
-    await write(['low', 'high']);
-    const updated = await write(['low', 'high', 'max']);
-
-    expect(flock.commits).toBe(2);
-    expect(flush).toHaveBeenCalledTimes(2);
-    expect(markDirty).toHaveBeenCalledTimes(2);
-    expect(updated.modelReasoningEfforts).toEqual({
-      'kimi-k3': ['low', 'high', 'max'],
-    });
-  });
-
-  it('persists title support changes even when all other capability fields are unchanged', async () => {
-    const flock = new FakeMachineFlock();
-    const repo = {
-      openFlockDoc: async () => ({ flock, syncOnce: async () => {} }),
-      flush: async () => {},
-    } as unknown as LoroRepo;
-    const document = new MachineDocument(
-      repo,
-      'workspace-1' as WorkspaceId,
-      'machine-1' as MachineId,
-      () => {}
-    );
-    const write = (sessionTitle: boolean) =>
-      document.updateAcpCapabilities(
-        'title-config' as AgentConfigId,
-        'custom',
-        'title-agent',
-        [],
-        [],
-        undefined,
-        undefined,
-        false,
-        'custom:test',
-        undefined,
-        false,
-        undefined,
-        { sessionTitle }
-      );
-    await write(false);
-    await write(true);
-    expect([...flock.rows.values()][0]?.value).toMatchObject({ sessionTitle: true });
-    await write(false);
-    expect([...flock.rows.values()][0]?.value).toMatchObject({ sessionTitle: false });
-  });
-
-  it('does not write capabilities when cancelled while opening the Machine Flock', async () => {
-    const flock = new FakeMachineFlock();
-    let markOpenStarted!: () => void;
-    const openStarted = new Promise<void>((resolve) => {
-      markOpenStarted = resolve;
-    });
-    let releaseOpen!: () => void;
-    const openCanFinish = new Promise<void>((resolve) => {
-      releaseOpen = resolve;
-    });
-    const flush = vi.fn(async () => undefined);
-    const repo = {
-      openFlockDoc: vi.fn(async () => {
-        markOpenStarted();
-        await openCanFinish;
-        return { flock, syncOnce: vi.fn(async () => undefined) };
-      }),
-      flush,
-    } as unknown as LoroRepo;
-    const document = new MachineDocument(
-      repo,
-      'workspace-1' as WorkspaceId,
-      'machine-1' as MachineId,
-      vi.fn()
-    );
-    const controller = new AbortController();
-
-    const update = document.updateAcpCapabilities(
-      'config-1' as AgentConfigId,
-      'builtin',
-      'codex',
-      [{ id: 'agent', name: 'Agent' }],
-      [{ modelId: 'gpt-5', name: 'GPT-5' }],
-      undefined,
-      undefined,
-      false,
-      'builtin:codex:test',
-      undefined,
-      false,
-      undefined,
-      { signal: controller.signal }
-    );
-    await openStarted;
-    controller.abort();
-    releaseOpen();
-
-    await expect(update).rejects.toMatchObject({ name: 'AbortError' });
-    expect(flock.commits).toBe(0);
-    expect(flush).not.toHaveBeenCalled();
-  });
-
-  it("stores each model's declared controls in its own row, writing only on change", async () => {
-    const flock = new FakeMachineFlock();
-    const markDirty = vi.fn();
-    const repo = {
-      openFlockDoc: vi.fn(async () => ({ flock, syncOnce: vi.fn(async () => undefined) })),
-      flush: vi.fn(async () => undefined),
-    } as unknown as LoroRepo;
-    const document = new MachineDocument(
-      repo,
-      'workspace-1' as WorkspaceId,
-      'machine-1' as MachineId,
-      markDirty
-    );
-    const write = (
-      modelCapabilities?: Record<string, { effortValues?: string[]; fastMode?: boolean }>
+    const configId = 'config-1' as AgentConfigId;
+    const observed = () =>
+      getMachineFlockAcpCapabilities(readMachineFlockRowsFromFlock(flock))[configId]
+        ?.observedModelConfigOptions;
+    const refresh = (
+      sourceVersion: string,
+      modelConfigOptions?: Record<string, ReturnType<typeof effort>[]>
     ) =>
       document.updateAcpCapabilities(
-        'config-1' as AgentConfigId,
+        configId,
         'builtin',
-        'codex',
+        'dimcode',
         [],
-        [{ modelId: 'gpt-6', name: 'GPT-6' }],
-        undefined,
-        undefined,
-        false,
-        'codex@1',
+        [],
+        [model('mimo'), effort(['auto', 'none', 'low'])],
         undefined,
         false,
+        sourceVersion,
         undefined,
-        { modelCapabilities }
+        false,
+        undefined,
+        { modelConfigOptions }
       );
-    const modelRow = () =>
-      flock.rows.get(JSON.stringify(['acpModelCapability', 'config-1']))?.value;
-    const declared = { 'gpt-6': { effortValues: ['low', 'ultra'], fastMode: true } };
 
-    await write(declared);
-    await write(declared);
-    expect(flock.commits).toBe(2);
-    expect(markDirty).toHaveBeenCalledTimes(1);
-    expect(modelRow()).toEqual({ version: 1, sourceVersion: 'codex@1', models: declared });
+    // A refresh that read every model stores each answer; the snapshot is
+    // its own model's answer.
+    await refresh('dimcode@0.5.25', {
+      'deepseek-flash': [model('deepseek-flash'), effort(['auto', 'low', 'max'])],
+    });
+    expect(observed()).toEqual({
+      mimo: [effort(['auto', 'none', 'low'])],
+      'deepseek-flash': [effort(['auto', 'low', 'max'])],
+    });
 
-    // Only the declaration changed: one write, to the per-model row.
-    const changed = { 'gpt-6': { effortValues: ['low'], fastMode: false } };
-    await write(changed);
-    expect(flock.commits).toBe(3);
-    expect(modelRow()).toMatchObject({ models: changed });
+    // A later answer that changes only a current value costs no write.
+    flush.mockClear();
+    await refresh('dimcode@0.5.25', {
+      'deepseek-flash': [model('deepseek-flash'), effort(['auto', 'low', 'max'], 'max')],
+    });
+    expect(flush).not.toHaveBeenCalled();
 
-    // A response without a declaration leaves the stored one alone.
-    await write(undefined);
-    expect(flock.commits).toBe(3);
-    expect(modelRow()).toMatchObject({ models: changed });
+    // A snapshot-only write (a created session) keeps the other models' answers.
+    await refresh('dimcode@0.5.25');
+    expect(observed()?.['deepseek-flash']).toEqual([effort(['auto', 'low', 'max'])]);
+
+    // A new ladder, or a new runtime version, replaces the stored answer.
+    await refresh('dimcode@0.5.26', {
+      'deepseek-flash': [model('deepseek-flash'), effort(['auto', 'low', 'high', 'max'])],
+    });
+    expect(observed()?.['deepseek-flash']).toEqual([effort(['auto', 'low', 'high', 'max'])]);
   });
 });
 
 describe('MachineDocument quota publication', () => {
+  it('keeps the persisted quota checkpoint for reset jitter and publishes real quota changes', async () => {
+    const flock = new Flock();
+    const document = new MachineDocument(
+      { openFlockDoc: async () => ({ flock }), flush: async () => {} } as unknown as LoroRepo,
+      'workspace-1' as WorkspaceId,
+      'machine-1' as MachineId,
+      () => {}
+    );
+    const configId = 'quota-provider' as AgentConfigId;
+    const quota = (reset: number, usedPercent = 25) => ({
+      limitId: 'account',
+      scope: { providerId: 'example' },
+      windows: [{ usedPercent, windowDurationSeconds: 3600, resetsAtEpochSeconds: reset }],
+    });
+    await document.updateRateLimits(configId, 'example', quota(1000));
+    const checkpoint = flock.version();
+    for (const reset of [1001, 999, 1002]) {
+      await document.updateRateLimits(configId, 'example', quota(reset));
+      expect(flock.version()).toEqual(checkpoint);
+    }
+    await document.updateRateLimits(configId, 'example', quota(1003));
+    expect(flock.version()).not.toEqual(checkpoint);
+    await document.updateRateLimits(configId, 'example', quota(1004, 26));
+    expect(Object.values(getMachineFlockRateLimits(readMachineFlockRowsFromFlock(flock)))).toEqual([
+      quota(1004, 26),
+    ]);
+  });
+
   it('publishes custom quota only while its persisted config and push fence still match', async () => {
     const flock = new FakeMachineFlock();
     const configId = 'quota-provider' as AgentConfigId;
@@ -324,6 +386,7 @@ describe('MachineDocument quota publication', () => {
       cliType: 'custom',
       agentType: 'example/agent',
       name: 'Example',
+      description: '',
       env: {},
       customAcp: { command: 'example', args: [] },
     };

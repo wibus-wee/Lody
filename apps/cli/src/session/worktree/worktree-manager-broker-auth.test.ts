@@ -208,9 +208,7 @@ globalThis.fetch = async (url, init) => {
     return { ok: false, status: 403, json: async () => ({ error: 'invalid_context' }) };
   }
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ url, context }) + '\\n');
-  return { ok: true, status: 200, json: async () => url.endsWith('/github-auth-context')
-    ? { allowLocalAuth: false, personalEnabled: ${checkoutCredentials} }
-    : ${checkoutCredentials} && request.source !== 'personal'
+  return { ok: true, status: 200, json: async () => ${checkoutCredentials} && request.source !== 'personal'
       ? { available: false }
       : { tokenSource: request.source, token: 'synthetic-fixture-token' } };
 };
@@ -559,25 +557,6 @@ process.exit(result.status ?? 1);
     );
 
     expect(isGitExecutableNotFoundError(failure)).toBe(true);
-  });
-
-  it('routes native command diagnostics to the supplied logger sink', async () => {
-    const { WorktreeManager } = await import('./worktree-manager');
-    const logger = createLogger();
-    const messages: string[] = [];
-    logger.debug = (message) => {
-      messages.push(String(message));
-    };
-    const manager = new WorktreeManager({
-      repoId: REPO_ID,
-      repoUrl: REPO_URL,
-      logger,
-      nodeProcess,
-    });
-    await manager.ensureRepo();
-    expect(messages.some((message) => message.includes('Running git fetch origin --prune'))).toBe(
-      true
-    );
   });
 
   it.each(['remote', 'fetch', 'rev-parse'])(

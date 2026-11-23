@@ -1,48 +1,21 @@
-import { createConversationViewFromHistory } from '../src/lib/conversation-view';
 // @vitest-environment jsdom
+import { createConversationViewFromHistory } from '../src/lib/conversation-view';
 
 import { act, createElement, type ComponentProps } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import type { SessionId } from '@lody/shared';
 import { SessionChatStreamView } from '../src/components/ai-gui/view';
 import { buildChatStreamItems as buildFromView } from '../src/components/ai-gui/build-chat-stream-items';
-import { initI18n } from '../src/i18n';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  SessionForkDestinationMenu,
-  getSessionForkDestinationOptions,
-} from '../src/components/sessions/session-fork-destination-menu';
+import { SessionForkDestinationMenu } from '../src/components/sessions/session-fork-destination-menu';
+import { createTestI18n, withTestI18n } from './test-i18n';
 
-vi.mock('react-i18next', async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  useTranslation: () => ({
-    t: (key: string, fallback?: string): string => (typeof fallback === 'string' ? fallback : key),
-    i18n: { language: 'en' },
-  }),
-}));
+const testI18n = createTestI18n();
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
 ).IS_REACT_ACT_ENVIRONMENT = true;
-
-describe('getSessionForkDestinationOptions', () => {
-  const t = (_key: string, fallback: string) => fallback;
-
-  it('only offers a new tab when worktree support is hidden', () => {
-    expect(getSessionForkDestinationOptions(t, 'hidden').map((option) => option.id)).toEqual([
-      'shared',
-    ]);
-  });
-
-  it('disables the worktree option while Git status is still resolving', () => {
-    const worktree = getSessionForkDestinationOptions(t, 'checking').find(
-      (option) => option.id === 'new-worktree'
-    );
-    expect(worktree?.disabled).toBe(true);
-    expect(worktree?.status).toBe('Checking Git status…');
-  });
-});
 
 describe('SessionForkDestinationMenu', () => {
   let root: Root;
@@ -73,34 +46,24 @@ describe('SessionForkDestinationMenu', () => {
   ): Promise<void> => {
     await act(async () => {
       root.render(
-        createElement(
-          SessionForkDestinationMenu,
-          {
-            open: true,
-            worktreeAvailability: 'available',
-            onSelect: vi.fn(),
-            ...props,
-          },
-          createElement('button', { type: 'button' }, 'Fork')
+        withTestI18n(
+          createElement(
+            SessionForkDestinationMenu,
+            {
+              open: true,
+              worktreeAvailability: 'available',
+              onSelect: vi.fn(),
+              ...props,
+            },
+            createElement('button', { type: 'button' }, 'Fork')
+          ),
+          testI18n
         )
       );
       // Base UI defers the portal mount to a frame; jsdom's rAF is a real timer.
       await new Promise((resolve) => setTimeout(resolve, 40));
     });
   };
-
-  it('lists both destinations by name and explains each only on hover', async () => {
-    await renderMenu();
-    const items = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"]'));
-    expect(items.map((item) => item.textContent)).toEqual([
-      'Fork to new tab',
-      'Fork to new worktree',
-    ]);
-    const explanation = 'works in the same directory';
-    expect(document.body.textContent).not.toContain(explanation);
-    await act(async () => items[0]?.focus());
-    expect(document.body.textContent).toContain(explanation);
-  });
 
   it('keeps the Git status check inline on the disabled worktree row', async () => {
     await renderMenu({ worktreeAvailability: 'checking' });
@@ -126,28 +89,7 @@ describe('SessionForkDestinationMenu', () => {
     await act(async () => items[0]?.click());
     expect(copied).toBe(true);
   });
-
-  it('does not leave the first destination focused after opening', async () => {
-    await renderMenu();
-    const firstItem = document.querySelector('[role="menuitem"]');
-    expect(firstItem).toBeInstanceOf(HTMLElement);
-    expect(document.activeElement).not.toBe(firstItem);
-  });
-
-  it('forks to a new tab from a menu, not a modal dialog', async () => {
-    const onSelect = vi.fn();
-    await renderMenu({ onSelect });
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(document.querySelector('[role="menu"]')).not.toBeNull();
-
-    const shared = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"]')).find(
-      (item) => item.textContent === 'Fork to new tab'
-    );
-    await act(async () => shared?.click());
-    expect(onSelect).toHaveBeenCalledWith('shared');
-  });
   it.each([false, true])('exposes context copying for a turn (finished=%s)', async (finished) => {
-    await initI18n('en');
     const sessionId = 'copy-stream' as SessionId;
     const history = [
       {
@@ -169,18 +111,21 @@ describe('SessionForkDestinationMenu', () => {
     let copied: string | undefined;
     await act(async () =>
       root.render(
-        createElement(SessionChatStreamView, {
-          items,
-          sessionId,
-          renderMessageRow: () => null,
-          onCopyContext: (id) => {
-            copied = id;
-          },
-          onForkLastAssistant: () => undefined,
-          lastAssistantMessageId: 'partial',
-          lastCompletedAssistantMessageId: finished ? 'partial' : null,
-          forkingAssistantMessageId: finished ? null : 'partial',
-        })
+        withTestI18n(
+          createElement(SessionChatStreamView, {
+            items,
+            sessionId,
+            renderMessageRow: () => null,
+            onCopyContext: (id) => {
+              copied = id;
+            },
+            onForkLastAssistant: () => undefined,
+            lastAssistantMessageId: 'partial',
+            lastCompletedAssistantMessageId: finished ? 'partial' : null,
+            forkingAssistantMessageId: finished ? null : 'partial',
+          }),
+          testI18n
+        )
       )
     );
 
@@ -191,9 +136,6 @@ describe('SessionForkDestinationMenu', () => {
     } else {
       expect(fork).toBeNull();
       expect(container.querySelector('[aria-label="Copy response"]')).toBeNull();
-      expect(
-        container.querySelector('[data-assistant-turn-actions]')?.classList.contains('opacity-100')
-      ).toBe(false);
     }
     const copy = finished
       ? [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((item) =>

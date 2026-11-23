@@ -1,4 +1,5 @@
-import { resolveSessionPullRequests } from '@lody/shared';
+import { isSessionInMyScope } from '@/lib/session-visibility';
+import { hasFailedLatestTurn, resolveSessionPrimaryPullRequest } from '@lody/shared';
 import { sessionHasUnreadMessages } from '@/lib/session-read-receipt';
 import type {
   LocalProjectHistoryProvider,
@@ -9,18 +10,27 @@ import type {
   SessionMeta,
   SessionStatus,
 } from '@lody/shared';
-import {
-  deriveSessionPullRequestReadiness,
-  getSessionPullRequestLegacyFields,
-  parseGitHubPrNumber,
-  resolveProjectGitHubRepo,
-  resolveSessionHistoryBackendKind,
-} from '@lody/shared';
+import { resolveProjectGitHubRepo, resolveSessionHistoryBackendKind } from '@lody/shared';
 import type { SessionListRow, SessionListRowOwner } from '@/components/session-list';
 import { getLineChangeDeltaForScope, type LineChangeScope } from '@/lib/file-change-category';
 import { placeOpenedSessionsWithOpeners } from '@/lib/session-opened-by-tree';
 
 export type SessionListScope = 'my' | 'team';
+
+/** Unavailable local-project history has no project section; keep it in Chats. */
+export function selectSidebarTaskSessions(
+  sessions: SessionMeta[],
+  visibleLocalProjects: { has(key: string): boolean },
+  workspaceHistoryReadable = false
+): SessionMeta[] {
+  return sessions.filter(
+    (session) =>
+      session.project?.kind !== 'local' ||
+      session.projectRun !== undefined ||
+      (workspaceHistoryReadable &&
+        !visibleLocalProjects.has(`${session.machineId}:${session.project.localProjectId}`))
+  );
+}
 
 export type WorkspaceMember = {
   userId: string;
@@ -180,6 +190,8 @@ export type EffectiveSessionActivitySummary = {
   isWorking: boolean;
   isWaitingPermission: boolean;
   hasUnreadMessages: boolean;
+  /** The latest turn of the session or one of its child Tabs ended in failure. */
+  hasFailedTurn: boolean;
   latestMessageAt: number;
 };
 
@@ -195,6 +207,7 @@ export function getEffectiveSessionActivitySummary(
   let isWorking = liveStatus != null;
   let isWaitingPermission = liveStatus?.type === 'requestPermission';
   let hasUnreadMessages = sessionHasUnreadMessages(session);
+  let hasFailedTurn = hasFailedLatestTurn(session);
   let latestMessageAt =
     parseTimestamp(session.lastMessageAt) ?? parseTimestamp(session.createdAt) ?? 0;
 
@@ -211,6 +224,9 @@ export function getEffectiveSessionActivitySummary(
       if (!hasUnreadMessages && sessionHasUnreadMessages(child)) {
         hasUnreadMessages = true;
       }
+      if (!hasFailedTurn && hasFailedLatestTurn(child)) {
+        hasFailedTurn = true;
+      }
       const childMs = parseTimestamp(child.lastMessageAt) ?? parseTimestamp(child.createdAt) ?? 0;
       if (childMs > latestMessageAt) {
         latestMessageAt = childMs;
@@ -222,11 +238,12 @@ export function getEffectiveSessionActivitySummary(
     isWorking,
     isWaitingPermission,
     hasUnreadMessages,
+    hasFailedTurn,
     latestMessageAt,
   };
 }
 
-type LatestPullRequestInfo = {
+export type LatestPullRequestInfo = {
   url: string | null;
   number: number | null;
   status: PrStatus | null;
@@ -249,26 +266,15 @@ export function getLatestPullRequestInfo(session: SessionMeta): LatestPullReques
 }
 
 function computeLatestPullRequestInfo(session: SessionMeta): LatestPullRequestInfo {
-  const pullRequests = resolveSessionPullRequests(session);
-  if (!pullRequests.length) {
-    return { url: null, number: null, status: null, ciState: null, readiness: null };
-  }
-
-  const latest = pullRequests.some((pr) => getSessionPullRequestLegacyFields(pr).reportedAt)
-    ? [...pullRequests].sort((a, b) =>
-        (getSessionPullRequestLegacyFields(b).reportedAt ?? '').localeCompare(
-          getSessionPullRequestLegacyFields(a).reportedAt ?? ''
-        )
-      )[0]
-    : pullRequests[pullRequests.length - 1];
-  const url = normalizeString(latest?.url ?? '');
-  const legacy = getSessionPullRequestLegacyFields(latest);
+  // The same primary PR the Info Bar describes by default, so a Project group's
+  // row and its conversation never name different PRs.
+  const view = resolveSessionPrimaryPullRequest(session);
   return {
-    url: url ? url : null,
-    number: legacy.number ?? (url ? parseGitHubPrNumber(url) : null),
-    status: latest?.status ?? null,
-    ciState: url ? (session.pullRequestState?.[url]?.s ?? null) : null,
-    readiness: url ? deriveSessionPullRequestReadiness(session.pullRequestState?.[url]) : null,
+    url: view?.url ?? null,
+    number: view?.number ?? null,
+    status: view?.status ?? null,
+    ciState: view?.ci ?? null,
+    readiness: view?.readiness ?? null,
   };
 }
 
@@ -344,6 +350,8 @@ export function mapSessionMetaToSessionListRow(
     hasUnreadMessages,
     isOffline,
     isWaitingPermission: liveStatus?.type === 'requestPermission',
+    hasFailedTurn: hasFailedLatestTurn(session),
+    deliveryStalled: session.autoDelivery?.state === 'stalled',
     isPinned: Boolean(session.isPinned),
     isWorktree: Boolean(session.isWorktree),
     externalHistoryProvider,
@@ -383,6 +391,7 @@ function aggregateChildStatus(
     activity.isWorking === task.isWorking &&
     activity.isWaitingPermission === task.isWaitingPermission &&
     activity.hasUnreadMessages === task.hasUnreadMessages &&
+    activity.hasFailedTurn === Boolean(task.hasFailedTurn) &&
     latestMessageAt === task.latestMessageAt
   ) {
     return task;
@@ -393,6 +402,7 @@ function aggregateChildStatus(
     isWorking: activity.isWorking,
     isWaitingPermission: activity.isWaitingPermission,
     hasUnreadMessages: activity.hasUnreadMessages,
+    hasFailedTurn: activity.hasFailedTurn,
     latestMessageAt,
   };
 }
@@ -463,7 +473,7 @@ export function buildSessionListRows(
       return [];
     }
     return sessions
-      .filter((session) => session.userId === currentUserId)
+      .filter((session) => isSessionInMyScope(session, currentUserId))
       .map((session) => mapAndAggregate(session));
   }
 
@@ -516,7 +526,8 @@ export function placeWorkspaceSessionsWithOpeners(
     }
   };
   for (const task of natural.chatSessions) addTask(task, 'chats');
-  for (const task of natural.repoSessions) addTask(task, `repo:${(task.repoFullName ?? '').trim()}`);
+  for (const task of natural.repoSessions)
+    addTask(task, `repo:${(task.repoFullName ?? '').trim()}`);
   for (const task of natural.projectGroupSessions)
     addTask(task, `group:${task.projectGroup?.id ?? ''}`);
   const sessionById = new Map<string, SessionMeta>();

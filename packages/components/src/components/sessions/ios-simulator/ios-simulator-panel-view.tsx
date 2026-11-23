@@ -1,4 +1,5 @@
-import type { IosSimulatorExterior } from '@lody/shared';
+import { useDevicePreviewPlatform } from './device-preview-platform';
+import type { AndroidEmulatorQuality, IosSimulatorExterior } from '@lody/shared';
 import type { ReactNode, Ref } from 'react';
 import * as stylex from '@stylexjs/stylex';
 import { Check, Copy } from 'lucide-react';
@@ -37,6 +38,7 @@ import {
 import { IosSimulatorControls, type IosSimulatorControlsProps } from './ios-simulator-controls';
 import { IosSimulatorDeviceFrame } from './ios-simulator-device-frame';
 import { IosSimulatorDevicePicker } from './ios-simulator-device-picker';
+import { PreviewDisconnectButton } from '../preview-disconnect-button';
 import { IosSimulatorViewer, type IosSimulatorViewerHandle } from './ios-simulator-viewer';
 import {
   getIosSimulatorHardware,
@@ -56,6 +58,7 @@ export type IosSimulatorPanelBlocker =
   | 'offline';
 
 export type IosSimulatorPanelViewProps = {
+  quality?: { onChange: (value: AndroidEmulatorQuality) => void };
   deviceExterior?: { udid: string; geometry: IosSimulatorExterior; imageUrl: string };
   machineName: string;
   blocker: IosSimulatorPanelBlocker | null;
@@ -70,6 +73,8 @@ export type IosSimulatorPanelViewProps = {
   pendingAction?: IosSimulatorPendingAction;
   /** Whether this start has to boot the device, so the steps list it. */
   bootExpected?: boolean;
+  /** Cache key for keeping the live viewer iframe alive across session switches. */
+  cacheKey?: string;
   /** The panel is on screen; the viewer is told when it is not. */
   active?: boolean;
   leadingSlot?: ReactNode;
@@ -79,6 +84,7 @@ export type IosSimulatorPanelViewProps = {
   onStart: (device: IosSimulatorDeviceEntry) => void;
   onCancel: () => void;
   onStop: () => void;
+  onStopAndShutdown?: () => void;
   onRestore: () => void;
   onRetry: () => void;
   onCopyDiagnostics: () => void;
@@ -382,6 +388,7 @@ export function IosSimulatorPanelView({
   viewerReloadKey = 0,
   pendingAction = null,
   bootExpected = false,
+  cacheKey,
   active = true,
   leadingSlot,
   onSelectDevice,
@@ -390,6 +397,8 @@ export function IosSimulatorPanelView({
   onStart,
   onCancel,
   onStop,
+  onStopAndShutdown,
+  quality,
   onRestore,
   onRetry,
   onCopyDiagnostics,
@@ -404,6 +413,7 @@ export function IosSimulatorPanelView({
   const { t } = useTranslation();
   const stateLabel = useIosSimulatorDeviceStateLabel();
   const errorCopy = useIosSimulatorErrorCopy();
+  const platform = useDevicePreviewPlatform();
   const runtimes = catalog.phase === 'ready' ? catalog.runtimes : [];
   const devices = catalog.phase === 'ready' ? catalog.devices : [];
   const deviceByUdid = new Map(devices.map((device) => [device.udid, device]));
@@ -414,6 +424,10 @@ export function IosSimulatorPanelView({
   const busy = pendingAction !== null;
   const buttonLabel = useIosSimulatorButtonLabel();
   const bezel = (controls?.viewMode ?? 'device') === 'device';
+  const controlsWithQuality =
+    controls && quality && status.phase === 'ready'
+      ? { ...controls, quality: { onChange: quality.onChange, disabled: busy } }
+      : controls;
 
   const copyDiagnosticsButton = (
     <Button type="button" variant="ghost" size="small" onClick={onCopyDiagnostics}>
@@ -488,10 +502,17 @@ export function IosSimulatorPanelView({
           title={t('sessions.iosSimulator.catalog.emptyTitle', 'No simulators on {{machine}}', {
             machine: machineName,
           })}
-          detail={t(
-            'sessions.iosSimulator.catalog.emptyDetail',
-            'Add one in Xcode under Window › Devices and Simulators, then refresh.'
-          )}
+          detail={
+            platform === 'android'
+              ? t(
+                  'sessions.androidEmulator.emptyDetail',
+                  'Create an AVD in Android Studio Device Manager, then refresh.'
+                )
+              : t(
+                  'sessions.iosSimulator.catalog.emptyDetail',
+                  'Add one in Xcode under Window › Devices and Simulators, then refresh.'
+                )
+          }
         >
           {refreshButton}
         </Message>
@@ -516,6 +537,8 @@ export function IosSimulatorPanelView({
           <IosSimulatorViewer
             key={`${status.operationId}:${viewerReloadKey}:${controlsLayout}`}
             ref={viewerRef}
+            cacheKey={cacheKey}
+            alreadyReady={viewerState === 'ready'}
             viewerUrl={status.viewerUrl}
             viewerOrigin={status.viewerOrigin}
             operationId={status.operationId}
@@ -720,17 +743,44 @@ export function IosSimulatorPanelView({
               onRestore={onRestore}
               onCancel={onCancel}
               onStop={onStop}
+              onStopAndShutdown={onStopAndShutdown}
               hasError={catalog.phase === 'error'}
               onCopyDiagnostics={onCopyDiagnostics}
             />
           </div>
         ) : null}
-        {controls && controlsLayout === 'menu' ? (
-          <IosSimulatorControls layout="menu" {...controls} />
+        {status.phase === 'ready' && blocker === null ? (
+          <PreviewDisconnectButton
+            size="small"
+            primaryLabel={t('sessions.iosSimulator.action.stop', 'Stop preview')}
+            menuAriaLabel={t('sessions.iosSimulator.action.stopOptions', 'Stop preview options')}
+            disconnectOnlyLabel={t(
+              'sessions.iosSimulator.action.stopPreviewOnly',
+              'Stop preview only'
+            )}
+            disconnectAndTerminateLabel={
+              platform === 'android'
+                ? t(
+                    'sessions.androidEmulator.action.stopAndShutdown',
+                    'Stop preview and shut down emulator'
+                  )
+                : t(
+                    'sessions.iosSimulator.action.stopAndShutdown',
+                    'Stop preview and shut down simulator'
+                  )
+            }
+            disabled={busy}
+            onDisconnectOnly={onStop}
+            onDisconnectAndTerminate={onStopAndShutdown}
+            testId="device-preview-disconnect-button"
+          />
+        ) : null}
+        {controlsWithQuality && controlsLayout === 'menu' ? (
+          <IosSimulatorControls layout="menu" {...controlsWithQuality} />
         ) : null}
       </div>
-      {controls && controlsLayout === 'toolbar' ? (
-        <IosSimulatorControls layout="toolbar" {...controls} />
+      {controlsWithQuality && controlsLayout === 'toolbar' ? (
+        <IosSimulatorControls layout="toolbar" {...controlsWithQuality} />
       ) : null}
       <div {...stylex.props(styles.stage)}>{renderStage()}</div>
     </div>

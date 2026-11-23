@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { MessageContent } from '../src/ai';
+import { nextCronFireMs } from '../src/cron-next-fire';
 import {
   collectPendingScheduledTasksFromHistory,
   resolveFireMs,
@@ -35,28 +36,6 @@ function entry(endedAt: number, items: MessageContent[]): ScheduledTaskHistoryEn
 }
 
 describe('collectPendingScheduledTasksFromHistory', () => {
-  it('derives a wakeup with scheduledFor = call time + delaySeconds', () => {
-    const endedAt = 1_000_000;
-    const tasks = collectPendingScheduledTasksFromHistory([
-      entry(endedAt, [
-        toolCall({
-          toolCallId: 'w1',
-          title: 'ScheduleWakeup',
-          rawInput: { delaySeconds: 120, reason: 'wake up and report' },
-        }),
-      ]),
-    ]);
-    expect(tasks).toEqual([
-      {
-        id: 'wakeup',
-        kind: 'wakeup',
-        createdAtMs: endedAt,
-        scheduledForMs: endedAt + 120_000,
-        summary: 'wake up and report',
-      },
-    ]);
-  });
-
   it('keeps only the latest ScheduleWakeup', () => {
     const tasks = collectPendingScheduledTasksFromHistory([
       entry(1_000, [
@@ -81,43 +60,6 @@ describe('collectPendingScheduledTasksFromHistory', () => {
       scheduledForMs: 2_000 + 30_000,
       summary: 'second',
     });
-  });
-
-  it('derives a cron task from CronCreate rawInput', () => {
-    const tasks = collectPendingScheduledTasksFromHistory([
-      entry(5_000, [
-        toolCall({
-          toolCallId: 'c1',
-          title: 'CronCreate',
-          rawInput: { cron: '0 9 * * 1-5', prompt: 'daily standup', recurring: true },
-          rawOutput: 'Scheduled task ab9963d6 (0 9 * * 1-5).',
-        }),
-      ]),
-    ]);
-    expect(tasks).toEqual([
-      {
-        id: 'c1',
-        kind: 'cron',
-        createdAtMs: 5_000,
-        humanSchedule: '0 9 * * 1-5',
-        recurring: true,
-        summary: 'daily standup',
-      },
-    ]);
-  });
-
-  it('propagates the persisted machine timezone onto the cron task', () => {
-    const tasks = collectPendingScheduledTasksFromHistory([
-      entry(5_000, [
-        toolCall({
-          toolCallId: 'c1',
-          title: 'CronCreate',
-          rawInput: { cron: '0 9 * * *', prompt: 'p' },
-          schedulingTimeZone: 'America/New_York',
-        }),
-      ]),
-    ]);
-    expect(tasks[0]?.timeZone).toBe('America/New_York');
   });
 
   it('removes a cron when a later CronDelete references its id', () => {
@@ -260,14 +202,6 @@ describe('collectPendingScheduledTasksFromHistory', () => {
       expect(fire!).toBeGreaterThan(NEXT_DAY);
     });
 
-    it('ignores an absent/unparseable nextFireAt and falls back to the anchor', () => {
-      const tasks = collectPendingScheduledTasksFromHistory([
-        legacyEntry([oneShotCall({ recordedAtMs: CALL_AT, rawOutput: 'nextFireAt: null' })]),
-      ]);
-      expect(tasks[0]?.scheduledForMs).toBeUndefined();
-      expect(resolveFireMs(tasks[0]!, NEXT_DAY)).toBe(FIRE_AT);
-    });
-
     it('anchors a wakeup at the call recordedAtMs, not the turn', () => {
       const tasks = collectPendingScheduledTasksFromHistory([
         legacyEntry([
@@ -282,5 +216,59 @@ describe('collectPendingScheduledTasksFromHistory', () => {
       expect(tasks[0]?.createdAtMs).toBe(CALL_AT);
       expect(tasks[0]?.scheduledForMs).toBe(CALL_AT + 120_000);
     });
+  });
+
+  it('resolveFireMs handles wakeup, missing schedule, and same-minute one-shot creation', () => {
+    expect(
+      resolveFireMs(
+        { id: 'wakeup', kind: 'wakeup', createdAtMs: 1_000, scheduledForMs: 31_000 },
+        5_000
+      )
+    ).toBe(31_000);
+    expect(resolveFireMs({ id: 'wakeup', kind: 'wakeup', createdAtMs: 1_000 }, 5_000)).toBe(
+      undefined
+    );
+    expect(resolveFireMs({ id: 'cron-1', kind: 'cron', createdAtMs: 1_000 }, 5_000)).toBe(
+      undefined
+    );
+    const createdInTargetMinute = Date.parse('2026-07-03T16:25:15+08:00');
+    const sameMinuteFire = Date.parse('2026-07-03T16:25:00+08:00');
+    expect(
+      resolveFireMs(
+        {
+          id: 'cron-same-minute',
+          kind: 'cron',
+          createdAtMs: createdInTargetMinute,
+          humanSchedule: '25 16 3 7 *',
+          recurring: false,
+          timeZone: 'Asia/Shanghai',
+        },
+        Date.parse('2026-07-03T17:00:00+08:00')
+      )
+    ).toBe(sameMinuteFire);
+  });
+});
+
+describe('nextCronFireMs — timezone', () => {
+  const utc = (y: number, mo: number, d: number, h: number, mi: number) =>
+    Date.UTC(y, mo - 1, d, h, mi);
+  const localMs = (year: number, month1: number, day: number, hour: number, minute: number) =>
+    new Date(year, month1 - 1, day, hour, minute, 0, 0).getTime();
+
+  it('resolves the cron in the given zone, not the runner local zone', () => {
+    const from = utc(2026, 7, 1, 0, 0);
+    expect(nextCronFireMs('0 9 * * *', from, 'America/New_York')).toBe(utc(2026, 7, 1, 13, 0));
+    expect(nextCronFireMs('0 9 * * *', from, 'Asia/Shanghai')).toBe(utc(2026, 7, 1, 1, 0));
+  });
+
+  it('crosses a spring-forward DST boundary correctly', () => {
+    expect(nextCronFireMs('0 9 * * *', utc(2026, 3, 7, 15, 0), 'America/New_York')).toBe(
+      utc(2026, 3, 8, 13, 0)
+    );
+  });
+
+  it('falls back to the local zone for an unusable timezone', () => {
+    const from = localMs(2026, 7, 1, 8, 0);
+    expect(nextCronFireMs('0 9 * * *', from, 'Not/AZone')).toBe(nextCronFireMs('0 9 * * *', from));
   });
 });

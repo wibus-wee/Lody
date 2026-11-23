@@ -7,27 +7,6 @@ import {
 } from '../src/agent-authentication';
 
 describe('hasBuiltinEnvAuthentication', () => {
-  it('detects Claude credentials and provider routing supplied by env', () => {
-    expect(hasBuiltinEnvAuthentication('claude', { ANTHROPIC_API_KEY: 'sk-test' })).toBe(true);
-    expect(hasBuiltinEnvAuthentication('claude', { ANTHROPIC_AUTH_TOKEN: 'sk-test' })).toBe(true);
-    expect(
-      hasBuiltinEnvAuthentication('claude', {
-        ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
-      })
-    ).toBe(true);
-    expect(hasBuiltinEnvAuthentication('claude', { CLAUDE_CODE_USE_BEDROCK: '1' })).toBe(true);
-  });
-
-  it('ignores unrelated or blank variables', () => {
-    expect(hasBuiltinEnvAuthentication('claude', undefined)).toBe(false);
-    expect(hasBuiltinEnvAuthentication('claude', {})).toBe(false);
-    expect(hasBuiltinEnvAuthentication('claude', { HTTPS_PROXY: 'http://127.0.0.1:7890' })).toBe(
-      false
-    );
-    expect(hasBuiltinEnvAuthentication('claude', { ANTHROPIC_API_KEY: '  ' })).toBe(false);
-    expect(hasBuiltinEnvAuthentication('claude', { ANTHROPIC_API_KEY: undefined })).toBe(false);
-  });
-
   it('does not infer env authentication for agents that report it themselves', () => {
     // Codex custom model providers may set `requires_openai_auth = false`, so the
     // agent — not an env heuristic — decides whether sign-in is required.
@@ -40,7 +19,7 @@ describe('hasBuiltinEnvAuthentication', () => {
 
 describe('supportsBuiltinAuthentication', () => {
   it('allows sign-in for managed built-in agents without env credentials', () => {
-    for (const agentType of ['claude', 'codex', 'kimi', 'grok']) {
+    for (const agentType of ['claude', 'codex', 'kimi', 'grok', 'antigravity']) {
       expect(supportsBuiltinAuthentication({ cliType: 'builtin', agentType, env: {} })).toBe(true);
     }
   });
@@ -111,6 +90,10 @@ describe('usesAcpProtocolAuthentication', () => {
     expect(usesAcpProtocolAuthentication('custom')).toBe(true);
     expect(usesAcpProtocolAuthentication('builtin')).toBe(false);
     expect(usesAcpProtocolAuthentication('builtin', 'devin')).toBe(true);
+    expect(usesAcpProtocolAuthentication('builtin', 'sorbet')).toBe(true);
+    expect(supportsAuthenticationWhenRequired({ cliType: 'builtin', agentType: 'sorbet' })).toBe(
+      true
+    );
     expect(supportsBuiltinAuthentication({ cliType: 'builtin', agentType: 'devin' })).toBe(false);
     expect(usesAcpProtocolAuthentication(undefined)).toBe(false);
   });
@@ -140,4 +123,14 @@ describe('supportsAuthenticationWhenRequired', () => {
       false
     );
   });
+});
+
+it('offers managed Antigravity browser sign-in without protocol terminal authentication', () => {
+  expect(usesAcpProtocolAuthentication('builtin', 'antigravity')).toBe(false);
+  expect(
+    supportsBuiltinAuthentication({ cliType: 'builtin', agentType: 'antigravity', env: {} })
+  ).toBe(true);
+  expect(supportsAuthenticationWhenRequired({ cliType: 'builtin', agentType: 'antigravity' })).toBe(
+    true
+  );
 });

@@ -1,10 +1,26 @@
+import { machineTurnInterruptionReason, reserveMachineTurn } from './machine-turn-admission';
+import { isMissingHistoryUserTurn } from '@lody/shared';
+import { verifyAutomationWorktreeHeads } from './automation-worktree';
+import { classifyCapacityFailure } from './acp-error-classification';
+import {
+  providerBindingFingerprint,
+  type AutomationObservationSink,
+  type SessionAutomationObservation,
+} from './automation-observations';
+import { daemonLossObserver, createDaemonLossTasks } from '@/lib/e2ee/client-loss-observer';
 import type { EncryptedAgentExecution } from '@/lib/e2ee/agent-execution';
+import { MAX_DERIVED_TURNS_PER_ORIGIN } from '@/lib/e2ee/derivation-limits';
 import type { RealtimeStartPermit } from '@/lib/e2ee/realtime-journal';
-import { publishTurnCompletionLegacy } from './turn-completion-legacy';
+import {
+  awaitNativeWorkSettlementLegacy,
+  publishTurnCompletionLegacy,
+} from './turn-completion-legacy';
+import type { NativeWorkWatch } from './turn-completion';
 import { resolveProjectFileRoots } from './worktree/project-member-access';
 import { type AcpLauncher, resolveAcpLauncher } from '@/agent/acp-analytics';
 import type { LodyRateLimitsCapability } from 'acp-extension-core';
 import { queryLocalAcpRateLimits, AcpQuotaCleanupError } from '@/agent/acp-runner';
+import { isLoroRepoDocDeleted, normalizeSessionTurnInputConfig } from '@lody/shared';
 import {
   isSubscriptionQuotaEligible,
   type MachineProviderRateLimitsRefreshResponse,
@@ -32,12 +48,7 @@ import { getAcpCapabilitySourceVersion, resolveACPProcessLaunch } from '@/agent/
 import { captureCli } from '@/lib/analytics/posthog';
 import { ConcurrentQueue } from '@/lib/concurrent-queue';
 import {
-  captureGitWorkingTreeDiffBaseline,
-  getCurrentCommitHash,
-  type GitRunner,
-  type GitWorkingTreeDiffBaseline,
-} from '@/lib/git/git-diff-stats';
-import {
+  readMachineLocalProjects,
   resolveWorkspaceLocalProjectRootPathWithRetry,
   readLocalProjectRootResolveSyncTimeoutMs,
 } from '@/lib/local-project-meta';
@@ -74,7 +85,7 @@ import {
 } from './session-start-stage';
 import type { Logger } from '@/utils/logger';
 import { startTraceSpan, traceAsync } from '@/utils/trace-span';
-import type { ContentBlock } from '@agentclientprotocol/sdk';
+import type { AuthMethod, ContentBlock } from '@agentclientprotocol/sdk';
 import type { ModelInfo } from '@lody/shared';
 import {
   type AcpCapabilityCacheEntry,
@@ -88,7 +99,7 @@ import {
   type AgentConfigId,
   type AgentConfigMeta,
   assertManagedCodexProfileConfig,
-  buildReplayPromptFromHistory,
+  createReplayPromptBuilder,
   type BuiltinRuntimeOverrides,
   type ChatFailedCode,
   type ChatFailedReason,
@@ -99,7 +110,9 @@ import {
   getServerNow,
   getSessionRoomId,
   hasBuiltinRuntimeOverrideValues,
+  hasEmptyModelSelectOption,
   hasRecentResumeNotice,
+  isReplayEntryExcluded,
   isSessionCollaborationStopped,
   type IssuePRMention,
   type LocalProjectId,
@@ -139,12 +152,14 @@ import {
   type SessionGoalResponse,
   SessionHistoryInput,
   type SessionId,
+  type SessionProjectRun,
   type SessionInputBlock,
   type SessionMeta,
   SessionStatusFactory,
   type SessionSteerOperationRecord,
   type SessionSteerResponse,
   type SessionTurnInputConfig,
+  usesAcpProtocolAuthentication,
   type WorkspaceId,
 } from '@lody/shared';
 import {
@@ -154,6 +169,8 @@ import {
 import { findProgressMessageId } from '@lody/shared/session-data';
 import { Cause, Clock, Data, Effect, Exit, Fiber, Random, Scope } from 'effect';
 import { createHash, randomUUID } from 'node:crypto';
+import { stat } from 'node:fs/promises';
+import { join as joinPath } from 'node:path';
 import { getCodexProfileStore, type ResolvedCodexProfile } from '../agent/codex-profile-store';
 import {
   getACPErrorUserMessage,
@@ -167,6 +184,11 @@ import {
 import type { MachineAccessVerification } from './session-access-retry';
 import { createSessionBackend, getSteerOperationId, type SessionBackend } from './session-backend';
 import {
+  interruptedTurnContinuationId,
+  isTurnInterruptedByProcessEnd,
+  planInterruptedTurnContinuation,
+} from './interrupted-turn-continuation';
+import {
   findLastHistoryEntry,
   isActivationAwaitingHistory,
   resolveDispatchAcpSessionId,
@@ -175,6 +197,7 @@ import {
 import { buildPrompt } from './session-execution-helpers';
 import { resolveSessionLaunchConfig } from './session-launch-config-resolver';
 import type { ISession, SessionManager } from './session-manager';
+import { readLodyDataDiskInfo } from '@/lib/machine-disk';
 import type { SessionConfig } from './types';
 import { isAllocatedSessionBranchName } from './worktree/branch-name-allocation';
 import {
@@ -187,8 +210,6 @@ type FinalizeTurnContext = {
   session: ISession;
   sessionDoc: SessionDocument;
   turnId: string;
-  baseCommitHash: string | null;
-  turnStartWorkingTreeDiff?: GitWorkingTreeDiffBaseline | null;
   project?: ProjectRef;
   isTurnCancelled?: () => boolean;
   abortSignal?: AbortSignal;
@@ -201,6 +222,38 @@ type FinalizeTurnContext = {
 };
 
 type InboxExecutionHandle = Awaited<ReturnType<OperationInboxLegacy['openExecution']>>;
+
+function mcpSelectionChanged(session: ISession, input: SessionTurnInputConfig): boolean {
+  const selected = new Set(input.mcpServerIds ?? []);
+  const mounted = new Set(session.getMcpServerIds?.() ?? []);
+  return selected.size !== mounted.size || [...selected].some((id) => !mounted.has(id));
+}
+
+/** One message per definite encrypted refusal; only a sender without rights reads as one. */
+function encryptedRefusalMessage(
+  reason: Exclude<
+    Extract<
+      import('@/lib/e2ee/agent-execution').EncryptedExecutionClaim,
+      { state: 'denied' }
+    >['reason'],
+    undefined
+  >
+): string {
+  switch (reason) {
+    case 'e2ee_machine_not_shared':
+      return 'e2ee_machine_not_shared: 机器或本地项目未共享，请联系机器所有者。';
+    case 'e2ee_sender_not_authorized':
+      return 'e2ee_sender_not_authorized: The sender is not authorized to run turns in this encrypted workspace now, so this turn will not run.';
+    case 'e2ee_machine_not_member':
+      return 'e2ee_machine_not_member: This machine is no longer a member of this encrypted workspace, so it cannot run this turn.';
+    case 'e2ee_signature_missing':
+      return 'e2ee_signature_missing: This encrypted turn has no signature, so it will not run. Send it again.';
+    case 'e2ee_signature_invalid':
+      return 'e2ee_signature_invalid: This encrypted turn does not match its signature, so it will not run.';
+    case 'e2ee_scope_mismatch':
+      return 'e2ee_scope_mismatch: This encrypted turn was signed for another conversation or machine, so it will not run here.';
+  }
+}
 
 const TURN_FINALIZATION_STAGE_WARN_MS = 5_000;
 /** Trailing history rows searched for the last assistant turn and its user input. */
@@ -249,18 +302,6 @@ type TurnFinalizationEffects = {
     signal?: AbortSignal
   ) => Promise<boolean>;
   flushSessionUsage: (sessionId: SessionId) => Promise<void>;
-  updateSessionDiffStats: (
-    sessionId: SessionId,
-    session: ISession,
-    options: {
-      turnId: string;
-      baseCommitHash?: string;
-      turnStartWorkingTreeDiff?: GitWorkingTreeDiffBaseline | null;
-      preferredBaseBranch?: string;
-      skipHistoryFileDiff?: boolean;
-      signal?: AbortSignal;
-    }
-  ) => Promise<SessionHistoryInput['fileDiff']>;
   detectAndAssociatePR: (ctx: {
     sessionId: SessionId;
     session: ISession;
@@ -269,7 +310,7 @@ type TurnFinalizationEffects = {
     branchName?: string | null;
     signal?: AbortSignal;
   }) => Promise<{ readonly baseBranch: string } | null>;
-  /** Publish the workspace dirty/unpushed flags alone, for paths that skip diff stats. */
+  /** Publish workspace dirty/unpushed flags independently of turn edit evidence. */
   syncWorkspaceGitState: (
     sessionId: SessionId,
     session: ISession,
@@ -332,26 +373,39 @@ type TurnRuntimeState = {
   turnId: string;
   userTurnId?: string;
   invocation?: TurnInvocation;
+  /** Encrypted only: whose authority admitted the claimed turn's verified signer. */
+  encryptedPrincipal?: 'owner' | 'member' | 'derived';
+  /** Encrypted member turns only: the verified origin device and reached projects. */
+  encryptedOrigin?: { requesterDevice: string; localProjectIds: readonly string[] };
+  /** Inputs derived from this member turn so far (owner decision: bounded per origin). */
+  encryptedDerivations?: Set<string>;
   inboxNotificationWork?: { userId: string; originTurnIds: string[] };
   goalControl?: GoalPromptControl;
   session?: ISession;
   project?: ProjectRef;
-  baseCommitHash?: string | null;
-  turnStartWorkingTreeDiff?: GitWorkingTreeDiffBaseline | null;
   promptStarted: boolean;
   promptInFlight: boolean;
   promptFailed: boolean;
   finalizeStarted: boolean;
   finalizeCompleted: boolean;
+  failureFinalized?: boolean;
   notificationOutcome?: TurnOutcome;
+  capacityFailure?: SessionAutomationObservation['capacityFailure'];
   /** Publish-once latch for the workspace git-state flags; both cancel routes read it. */
   workspaceGitStateSynced: boolean;
   prePromptFailureRecorded: boolean;
   /** Start step in progress; cleared once a Session is bound, so later failures name none. */
   startStage?: SessionStartStage;
   cancelRequested: boolean;
+  /**
+   * Shutdown interrupted this input's running prompt; the user did not stop it. Its
+   * cancellation keeps the dispatch claim in Session metadata, exactly as a crash
+   * leaves it, so the next start continues the Turn once.
+   */
+  interruptedByProcessEnd?: boolean;
   pendingInputOnCancel: PendingInputCancellationPolicy;
   releaseFailure?: unknown;
+  releaseParentAdmission?: () => void;
   rawPromptCompletion?: Promise<void>;
   disconnectedTransport?: boolean;
   inboxOwner?: InboxExecutionHandle;
@@ -443,7 +497,13 @@ type VisibleSessionTurnContext = {
     unhandledErrorContext?: VisibleSessionTurnUnhandledErrorContext;
   }) => Effect.Effect<void, unknown, never>;
   prompt: (promptBlocks: ContentBlock[]) => Effect.Effect<void, unknown, never>;
-  claimExecution: () => Effect.Effect<void, unknown, never>;
+  /**
+   * `scope` resolves, on this machine, every local project the turn can reach. An
+   * encrypted claim returns the authorized set; the turn must not start outside it.
+   */
+  claimExecution: (
+    scope: () => Promise<readonly LocalProjectId[]>
+  ) => Effect.Effect<readonly LocalProjectId[] | undefined, unknown, never>;
 };
 
 type VisibleSessionTurnAnalytics = {
@@ -650,8 +710,11 @@ export type SessionExecutionServiceDeps = {
   getActiveTurnId: (sessionId: SessionId) => string | undefined;
   clearActiveTurnId: (sessionId: SessionId, turnId: string) => void;
   buildAcpPromptBlocks: (args: {
+    requesterUserId?: string;
     workspaceId: WorkspaceId;
     sessionId: SessionId;
+    /** The input's history turn; an agent author adds a provenance header. */
+    userTurnId?: string;
     inputBlocks: SessionInputBlock[];
     issuePRMentions?: IssuePRMention[];
     replayPromptText?: string;
@@ -682,6 +745,8 @@ export type SessionExecutionServiceDeps = {
     signal?: AbortSignal
   ) => Promise<string | null>;
   turnFinalization: TurnFinalizationEffects;
+  /** Borrow the existing bounded user-history gate before recovery list writes. */
+  awaitTurnHistoryGate?: (sessionId: SessionId) => Promise<void>;
   recordChatFailure: (
     sessionDoc: SessionDocument,
     reason: ChatFailedReason,
@@ -693,6 +758,8 @@ export type SessionExecutionServiceDeps = {
     turnId: string,
     failure: { phase: SessionStopFailurePhase; message: string }
   ) => Promise<void>;
+  /** Persists the notice that agent work outliving this Turn ended unfinished. */
+  recordNativeWorkInterrupted?: (sessionId: SessionId, turnId: string) => Promise<void>;
   maybeGenerateAndStoreSessionTitle: (
     sessionId: SessionId,
     cliType: AgentConfigCliType,
@@ -743,6 +810,10 @@ export type SessionExecutionServiceDeps = {
     modelReasoningEfforts?: Record<string, string[]>;
     modelCapabilities?: Record<string, AcpModelControls>;
     capabilitySourceVersion?: string;
+    /** Sign-in methods the probe read from `initialize`, when it could. */
+    authMethods?: readonly AuthMethod[];
+    /** Each model's own option list, when the refresh asked to read them. */
+    modelConfigOptions?: Record<string, AcpConfigOptionSummary[]>;
   }>;
   /**
    * The `capabilitySourceVersion` a probe would stamp right now, resolved without
@@ -829,6 +900,7 @@ function createAcpRefreshAbortError(): DOMException {
 }
 
 type AcpAuthenticationOptions = {
+  signal?: AbortSignal;
   onProgress?: (message: MachineAcpAuthenticationProgressMessage) => void;
 };
 
@@ -842,6 +914,7 @@ type ResolvedMachineAcpCapabilitiesRefreshRequest = MachineAcpCapabilitiesRefres
     | 'magpieGatewayUrl'
     | 'env'
     | 'codexAuth'
+    | 'sessionDefaults'
   >;
 
 const summarizeAcpAuthMethod = (method: unknown): MachineAcpAuthMethodSummary => {
@@ -897,6 +970,14 @@ type TurnAnalyticsState = {
 };
 
 export class SessionExecutionService {
+  private readonly clientLossRawWork = createDaemonLossTasks();
+  inspectClientLoss() {
+    return {
+      turns: this.getActiveTurnIds().length,
+      bookkeeping: this.ownedWork.size + this.clientLossRawWork.size,
+    };
+  }
+
   private readonly completionPublicationAbort = new AbortController();
 
   stopCompletionPublication(): void {
@@ -904,6 +985,17 @@ export class SessionExecutionService {
   }
 
   private readonly shutdownAbort = new AbortController();
+  private machineIdentityRestoreSealed = false;
+
+  isMachineIdentityRestoreIdle(): boolean {
+    // An execution owner can exist before its active presence is published.
+    return !this.machineIdentityRestoreSealed && this.turnRuntimeBySession.size === 0;
+  }
+
+  stopNewIdentityRestoreExecutions(): void {
+    this.machineIdentityRestoreSealed = true;
+  }
+
   private readonly ownedWork = new Set<Promise<unknown>>();
   private ownBookkeeping<T>(sessionId: SessionId, work: Promise<T>): Promise<T | undefined> {
     const observed = work.catch((error: unknown) => {
@@ -911,7 +1003,10 @@ export class SessionExecutionService {
       return undefined;
     });
     this.ownedWork.add(observed);
-    void observed.then(() => this.ownedWork.delete(observed));
+    void observed.then(() => {
+      this.ownedWork.delete(observed);
+      daemonLossObserver.changed();
+    });
     return observed;
   }
   private async runBookkeepingStage<T>(
@@ -1017,6 +1112,127 @@ export class SessionExecutionService {
       }
     | undefined;
   private operationInbox: OperationInboxLegacy | undefined;
+  private automationObservations: AutomationObservationSink | undefined;
+  setAutomationObservations(sink: AutomationObservationSink | undefined): void {
+    this.automationObservations = sink;
+  }
+  private automationAdmission:
+    | ((args: {
+        sessionId: SessionId;
+        turnId: string;
+        userId: string;
+        origin: import('@lody/shared/automations').AutomationOrigin;
+      }) => Promise<boolean>)
+    | undefined;
+  private automationSubmissionGuard:
+    | ((
+        sessionId: SessionId,
+        turnId: string,
+        origin: import('@lody/shared/automations').AutomationOrigin,
+        binding: import('./automation-observations').ProviderBinding | null
+      ) => boolean)
+    | undefined;
+  private automationBeforeAccept: SessionExecutionService['automationAdmission'];
+
+  setAutomationAdmission(
+    admit: SessionExecutionService['automationAdmission'],
+    canSubmit?: SessionExecutionService['automationSubmissionGuard'],
+    beforeAccept?: SessionExecutionService['automationAdmission']
+  ): void {
+    this.automationAdmission = admit;
+    this.automationSubmissionGuard = canSubmit;
+    this.automationBeforeAccept = beforeAccept;
+  }
+  async guardAutomationAction<A>(
+    sessionIds: readonly SessionId[],
+    userId: string,
+    body: () => Promise<A>
+  ): Promise<A> {
+    if (!this.operationInbox) throw new Error('AUTOMATION_ADMISSION_UNAVAILABLE');
+    return this.operationInbox.guard(
+      sessionIds.map((sessionId) => ({
+        workspaceId: this.deps.workspaceId,
+        sessionId,
+        userId,
+      })),
+      body
+    );
+  }
+  hasBlockedAutomationExecution(_sessionId: SessionId): boolean {
+    return !this.operationInbox;
+  }
+  automationExecutionRelease(sessionId: SessionId, executionId: string, userId: string) {
+    return this.operationInbox?.executionRelease(
+      { workspaceId: this.deps.workspaceId, sessionId, userId },
+      executionId
+    );
+  }
+  automationInputDisposition(
+    sessionId: SessionId,
+    turnId: string
+  ): 'unsubmitted' | 'cancelled' | 'ended' | 'unknown' {
+    const inbox = this.operationInbox;
+    if (!inbox) return 'unknown';
+    if (inbox.inputCanceled(this.deps.workspaceId, sessionId, turnId)) return 'cancelled';
+    if (inbox.inputEnded(this.deps.workspaceId, sessionId, turnId)) return 'ended';
+    if (
+      this.hasBlockedAutomationExecution(sessionId) ||
+      this.getExecutionSnapshot(sessionId).hasActiveTurn
+    )
+      return 'unknown';
+    return 'unsubmitted';
+  }
+  automationInputAccepted(sessionId: SessionId, userId: string, turnId: string): boolean {
+    return (
+      this.operationInbox?.acceptedAutomationInput(
+        { workspaceId: this.deps.workspaceId, sessionId, userId },
+        turnId
+      ) === true
+    );
+  }
+  async cancelAutomationInput(sessionId: SessionId, turnId: string): Promise<boolean> {
+    const runtime = this.turnRuntimeBySession.get(sessionId);
+    if (runtime?.invocation?.sourceTurnId === turnId) {
+      const result = await this.cancelSession(
+        {
+          type: 'session/cancel',
+          sessionId,
+          turnId: runtime.turnId,
+          machineId: this.deps.machineId,
+          workspaceId: this.deps.workspaceId,
+        },
+        { pauseInbox: false, pendingInput: 'preserve', prePromptSession: 'discard' }
+      );
+      return result.success;
+    }
+    await this.abandonInboxInput(sessionId, turnId);
+    return true;
+  }
+
+  async acceptAutomationInput(args: {
+    sessionId: SessionId;
+    turnId: string;
+    userId: string;
+    config: SessionTurnInputConfig;
+  }): Promise<boolean> {
+    const origin = args.config._lodyAutomation;
+    const inbox = this.operationInbox;
+    const admission = this.automationAdmission;
+    const beforeAccept = this.automationBeforeAccept;
+    if (!origin || !inbox || !admission || !(await admission({ ...args, origin }))) return false;
+    if (origin.workIntentId && !beforeAccept) return false;
+    return inbox.accept(
+      {
+        workspaceId: this.deps.workspaceId,
+        sessionId: args.sessionId,
+        userId: args.userId,
+        inputId: args.turnId,
+        kind: 'automation',
+        config: args.config,
+      },
+      origin.workIntentId && beforeAccept ? () => beforeAccept({ ...args, origin }) : undefined
+    );
+  }
   private onInboxReleased: ((sessionId: SessionId) => void) | undefined;
   setOperationInbox(
     inbox: OperationInboxLegacy | undefined,
@@ -1039,7 +1255,7 @@ export class SessionExecutionService {
       const read = await (await createSessionBackend(doc)).readTurn(args.inputId);
       if (
         meta?.lastHandledUserMsgId === args.inputId ||
-        meta?.lastMissingHistoryUserMsgId === args.inputId ||
+        isMissingHistoryUserTurn(meta, args.inputId) ||
         (read.state === 'ready' &&
           (read.turn.role !== 'user' ||
             ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(read.turn.status ?? '')))
@@ -1073,6 +1289,9 @@ export class SessionExecutionService {
   quiesceInboxExecutions(): void {
     this.shutdownAbort.abort();
     for (const runtime of this.turnRuntimeBySession.values()) {
+      // A Turn whose prompt already ended is only finishing bookkeeping: not continued.
+      if (runtime.inboxOwner?.input && runtime.promptInFlight && !runtime.cancelRequested)
+        runtime.interruptedByProcessEnd = true;
       runtime.cancelRequested = true;
       runtime.pendingInputOnCancel = 'preserve';
       runtime.terminateSessionOnCancel = true;
@@ -1119,7 +1338,10 @@ export class SessionExecutionService {
     })();
     this.releaseRecoveryBySession.set(sessionId, recovery);
     this.ownedWork.add(recovery);
-    void recovery.then(() => this.ownedWork.delete(recovery));
+    void recovery.then(() => {
+      this.ownedWork.delete(recovery);
+      daemonLossObserver.changed();
+    });
     return recovery;
   }
 
@@ -1150,16 +1372,24 @@ export class SessionExecutionService {
       );
     } else if (runtime.session) await runtime.session.terminate(true);
     runtime.releaseFailure = undefined;
+    this.releaseParentAdmission(runtime);
   }
 
   private readonly canceledTurnBySession = new Map<SessionId, string>();
   private readonly currentTurnBySession = new Map<SessionId, string>();
   private readonly turnRuntimeBySession = new Map<SessionId, TurnRuntimeState>();
+  /**
+   * The last cleanly released turn per Session. Work its own Agent continues by itself
+   * (woken by a background task, a scheduled wake-up or a cron) still acts for this
+   * turn's frozen invocation. See `readInvokingRuntime`.
+   */
+  private readonly releasedTurnBySession = new Map<SessionId, TurnRuntimeState>();
   /** Admission ownership outlives replaceable turn runtime registrations. */
   private readonly liveInboxExecutionIds = new Set<string>();
   /** Start times of recent start retries, shared by every Session this service runs. */
   private readonly startRetryStartedAt: number[] = [];
   private readonly rewriteBarrierSessions = new Set<SessionId>();
+  private readonly childAdmissions = new Map<SessionId, number>();
   private readonly rewriteConflictLeaseSessions = new Set<SessionId>();
   private readonly turnReleaseWaiters = new Map<SessionId, Map<string, Set<() => void>>>();
   /** At most one goal action waits per session; a newer action replaces it. */
@@ -1188,8 +1418,18 @@ export class SessionExecutionService {
   );
   private readonly providerQuotaUpdates = new Map<AgentConfigId, number>();
 
-  noteProviderRateLimitsUpdate(configId: AgentConfigId): void {
+  noteProviderRateLimitsUpdate(
+    configId: AgentConfigId,
+    binding: import('./automation-observations').ProviderBinding | undefined,
+    snapshot: import('acp-extension-core').RateLimitsSnapshot
+  ): void {
     this.providerQuotaUpdates.set(configId, (this.providerQuotaUpdates.get(configId) ?? 0) + 1);
+    if (binding && this.automationObservations)
+      void this.automationObservations
+        .capacity(binding, snapshot, 'push')
+        .catch((cause) =>
+          this.deps.logger.warn('Automation capacity observation could not be persisted', cause)
+        );
   }
 
   async refreshProviderRateLimits(
@@ -1282,6 +1522,17 @@ export class SessionExecutionService {
           unchanged,
           config
         );
+      }
+      if (unchanged() && this.automationObservations) {
+        await this.automationObservations
+          .capacity(
+            { bindingId: configId, fingerprint: providerBindingFingerprint(config) },
+            snapshot,
+            'query'
+          )
+          .catch((cause) =>
+            this.deps.logger.warn('Automation capacity observation could not be persisted', cause)
+          );
       }
       return unchanged();
     });
@@ -1587,8 +1838,6 @@ export class SessionExecutionService {
           ...this.baseSessionAnalyticsProps(sessionId),
           turn_id: turnId,
           ...(typeof totalTurnMs === 'number' ? { total_turn_ms: totalTurnMs } : {}),
-          // TODO(analytics): permission_wait_ms is accumulated in MessageHandler's
-          // SessionTransientStore (state.permissionWaitMs); plumb it here to populate it.
           pr_detected: prDetected,
           diff_file_count: diffFileCount,
           ...(analytics?.dispatchMode ? { dispatch_mode: analytics.dispatchMode } : {}),
@@ -1667,7 +1916,8 @@ export class SessionExecutionService {
   tryAcquireSessionRewriteBarrier(sessionId: SessionId): (() => void) | null {
     if (
       this.rewriteBarrierSessions.has(sessionId) ||
-      this.rewriteConflictLeaseSessions.has(sessionId)
+      this.rewriteConflictLeaseSessions.has(sessionId) ||
+      this.childAdmissions.has(sessionId)
     ) {
       return null;
     }
@@ -2186,6 +2436,9 @@ export class SessionExecutionService {
     if (!agentClient || !acpSessionId || !steerCapability) {
       return await rejectAndPromote('unsupported');
     }
+    if (mcpSelectionChanged(runtime.session, options.inputConfig)) {
+      return await rejectAndPromote('unsupported', 'MCP selection requires a new turn.');
+    }
     if (steerCapability.configPolicy === 'active') {
       const mismatch = agentClient.findSteerConfigMismatch(options.inputConfig);
       if (mismatch) {
@@ -2209,8 +2462,10 @@ export class SessionExecutionService {
       const inputBlocks = resolveSessionExecutionInputBlocks(options.inputConfig);
       const promptBlocks = await wait(
         this.deps.buildAcpPromptBlocks({
+          requesterUserId: options.userId,
           workspaceId: this.deps.workspaceId,
           sessionId: options.sessionId,
+          userTurnId: options.userTurnId,
           inputBlocks,
           issuePRMentions: options.inputConfig.issuePRMentions,
         })
@@ -2411,6 +2666,9 @@ export class SessionExecutionService {
         // history/finalization catches up. Switch causal identity first.
         const switchInvocation = () => {
           runtime.notificationOutcome = undefined;
+          // A steered input carries no verified principal of its own here.
+          runtime.encryptedPrincipal = undefined;
+          runtime.encryptedOrigin = undefined;
           runtime.invocation = {
             sourceTurnId: options.userTurnId,
             requesterUserId: options.userId,
@@ -2886,8 +3144,19 @@ export class SessionExecutionService {
     });
   }
 
-  async dispatchPreparedSessionTurn(options: PreparedSessionDispatchOptions): Promise<void> {
-    const { sessionId, userTurnId, dispatchSource } = options;
+  async dispatchPreparedSessionTurn(prepared: PreparedSessionDispatchOptions): Promise<void> {
+    const { sessionId, userTurnId, dispatchSource } = prepared;
+    // Ordinary workspaces must stay synchronous up to the first registration below.
+    const verifiedUserId = this.deps.encryptedExecution
+      ? await this.verifiedRequesterUserId(sessionId, userTurnId, prepared.invocation?.inputConfig)
+      : undefined;
+    const options =
+      verifiedUserId && prepared.invocation
+        ? {
+            ...prepared,
+            invocation: { ...prepared.invocation, requesterUserId: verifiedUserId },
+          }
+        : prepared;
     const expectedTurnId = this.getAssistantEntryIdForUserTurn(userTurnId);
     const span = startTraceSpan(this.deps.logger, 'execution.prepared_session_turn', {
       sessionId,
@@ -3026,7 +3295,125 @@ export class SessionExecutionService {
   }
 
   private registerTurnRuntime(runtime: TurnRuntimeState): void {
+    this.releasedTurnBySession.delete(runtime.sessionId);
     this.turnRuntimeBySession.set(runtime.sessionId, runtime);
+    // A newer Turn owns the Session's completion signals from here on.
+    this.withdrawNativeWorkCompletion(runtime.sessionId);
+  }
+
+  /** Completion publications still waiting for agent work that outlived their Turn. */
+  private readonly nativeWorkSupersede = new Map<SessionId, Set<() => void>>();
+
+  /**
+   * Withdraws any pending post-turn background completion wait so Stop, archive, delete,
+   * or a newer Turn will not emit stale `nativeWorkInterrupted` notices or outcomes.
+   */
+  withdrawNativeWorkCompletion(sessionId: SessionId): void {
+    for (const supersede of [...(this.nativeWorkSupersede.get(sessionId) ?? [])]) supersede();
+  }
+
+  private registerNativeWorkWithdraw(sessionId: SessionId, withdraw: () => void): () => void {
+    const supersedeSet = this.nativeWorkSupersede.get(sessionId) ?? new Set();
+    supersedeSet.add(withdraw);
+    this.nativeWorkSupersede.set(sessionId, supersedeSet);
+    return () => {
+      supersedeSet.delete(withdraw);
+      if (!supersedeSet.size && this.nativeWorkSupersede.get(sessionId) === supersedeSet)
+        this.nativeWorkSupersede.delete(sessionId);
+    };
+  }
+
+  /**
+   * Watches the released Turn's own agent instance while it still reports work. Absent
+   * for agents that report no `sessionActivity`, which keep immediate completion.
+   */
+  private watchNativeWork(sessionId: SessionId): NativeWorkWatch | undefined {
+    const sessionManager = this.deps.sessionManager;
+    const session = sessionManager.getSession(sessionId);
+    const client = session?.agentClient;
+    if (!session || !client || session.hasLiveAgentProcess?.() === false) return undefined;
+    const readPending = (): 'running' | 'background' | null => {
+      try {
+        return client.getNativeWork() ?? (client.hasUnsettledNativeWork?.() ? 'background' : null);
+      } catch (cause) {
+        this.deps.logger.debug(
+          `[${sessionId}] Native agent work unreadable at release: ${formatErrorMessage(cause)}`
+        );
+        return null;
+      }
+    };
+    // An unreadable observation must not hold back completion; publish it as before.
+    if (readPending() === null) return undefined;
+    const isInstanceLive = () =>
+      sessionManager.getSession(sessionId) === session && session.hasLiveAgentProcess?.() !== false;
+    return {
+      current: readPending,
+      subscribe: (onEvent) => {
+        const unregister = this.registerNativeWorkWithdraw(sessionId, () => onEvent('superseded'));
+        // Detach publishes null before removing the instance; read it after that.
+        const onChanged = (changed: SessionId) => {
+          if (changed !== sessionId) return;
+          queueMicrotask(() => onEvent(isInstanceLive() ? 'changed' : 'ended'));
+        };
+        const onEnded = (event: { sessionId: SessionId }) => {
+          if (event.sessionId === sessionId) onEvent('ended');
+        };
+        sessionManager.on('onNativeWorkChanged', onChanged);
+        sessionManager.on('exit', onEnded);
+        sessionManager.on('terminated', onEnded);
+        if (!isInstanceLive()) queueMicrotask(() => onEvent('ended'));
+        return () => {
+          unregister();
+          sessionManager.off('onNativeWorkChanged', onChanged);
+          sessionManager.off('exit', onEnded);
+          sessionManager.off('terminated', onEnded);
+        };
+      },
+    };
+  }
+
+  /**
+   * The runtime whose invocation the Session's Agent currently acts for: the
+   * registered turn, else the last cleanly released turn while that same Agent
+   * process is still live. Only that Agent holds the Session's tool binding, so a
+   * call proves it is working; whether it reports its own activity does not
+   * matter (Codex reports none to Lody). A replaced or exited Agent acts for nobody.
+   */
+  private readInvokingRuntime(sessionId: SessionId): TurnRuntimeState | undefined {
+    const live = this.turnRuntimeBySession.get(sessionId);
+    if (live) return live;
+    const released = this.releasedTurnBySession.get(sessionId);
+    if (!released) return undefined;
+    const session = released.session;
+    if (
+      !session ||
+      this.deps.sessionManager.getSession(sessionId) !== session ||
+      session.hasLiveAgentProcess?.() === false
+    ) {
+      this.releasedTurnBySession.delete(sessionId);
+      return undefined;
+    }
+    return released;
+  }
+
+  /** The Agent process ended or was replaced; its self-started work ends with it. */
+  forgetReleasedTurn(sessionId: SessionId): void {
+    this.releasedTurnBySession.delete(sessionId);
+  }
+
+  private canContinueAfterRelease(runtime: TurnRuntimeState): boolean {
+    return (
+      runtime.promptStarted &&
+      Boolean(runtime.session) &&
+      !runtime.cancelRequested &&
+      !runtime.releaseFailure &&
+      !runtime.disconnectedTransport &&
+      !runtime.initializationStalled &&
+      !(
+        runtime.inboxOwner?.input &&
+        this.isInboxInputCanceled(runtime.sessionId, runtime.inboxOwner.input.inputId)
+      )
+    );
   }
 
   /**
@@ -3051,7 +3438,26 @@ export class SessionExecutionService {
   private releaseTurnRuntime(sessionId: SessionId, turnId: string): void {
     const runtime = this.turnRuntimeBySession.get(sessionId);
     const releasedOwner = runtime?.turnId === turnId;
-    if (releasedOwner) this.turnRuntimeBySession.delete(sessionId);
+    if (releasedOwner) {
+      const rawPrompt =
+        runtime.session?.agentClient?.pendingPromptCompletion ?? runtime.rawPromptCompletion;
+      if (runtime.releaseFailure && rawPrompt) {
+        void rawPrompt.then(
+          () => {
+            if (!runtime.disconnectedTransport) this.releaseParentAdmission(runtime);
+          },
+          () => {
+            /* Recovery owns an unconfirmed release. */
+          }
+        );
+      } else {
+        this.releaseParentAdmission(runtime);
+      }
+      this.turnRuntimeBySession.delete(sessionId);
+      if (this.canContinueAfterRelease(runtime)) this.releasedTurnBySession.set(sessionId, runtime);
+      else this.releasedTurnBySession.delete(sessionId);
+      daemonLossObserver.changed();
+    }
     // Safety net: drop per-turn analytics state if the turn ended without a
     // completed/failed capture (e.g. cancellation), so the map cannot leak.
     if (releasedOwner || this.turnAnalyticsBySession.get(sessionId)?.turnId === turnId) {
@@ -3059,6 +3465,12 @@ export class SessionExecutionService {
     }
     this.clearCurrentTurn(sessionId, turnId);
     this.resolveTurnReleaseWaiters(sessionId, turnId);
+  }
+
+  private releaseParentAdmission(runtime: TurnRuntimeState): void {
+    const release = runtime.releaseParentAdmission;
+    runtime.releaseParentAdmission = undefined;
+    release?.();
   }
 
   private isTurnOwned(sessionId: SessionId, turnId: string): boolean {
@@ -3446,13 +3858,16 @@ export class SessionExecutionService {
       // assistant as success unless the user turn already carries a stronger
       // failed/cancelled outcome, so reversing these writes creates a window
       // where a cancelled turn can be durably folded as succeeded.
-      yield* self.ignoreWithWarning(
-        options.sessionId,
-        'Failed to mark dispatch cancelled',
-        self.tryPromise(() =>
-          self.markDispatchCancelled(options.sessionId, options.sessionDoc, options.userTurnId)
-        )
-      );
+      // A shutdown interruption leaves the same trace as a crash: the input stays
+      // `processing` and claimed in metadata until the next start continues it.
+      if (!runtime?.interruptedByProcessEnd)
+        yield* self.ignoreWithWarning(
+          options.sessionId,
+          'Failed to mark dispatch cancelled',
+          self.tryPromise(() =>
+            self.markDispatchCancelled(options.sessionId, options.sessionDoc, options.userTurnId)
+          )
+        );
 
       if (options.reportTurnError) {
         yield* self.ignoreWithWarning(
@@ -3570,6 +3985,132 @@ export class SessionExecutionService {
     );
   }
 
+  /** Called only by the serialized dispatch watcher with no live turn owner. */
+  async recoverUncertainEncryptedTurn(
+    sessionId: SessionId,
+    sessionDoc: SessionDocument,
+    userTurnId: string
+  ): Promise<boolean> {
+    const gate = this.deps.encryptedExecution;
+    if (!gate || this.getExecutionSnapshot(sessionId).hasActiveTurn) return false;
+    const release = this.tryAcquireSessionRewriteConflictLease(sessionId);
+    if (!release) return false;
+    try {
+      const meta = await this.getSessionMeta(sessionId);
+      const backend = await createSessionBackend(sessionDoc, meta);
+      const read = await backend.readTurn(userTurnId);
+      if (
+        read.state === 'ready' &&
+        ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(read.turn.status ?? '') &&
+        meta?.processingUserMsgId !== userTurnId
+      )
+        return false;
+      const state = await Effect.runPromise(gate.readState({ sessionId, userTurnId }));
+      if (state !== 'uncertain') return false;
+      return await this.settleUncertainEncryptedTurn(sessionId, sessionDoc, userTurnId);
+    } finally {
+      release();
+    }
+  }
+
+  private async settleUncertainEncryptedTurn(
+    sessionId: SessionId,
+    sessionDoc: SessionDocument,
+    userTurnId: string
+  ): Promise<boolean> {
+    await this.deps.awaitTurnHistoryGate?.(sessionId);
+    const backend = await this.getSessionBackend(sessionDoc, sessionId);
+    const user = await backend.readTurn(userTurnId);
+    if (
+      user.state === 'ready' &&
+      ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(user.turn.status ?? '')
+    ) {
+      const meta = await this.getSessionMeta(sessionId);
+      if (meta?.processingUserMsgId !== userTurnId) return false;
+      // A stale running pointer does not undo a user's terminal decision.
+      await this.upsertSessionMeta(sessionId, { processingUserMsgId: undefined });
+      await sessionDoc.setStatus(SessionStatusFactory.idle());
+      await backend.flushLocalWrites();
+      return true;
+    }
+    const noticeId = `e2ee-interrupted:${userTurnId}`;
+    const output = await backend.readHistorySelection((rows) => {
+      const start = rows.findIndex((row) => row.id === userTurnId);
+      let end = rows.length;
+      for (let i = start + 1; i < rows.length; i++) {
+        if (rows[i]?.role === 'user') {
+          end = i;
+          break;
+        }
+      }
+      return rows.flatMap((row, index) =>
+        row.id === noticeId ||
+        (row.role === 'assistant' && row.userTurnId === userTurnId) ||
+        (start >= 0 && index > start && index < end && row.role === 'system')
+          ? [index]
+          : []
+      );
+    });
+    const hasNotice = output.some(
+      (entry) =>
+        entry.id === noticeId ||
+        entry.items?.some((item) => item.type === 'system_notice' && item.name === 'chat_failed')
+    );
+    // A completed reply is positive completion evidence, unless it was closed by
+    // this recovery (the durable notice is written before any terminal stamp).
+    if (
+      !hasNotice &&
+      output.some((entry) => entry.role === 'assistant' && typeof entry.endedAt === 'number')
+    )
+      return false;
+    if (!hasNotice) {
+      await backend.applyHistoryAction({
+        kind: 'upsert-turn',
+        turn: {
+          id: noticeId,
+          role: 'system',
+          userTurnId,
+          timestamp: new Date().toISOString(),
+          fileDiff: [],
+          items: [
+            {
+              type: 'system_notice',
+              name: 'chat_failed',
+              meta: {
+                reason: 'turn_pre_prompt_failed',
+                message:
+                  'The previous run was interrupted by a device shutdown or crash. Its outcome is unknown, so it was not retried automatically to avoid duplicate execution. Check its effects before sending a new message.',
+              },
+            },
+          ],
+        },
+      });
+      await backend.flushLocalWrites();
+    }
+    for (const entry of output) {
+      if (entry.role === 'assistant' && typeof entry.endedAt !== 'number')
+        await backend.applyHistoryAction({
+          kind: 'finish-assistant',
+          turnId: entry.id,
+          endedAt: Date.now(),
+        });
+    }
+    await this.setTerminalUserTurnStatus(sessionId, sessionDoc, userTurnId, 'failed');
+    const meta = await this.getSessionMeta(sessionId);
+    // Recovery settles an old identity, not the latest execution. Never replace
+    // another turn's handled/processing pointers with this interrupted turn.
+    await this.upsertSessionMeta(sessionId, {
+      ...(!meta?.lastHandledUserMsgId || meta.lastHandledUserMsgId === userTurnId
+        ? { lastHandledUserMsgId: userTurnId, lastFailedUserMsgId: userTurnId }
+        : {}),
+      ...(meta?.processingUserMsgId === userTurnId ? { processingUserMsgId: undefined } : {}),
+    });
+    if (!meta?.processingUserMsgId || meta.processingUserMsgId === userTurnId)
+      await sessionDoc.setStatus(SessionStatusFactory.idle());
+    await backend.flushLocalWrites();
+    return true;
+  }
+
   private async recordKnownChatFailure(options: {
     sessionId: SessionId;
     sessionDoc: SessionDocument;
@@ -3620,6 +4161,49 @@ export class SessionExecutionService {
     }
     await options.sessionDoc.setStatus(SessionStatusFactory.idle());
     this.captureStatusChanged(options.sessionId, 'idle', undefined, 'turn_failed');
+  }
+
+  /**
+   * Restart dispatch of an input a process end interrupted (its metadata claim survived
+   * on this Machine). The input itself is never replayed: it settles as stopped, and
+   * one new Lody-authored `continue` input follows unless the user already moved on.
+   * Returns false when the input was not interrupted, so the caller fails it as before.
+   * Spec: `specs/interrupted-turn-continuation.md`.
+   */
+  private async continueInterruptedTurn(
+    sessionId: SessionId,
+    sessionDoc: SessionDocument,
+    userTurnId: string
+  ): Promise<boolean> {
+    // Encrypted starts run only signed input; Lody cannot sign for the requester.
+    if (this.deps.encryptedExecution) return false;
+    const raw = await this.deps.workspaceDocument.repo.getDocMeta(getSessionRoomId(sessionId));
+    const meta = raw?.meta as SessionMeta | undefined;
+    if (!isTurnInterruptedByProcessEnd(meta, this.deps.machineId, userTurnId)) return false;
+    const backend = await createSessionBackend(sessionDoc);
+    const [interrupted, existing, queue] = await Promise.all([
+      backend.readTurn(userTurnId),
+      backend.readTurn(interruptedTurnContinuationId(userTurnId)),
+      backend.getMessageQueue(),
+    ]);
+    const plan = planInterruptedTurnContinuation({
+      interruptedTurnId: userTurnId,
+      interruptedTurn: interrupted.state === 'ready' ? interrupted.turn : undefined,
+      meta: raw && !isLoroRepoDocDeleted(raw) ? meta : undefined,
+      queuedInputCount: queue.length,
+      continuationExists: existing.state !== 'missing',
+      timestamp: new Date(getServerNow()).toISOString(),
+    });
+    await this.markDispatchCancelled(sessionId, sessionDoc, userTurnId);
+    await sessionDoc.setStatus(SessionStatusFactory.idle());
+    this.deps.logger.info(
+      `[${sessionId}] Interrupted Turn ${userTurnId}: ${plan.kind === 'continue' ? 'continuing' : `not continued (${plan.reason})`}`
+    );
+    if (plan.kind === 'continue') {
+      await backend.appendUserTurn(plan.entry);
+      this.onInboxReleased?.(sessionId);
+    }
+    return true;
   }
 
   /**
@@ -3840,6 +4424,7 @@ export class SessionExecutionService {
       await this.markTurnFailed(options.sessionId, options.sessionDoc, options.userTurnId);
     }
     await this.handleTurnError(options.sessionId, options.sessionDoc, options.error);
+    options.runtime.failureFinalized = true;
     await options.onUnhandledError?.(options.error);
   }
 
@@ -3929,6 +4514,7 @@ export class SessionExecutionService {
       this.deps.machineId,
       localProjectId,
       {
+        verifyProjectIdentity: this.deps.workspaceDocument.isEncryptedWorkspace?.() === true,
         requestSync: () =>
           this.deps.workspaceDocument.syncMachineFlockDoc(this.deps.machineId, {
             reason: 'session-local-project-resolve',
@@ -4068,19 +4654,18 @@ export class SessionExecutionService {
     sessionId: SessionId,
     turnId: string | undefined,
     signal: AbortSignal
-  ): Promise<boolean> {
+  ): Promise<void> {
     const persist = this.deps.turnFinalization.persistCodeCollabTurnDiffs;
     if (!persist || !turnId) {
-      return false;
+      return;
     }
     try {
       signal.throwIfAborted();
-      return await persist(sessionId, turnId, signal);
+      await persist(sessionId, turnId, signal);
     } catch (error) {
       this.deps.logger.warn(
-        `[${sessionId}] Failed to persist Code Collab v2 turn diff evidence; not falling back to git history fileDiff: ${formatErrorMessage(error)}`
+        `[${sessionId}] Failed to persist Code Collab v2 turn diff evidence: ${formatErrorMessage(error)}`
       );
-      return true;
     }
   }
 
@@ -4093,13 +4678,6 @@ export class SessionExecutionService {
    * probes twice and rewrites the same values. `syncWorkspaceGitState` swallows
    * its own failures, so no caller needs to guard this.
    */
-  private markWorkspaceGitStateSynced(sessionId: SessionId, turnId: string): void {
-    const runtime = this.getTurnRuntime(sessionId, turnId);
-    if (runtime) {
-      runtime.workspaceGitStateSynced = true;
-    }
-  }
-
   private async syncWorkspaceGitStateOnce(
     sessionId: SessionId,
     turnId: string,
@@ -4157,9 +4735,9 @@ export class SessionExecutionService {
     sessionId: SessionId,
     turnId: string | undefined,
     signal: AbortSignal
-  ): Promise<boolean> {
+  ): Promise<void> {
     signal.throwIfAborted();
-    const codeCollabHistoryFileDiffPersisted = await this.runTurnFinalizationStage(
+    await this.runTurnFinalizationStage(
       sessionId,
       turnId ?? '',
       'persistCodeCollabTurnDiffs',
@@ -4170,7 +4748,6 @@ export class SessionExecutionService {
     await this.runTurnFinalizationStage(sessionId, turnId ?? '', 'flushSessionUsage', async () => {
       await this.deps.turnFinalization.flushSessionUsage(sessionId);
     });
-    return codeCollabHistoryFileDiffPersisted;
   }
 
   private async finalizeYieldedTurnOutput(
@@ -4223,15 +4800,7 @@ export class SessionExecutionService {
     ctx: FinalizeTurnContext,
     signal: AbortSignal
   ): Promise<void> {
-    const {
-      sessionId,
-      session,
-      sessionDoc,
-      turnId,
-      baseCommitHash,
-      turnStartWorkingTreeDiff,
-      project,
-    } = ctx;
+    const { sessionId, session, sessionDoc, turnId, project } = ctx;
     const isTurnCancelled = ctx.isTurnCancelled ?? (() => false);
     const githubProject = resolveProjectGitHubRepo(project);
     const stopIfTurnCancelled = async (stage: string): Promise<boolean> => {
@@ -4252,20 +4821,10 @@ export class SessionExecutionService {
       return true;
     };
 
-    const codeCollabHistoryFileDiffPersisted = await this.persistTurnDiffsAndFlushUsage(
-      sessionId,
-      turnId,
-      signal
-    );
+    await this.persistTurnDiffsAndFlushUsage(sessionId, turnId, signal);
 
     if (await stopIfTurnCancelled('ACP finalization')) {
       return;
-    }
-
-    let preferredStatsBaseBranch = project?.branch;
-    if (project?.kind === 'local') {
-      preferredStatsBaseBranch =
-        (await sessionDoc.getMetaState())?.baseBranch?.trim() || preferredStatsBaseBranch;
     }
 
     const branchName = await this.runTurnFinalizationStage(
@@ -4282,7 +4841,7 @@ export class SessionExecutionService {
 
     if (githubProject) {
       try {
-        const detectedPr = await this.runTurnFinalizationStage(
+        await this.runTurnFinalizationStage(
           sessionId,
           turnId,
           'detectAndAssociatePR',
@@ -4297,7 +4856,6 @@ export class SessionExecutionService {
             }),
           signal
         );
-        preferredStatsBaseBranch = detectedPr?.baseBranch ?? preferredStatsBaseBranch;
       } catch (error) {
         this.deps.logger.debug(`[${sessionId}] PR detection failed: ${formatErrorMessage(error)}`);
       }
@@ -4311,25 +4869,9 @@ export class SessionExecutionService {
       // session on the fast refresh cadence after a turn ends
       // (specs/pr-status-reconciler.md).
 
-      await this.runTurnFinalizationStage(
-        sessionId,
-        turnId,
-        'updateSessionDiffStats',
-        async () => {
-          await this.deps.turnFinalization.updateSessionDiffStats(sessionId, session, {
-            turnId,
-            baseCommitHash: baseCommitHash ?? undefined,
-            turnStartWorkingTreeDiff,
-            preferredBaseBranch: preferredStatsBaseBranch,
-            skipHistoryFileDiff: codeCollabHistoryFileDiffPersisted,
-            signal,
-          });
-          this.markWorkspaceGitStateSynced(sessionId, turnId);
-        },
-        signal
-      );
+      await this.syncWorkspaceGitStateOnce(sessionId, turnId, session, signal);
 
-      if (await stopIfTurnCancelled('diff recording')) {
+      if (await stopIfTurnCancelled('Git state synchronization')) {
         return;
       }
     }
@@ -4347,16 +4889,45 @@ export class SessionExecutionService {
     this.deps.touchSession(sessionId);
   }
 
+  private async acquireParentAdmission(
+    runtime: TurnRuntimeState,
+    doc: SessionDocument
+  ): Promise<void> {
+    if (runtime.releaseParentAdmission) return;
+    const parentId = (await doc.getMetaState())?.parentSessionId;
+    if (!parentId) return;
+    if (this.rewriteBarrierSessions.has(parentId))
+      throw new Error('Parent Session is changing; retry after it settles');
+    this.childAdmissions.set(parentId, (this.childAdmissions.get(parentId) ?? 0) + 1);
+    runtime.releaseParentAdmission = () => {
+      const remaining = (this.childAdmissions.get(parentId) ?? 1) - 1;
+      if (remaining) this.childAdmissions.set(parentId, remaining);
+      else this.childAdmissions.delete(parentId);
+    };
+    // Re-read after claiming the parent: automatic archive cannot pass its
+    // barrier until this child's actual execution owner releases the lease.
+    const parent = await this.deps.workspaceDocument.repo.getDocMeta(getSessionRoomId(parentId));
+    if (
+      parent &&
+      (isLoroRepoDocDeleted(parent) || (parent.meta as SessionMeta).isArchived === true)
+    )
+      throw new Error('Parent Session is archived');
+  }
+
   private async runVisibleSessionTurn(
     options: VisibleSessionTurnOptions,
     body: (ctx: VisibleSessionTurnContext) => Effect.Effect<void, unknown, Scope.Scope>
   ): Promise<string> {
+    const releaseAdmission = reserveMachineTurn();
+    if (!releaseAdmission) return 'execution-deferred';
     const owned = this.runVisibleSessionTurnOwned(options, body);
     this.ownedWork.add(owned);
     try {
       return await owned;
     } finally {
       this.ownedWork.delete(owned);
+      releaseAdmission();
+      daemonLossObserver.changed();
     }
   }
 
@@ -4364,6 +4935,7 @@ export class SessionExecutionService {
     options: VisibleSessionTurnOptions,
     body: (ctx: VisibleSessionTurnContext) => Effect.Effect<void, unknown, Scope.Scope>
   ): Promise<string> {
+    if (this.machineIdentityRestoreSealed) return 'identity-restore-pending';
     const { sessionId, sessionDoc, userTurnId } = options;
     const assistantEntryParentTurnId = options.assistantEntryParentTurnId ?? userTurnId;
     const span = startTraceSpan(this.deps.logger, 'execution.visible_turn', {
@@ -4393,15 +4965,64 @@ export class SessionExecutionService {
 
     const inbox = this.operationInbox;
     const invocation = options.invocation;
+    if (invocation?.inputConfig._lodyAutomation) {
+      try {
+        const gate = this.deps.encryptedExecution;
+        const evidence = gate
+          ? await Effect.runPromise(
+              gate.automationEvidence({
+                workspaceId: this.deps.workspaceId,
+                sessionId,
+                userTurnId: invocation.sourceTurnId,
+                requesterUserId: invocation.requesterUserId,
+                inputConfig: invocation.inputConfig,
+              })
+            )
+          : 'verified';
+        if (evidence === 'pending') {
+          releaseConflict();
+          span.end({ outcome: 'execution-deferred' });
+          return 'execution-deferred';
+        }
+        // Unverified input never reaches a rule; the start claim refuses it visibly.
+        if (
+          evidence === 'verified' &&
+          (!invocation.requesterUserId ||
+            !(await this.acceptAutomationInput({
+              sessionId,
+              turnId: invocation.sourceTurnId,
+              userId: invocation.requesterUserId,
+              config: invocation.inputConfig,
+            })))
+        ) {
+          releaseConflict();
+          span.end({ outcome: 'automation-admission-blocked' });
+          return 'automation-admission-blocked';
+        }
+      } catch (cause) {
+        releaseConflict();
+        span.end({ outcome: 'automation-admission-failed' });
+        throw cause;
+      }
+    }
     try {
-      if (inbox && invocation?.requesterUserId && !options.inboxBatch) {
+      if (
+        inbox &&
+        invocation?.requesterUserId &&
+        !options.inboxBatch &&
+        !invocation.inputConfig._lodyAutomation
+      ) {
         const control = await sessionDoc.getDocState();
         const receipt = control?.humanInputReceipts?.[invocation.sourceTurnId];
-        if (receipt?.userId === invocation.requesterUserId)
+        // Encrypted receipts carry a display label; the requester here is already verified.
+        if (
+          receipt &&
+          (this.deps.encryptedExecution || receipt.userId === invocation.requesterUserId)
+        )
           await this.acceptInboxHumanInput({
             sessionId,
             inputId: invocation.sourceTurnId,
-            userId: receipt.userId,
+            userId: invocation.requesterUserId,
             config: invocation.inputConfig,
           });
       }
@@ -4445,6 +5066,13 @@ export class SessionExecutionService {
     let turnId!: string;
     let runtime!: TurnRuntimeState;
     try {
+      // Recheck after every pre-owner await has finished. No await may separate
+      // this check from registration: Fleet either sees this owner or seals first.
+      // Returning before ownership leaves pending input/history and Inbox intact.
+      if (this.machineIdentityRestoreSealed) {
+        span.end({ outcome: 'identity-restore-pending' });
+        return 'identity-restore-pending';
+      }
       turnId = this.deps.beginConversationTurn(sessionId, assistantEntryParentTurnId, {
         ...(options.dispatchSource ? { dispatchSource: options.dispatchSource } : {}),
         sessionDoc,
@@ -4526,6 +5154,22 @@ export class SessionExecutionService {
         !options.inboxBatch &&
         inbox!.inputEnded(this.deps.workspaceId, sessionId, inboxInput.inputId)
       ) {
+        // A process end interrupted this input: settle it like Stop and continue once.
+        const continued = await this.continueInterruptedTurn(
+          sessionId,
+          sessionDoc,
+          userTurnId
+        ).catch((continueCause: unknown) => {
+          this.deps.logger.warn(
+            `[${sessionId}] Cannot continue interrupted input ${userTurnId}: ${formatErrorMessage(continueCause)}`
+          );
+          return false;
+        });
+        if (continued) {
+          await closeLeftoverEntry();
+          span.end({ outcome: 'inbox-input-interrupted' });
+          return 'inbox-input-ended';
+        }
         // An ended input is never admitted again (no replay), so leaving its user
         // turn pending would make dispatch select it ahead of every later message.
         await this.retireEndedInboxInputTurn(sessionId, sessionDoc, userTurnId).catch(
@@ -4678,6 +5322,7 @@ export class SessionExecutionService {
                   typeof pendingSession === 'function' ? pendingSession() : pendingSession,
                 catch: (error) => error,
               });
+              void self.clientLossRawWork.track(pending);
               runtime.pendingSession = pending;
               if (pendingOptions?.terminateOnCancel) {
                 runtime.terminateSessionOnCancel = true;
@@ -4916,18 +5561,57 @@ export class SessionExecutionService {
                           promptBlocks: promptBlocks.length,
                         },
                         async () => {
+                          const worktreeOrigin = runtime.invocation?.inputConfig._lodyAutomation;
+                          if (worktreeOrigin?.expectedHeads?.length)
+                            await verifyAutomationWorktreeHeads(
+                              worktreeOrigin,
+                              await sessionDoc.getMetaState(),
+                              activeSession
+                            );
                           const start = () => {
+                            const currentInvocation = runtime.invocation;
+                            const origin = currentInvocation?.inputConfig._lodyAutomation;
+                            if (
+                              origin &&
+                              currentInvocation &&
+                              !self.automationSubmissionGuard?.(
+                                sessionId,
+                                currentInvocation.sourceTurnId,
+                                origin,
+                                activeSession.getProviderBinding?.() ?? null
+                              )
+                            )
+                              throw new Error('AUTOMATION_ADMISSION_CHANGED');
+                            if (origin?.nativeSessionId && acpSessionId !== origin.nativeSessionId)
+                              throw new Error('AUTOMATION_NATIVE_SESSION_CHANGED');
+                            if (origin?.maintenance) {
+                              if (origin.maintenance.expiresAt <= Date.now())
+                                throw new Error('AUTOMATION_MAINTENANCE_EXPIRED');
+                              if (
+                                !activeSession
+                                  .getAcpCapabilities?.()
+                                  ?.availableCommands?.some(
+                                    (command) => command.name.replace(/^\//, '') === 'compact'
+                                  )
+                              )
+                                throw new Error('AUTOMATION_NATIVE_COMPACT_UNAVAILABLE');
+                            }
                             runtime.promptStarted = true;
                             const raw = agentClient.prompt(acpSessionId, promptBlocks, {
                               signal,
                               ...(runtime.goalControl ? { goalControl: runtime.goalControl } : {}),
                             });
+                            if (daemonLossObserver.enabled) {
+                              const rawAcp = agentClient.pendingPromptCompletion;
+                              if (rawAcp) void self.clientLossRawWork.track(rawAcp);
+                            }
                             runtime.rawPromptCompletion = raw.then(
                               () => undefined,
                               (cause) => {
                                 runtime.disconnectedTransport = isAgentDisconnectedError(cause);
                               }
                             );
+                            void self.clientLossRawWork.track(runtime.rawPromptCompletion);
                             runtime.inboxOwner?.track(runtime.rawPromptCompletion!);
                             return raw;
                           };
@@ -4978,20 +5662,20 @@ export class SessionExecutionService {
               return undefined;
             });
 
-            const claimExecution = Effect.fnUntraced(function* (): Effect.fn.Return<void, unknown> {
+            const claimExecution = Effect.fnUntraced(function* (
+              scope: () => Promise<readonly LocalProjectId[]>
+            ): Effect.fn.Return<readonly LocalProjectId[] | undefined, unknown> {
               const gate = self.deps.encryptedExecution;
               if (!gate && !self.deps.encryptedWorkspace) return undefined;
               yield* abortIfCancelled();
+              const authorized = gate && userTurnId ? yield* self.tryPromise(scope) : [];
               const result =
                 gate && userTurnId
                   ? yield* gate.claim({
                       workspaceId: self.deps.workspaceId,
                       sessionId,
                       userTurnId,
-                      localProjectId:
-                        runtime.project?.kind === 'local'
-                          ? runtime.project.localProjectId
-                          : undefined,
+                      localProjectIds: [...authorized],
                       requesterUserId: options.invocation?.requesterUserId,
                       inputConfig: options.invocation?.inputConfig,
                     })
@@ -5002,6 +5686,14 @@ export class SessionExecutionService {
               }
               if (result.state === 'claimed') {
                 executionPermit = result.permit;
+                runtime.encryptedPrincipal = result.principal;
+                runtime.encryptedOrigin = result.origin
+                  ? {
+                      requesterDevice: result.origin.requesterDevice,
+                      localProjectIds: [...authorized],
+                    }
+                  : undefined;
+                runtime.encryptedDerivations = new Set();
                 // Authorization may have yielded while Stop was requested.
                 yield* abortIfCancelled();
                 self.deps.logger.debug('[e2ee-rpc-timing]', {
@@ -5009,7 +5701,15 @@ export class SessionExecutionService {
                   userTurnId,
                   at: yield* Clock.currentTimeMillis,
                 });
-                return undefined;
+                return authorized;
+              }
+              if (result.state === 'uncertain' && userTurnId) {
+                yield* self.tryPromise(() =>
+                  self.settleUncertainEncryptedTurn(sessionId, sessionDoc, userTurnId)
+                );
+                return yield* Effect.fail(
+                  new SessionTurnClaimContended({ sessionId, turnId: runtime.turnId })
+                );
               }
               if (result.state === 'completed' && userTurnId) {
                 const backend = yield* self.tryPromise(() =>
@@ -5038,15 +5738,11 @@ export class SessionExecutionService {
                 userTurnId,
                 reason: 'turn_pre_prompt_failed',
                 message:
-                  result.state === 'uncertain'
-                    ? 'Result unknown. This encrypted turn may already have started and will not be started again. Send a new turn to continue.'
-                    : result.state === 'completed'
-                      ? 'This encrypted turn already finished and will not be started again.'
-                      : result.state === 'expired'
-                        ? 'This encrypted turn expired before execution. Send a new turn to continue.'
-                        : result.state === 'denied' && result.reason === 'e2ee_machine_not_shared'
-                          ? 'e2ee_machine_not_shared: 机器或本地项目未共享，请联系机器所有者。'
-                          : 'This encrypted turn is not authorized for execution.',
+                  result.state === 'completed'
+                    ? 'This encrypted turn already finished and will not be started again.'
+                    : result.state === 'denied' && result.reason
+                      ? encryptedRefusalMessage(result.reason)
+                      : 'This encrypted turn is not authorized for execution.',
               });
             });
 
@@ -5178,6 +5874,7 @@ export class SessionExecutionService {
       return 'cancelled';
     }
     const parsedError = parseACPError(error);
+    runtime.capacityFailure = classifyCapacityFailure(error);
     runtime.notificationOutcome = isAgentDisconnectedError(error)
       ? { kind: 'unknown', code: 'agent_disconnected' }
       : {
@@ -5220,6 +5917,40 @@ export class SessionExecutionService {
     outcome: string;
   }): Promise<void> {
     const { sessionId, sessionDoc, runtime, inbox, inboxInput, inboxBatch, outcome } = options;
+    const invocation = runtime.invocation;
+    const client = runtime.session?.agentClient;
+    const observation: SessionAutomationObservation | undefined =
+      invocation?.requesterUserId && this.automationObservations
+        ? {
+            sessionId,
+            turnId: invocation.sourceTurnId,
+            assistantTurnId: runtime.turnId,
+            userId: invocation.requesterUserId,
+            nativeSessionId: runtime.session?.acpSessionId ?? undefined,
+            binding: runtime.session?.getProviderBinding?.(),
+            modelId: client?.currentModel?.modelId,
+            outcome: runtime.cancelRequested
+              ? 'cancelled'
+              : runtime.releaseFailure
+                ? 'unknown'
+                : outcome === 'completed' && !runtime.promptFailed
+                  ? 'completed'
+                  : 'failed',
+            capacityFailure: runtime.capacityFailure,
+            inputConfig: invocation.inputConfig,
+            released: false,
+            finalized: runtime.finalizeCompleted || runtime.failureFinalized === true,
+            observedAt: Date.now(),
+            ...client?.getAutomationObservations(),
+          }
+        : undefined;
+    if (observation) {
+      try {
+        this.automationObservations?.stage(observation);
+      } catch (cause) {
+        this.deps.logger.warn('Automation turn observation could not be staged', cause);
+      }
+    }
     try {
       const withdrawn =
         inboxInput &&
@@ -5301,32 +6032,108 @@ export class SessionExecutionService {
           }
         }
       } finally {
+        if (observation && this.automationObservations) {
+          const delivery = this.automationObservations
+            .turn({
+              ...observation,
+              released: !!inboxInput && !runtime.releaseFailure,
+              outcome: runtime.releaseFailure ? 'unknown' : observation.outcome,
+            })
+            .catch((cause) =>
+              this.deps.logger.warn('Automation turn observation could not be persisted', cause)
+            );
+          this.ownedWork.add(delivery);
+          void delivery.finally(() => this.ownedWork.delete(delivery));
+        }
         for (const run of runtime.afterRelease.splice(0))
           void this.ownBookkeeping(sessionId, Promise.resolve().then(run));
         const notify = async () => {
           if (fact) await this.publishTurnOutcomeFact(fact);
         };
+        const own = (work: Promise<unknown>) => {
+          const owned = Promise.allSettled([work]);
+          this.ownedWork.add(owned);
+          void owned.then(() => {
+            this.ownedWork.delete(owned);
+            daemonLossObserver.changed();
+          });
+        };
         // Failure attention is independent of successful delivery. Never delay it on sync.
         const completion = runtime.finalizeCompleted && !runtime.releaseFailure;
-        const delivery = completion
-          ? publishTurnCompletionLegacy({
-              signal: this.completionPublicationAbort.signal,
-              completedAt,
-              sessionDoc,
-              workspaceDocument: this.deps.workspaceDocument,
-              notify: fact?.outcome.kind === 'succeeded' ? notify : async () => {},
-            }).catch((error: unknown) => {
-              this.deps.logger.warn(
-                `[${sessionId}] Turn completion publication incomplete (turnId=${runtime.turnId}): ${formatErrorMessage(error)}`
+        const publishCompletion = (settlement: 'settled' | 'interrupted', at: number) =>
+          publishTurnCompletionLegacy({
+            signal: this.completionPublicationAbort.signal,
+            completedAt: at,
+            sessionDoc,
+            workspaceDocument: this.deps.workspaceDocument,
+            notify:
+              fact?.outcome.kind !== 'succeeded'
+                ? async () => {}
+                : settlement === 'interrupted'
+                  ? () =>
+                      this.publishTurnOutcomeFact({
+                        ...fact,
+                        outcome: { kind: 'unknown', code: 'native_work_interrupted' },
+                      })
+                  : notify,
+          }).catch((error: unknown) => {
+            this.deps.logger.warn(
+              `[${sessionId}] Turn completion publication incomplete (turnId=${runtime.turnId}): ${formatErrorMessage(error)}`
+            );
+          });
+        // Agent work that outlived the Turn keeps it unfinished for its reader. The wait
+        // holds no write, so only the publication after it is owned bookkeeping.
+        const nativeWork = completion ? this.watchNativeWork(sessionId) : undefined;
+        if (nativeWork) {
+          let withdrawn = false;
+          const unregisterWithdraw = this.registerNativeWorkWithdraw(sessionId, () => {
+            withdrawn = true;
+          });
+          void awaitNativeWorkSettlementLegacy(nativeWork, this.completionPublicationAbort.signal)
+            .then((settlement) => {
+              if (
+                settlement === 'superseded' ||
+                withdrawn ||
+                this.completionPublicationAbort.signal.aborted
+              ) {
+                unregisterWithdraw();
+                return;
+              }
+              own(
+                (async () => {
+                  try {
+                    if (settlement === 'interrupted')
+                      await this.recordNativeWorkInterrupted(sessionId, runtime.turnId);
+                    if (withdrawn || this.completionPublicationAbort.signal.aborted) return;
+                    unregisterWithdraw();
+                    await publishCompletion(settlement, Math.max(completedAt, getServerNow()));
+                  } finally {
+                    unregisterWithdraw();
+                  }
+                })()
               );
             })
-          : Promise.resolve();
-        const attention = fact?.outcome.kind !== 'succeeded' ? notify() : Promise.resolve();
-        const owned = Promise.allSettled([delivery, attention]);
-        this.ownedWork.add(owned);
-        void owned.then(() => this.ownedWork.delete(owned));
+            .catch(() => {
+              // Shutdown withdrew the wait; nothing was published or written.
+              unregisterWithdraw();
+            });
+        } else if (completion) own(publishCompletion('settled', completedAt));
+        if (fact?.outcome.kind !== 'succeeded') own(notify());
       }
     }
+  }
+
+  /**
+   * The agent reported work after its Turn and its process ended first: the conversation
+   * records it, and the reader is alerted to an unknown result rather than a success.
+   */
+  private recordNativeWorkInterrupted(sessionId: SessionId, turnId: string): Promise<void> {
+    return (this.deps.recordNativeWorkInterrupted?.(sessionId, turnId) ?? Promise.resolve()).catch(
+      (cause: unknown) =>
+        this.deps.logger.warn(
+          `[${sessionId}] Failed to record interrupted background work: ${formatErrorMessage(cause)}`
+        )
+    );
   }
 
   /** Freeze provenance once the exact input is available; never changes authorization. */
@@ -5427,6 +6234,7 @@ export class SessionExecutionService {
     const currentTurnId = this.currentTurnBySession.get(sessionId);
     if (!turnId || currentTurnId === turnId) {
       this.currentTurnBySession.delete(sessionId);
+      daemonLossObserver.changed();
       const releasedTurnId = turnId ?? currentTurnId;
       if (releasedTurnId && this.turnRuntimeBySession.get(sessionId)?.turnId !== releasedTurnId) {
         this.resolveTurnReleaseWaiters(sessionId, releasedTurnId);
@@ -5458,7 +6266,7 @@ export class SessionExecutionService {
     backend: SessionBackend,
     userTurnId: string,
     status: 'pending' | 'seen' | 'processing' | 'handled' | 'failed' | 'canceled',
-    cancellationReason?: 'user_stop'
+    cancellationReason?: 'user_stop' | 'machine_update'
   ): Promise<boolean> {
     let matched = false;
     await backend
@@ -5517,7 +6325,8 @@ export class SessionExecutionService {
       userTurnId,
       status,
       status === 'canceled'
-        ? this.getInboxInputCancellationReason(sessionId, userTurnId)
+        ? (this.getInboxInputCancellationReason(sessionId, userTurnId) ??
+            machineTurnInterruptionReason())
         : undefined
     );
     if (!matched) {
@@ -5559,6 +6368,50 @@ export class SessionExecutionService {
     return this.turnRuntimeBySession.get(sessionId)?.userTurnId;
   }
 
+  /**
+   * Encrypted only: the verified principal of the active turn driving `sourceTurnId`.
+   * After write authorization, reserve one slot per request; identical retries reuse it. Past the
+   * bound, new requests fail closed; accepted IDs can retry within the same turn.
+   */
+  reserveEncryptedDerivation(
+    sessionId: SessionId,
+    sourceTurnId: string,
+    requestId: string
+  ): { kind: 'owner' } | { kind: 'member' } | undefined {
+    const runtime = this.readInvokingRuntime(sessionId);
+    if (!runtime || runtime.cancelRequested || runtime.invocation?.sourceTurnId !== sourceTurnId)
+      return undefined;
+    if (runtime.encryptedPrincipal === 'owner') return { kind: 'owner' };
+    if (
+      (runtime.encryptedPrincipal !== 'member' && runtime.encryptedPrincipal !== 'derived') ||
+      !runtime.encryptedOrigin
+    )
+      return undefined;
+    if (!requestId) return undefined;
+    const used = (runtime.encryptedDerivations ??= new Set<string>());
+    if (!used.has(requestId) && used.size >= MAX_DERIVED_TURNS_PER_ORIGIN) return undefined;
+    used.add(requestId);
+    return { kind: 'member' };
+  }
+
+  /** Encrypted agent control acts as the turn's verified principal and its projects. */
+  getEncryptedControlPrincipal(
+    sessionId: SessionId
+  ):
+    | { kind: 'owner' }
+    | { kind: 'member'; requesterDevice: string; localProjectIds: readonly string[] }
+    | undefined {
+    const runtime = this.readInvokingRuntime(sessionId);
+    if (!runtime || runtime.cancelRequested) return undefined;
+    if (runtime.encryptedPrincipal === 'owner') return { kind: 'owner' };
+    if (
+      (runtime.encryptedPrincipal === 'member' || runtime.encryptedPrincipal === 'derived') &&
+      runtime.encryptedOrigin
+    )
+      return { kind: 'member', ...runtime.encryptedOrigin };
+    return undefined;
+  }
+
   getActiveInvocationContext(sessionId: SessionId):
     | {
         requesterUserId: string;
@@ -5566,15 +6419,28 @@ export class SessionExecutionService {
         inputConfig: SessionTurnInputConfig;
         notificationOriginTurnIds: string[];
         notificationProvenancePending?: boolean;
+        sender?: { kind: 'user' } | { kind: 'agent'; sessionId: SessionId };
       }
     | undefined {
-    const runtime = this.turnRuntimeBySession.get(sessionId);
+    const runtime = this.readInvokingRuntime(sessionId);
     if (
       !runtime ||
       runtime.cancelRequested ||
       runtime.releaseFailure ||
       (runtime.inboxOwner?.input &&
         this.isInboxInputCanceled(sessionId, runtime.inboxOwner?.input.inputId))
+    ) {
+      return undefined;
+    }
+    // In encrypted workspaces the history row's userId is unauthenticated display
+    // data and never authority. Derived work from an owner turn keeps today's
+    // behavior; from a shared member's turn it is re-authorized as that member when
+    // written and when it starts. Unclaimed turns expose no invocation identity.
+    if (
+      (this.deps.encryptedExecution || this.deps.encryptedWorkspace) &&
+      runtime.encryptedPrincipal !== 'owner' &&
+      runtime.encryptedPrincipal !== 'member' &&
+      runtime.encryptedPrincipal !== 'derived'
     ) {
       return undefined;
     }
@@ -5586,6 +6452,16 @@ export class SessionExecutionService {
       requesterUserId: invocation.requesterUserId,
       sourceTurnId: invocation.sourceTurnId,
       inputConfig: invocation.inputConfig,
+      ...(invocation.notificationAudience?.kind === 'user'
+        ? { sender: { kind: 'user' as const } }
+        : invocation.notificationAudience?.kind === 'agent'
+          ? {
+              sender: {
+                kind: 'agent' as const,
+                sessionId: invocation.notificationAudience.sessionId,
+              },
+            }
+          : {}),
       notificationOriginTurnIds: this.notificationOrigins(runtime),
       ...((!invocation.notificationAudience ||
         invocation.notificationAudience.kind === 'unknown') &&
@@ -5664,9 +6540,84 @@ export class SessionExecutionService {
     }
   }
 
-  private async getSessionHistory(sessionDoc: SessionDocument): Promise<SessionHistoryInput[]> {
+  private async getSessionHistoryQuery(sessionDoc: SessionDocument) {
     const backend = await this.getSessionBackend(sessionDoc, sessionDoc.sessionId);
-    return await backend.readHistory();
+    return await backend.readHistoryQuery();
+  }
+
+  private async buildHistoryReplay(
+    sessionDoc: SessionDocument,
+    excludeTurnId?: string
+  ): Promise<ReplayPromptResult> {
+    const backend = await this.getSessionBackend(sessionDoc, sessionDoc.sessionId);
+    if (backend.readHistoryReplay) return backend.readHistoryReplay(excludeTurnId);
+    const builder = await backend.foldHistory(
+      () => createReplayPromptBuilder({ excludeTurnId }),
+      (state, entry) => state.add(entry)
+    );
+    return builder.finish();
+  }
+
+  /**
+   * Create dispatch has no `meta.acpSessionId`, but that does not prove the
+   * conversation is empty: a first start can fail during process startup.
+   * Replay is best-effort. Wait briefly for earlier turns, but if the mirror or
+   * backend cannot provide them, start the requested turn without replay rather
+   * than blocking a session that otherwise could run.
+   */
+  private hasPriorCreateHistory(
+    meta: SessionMeta | undefined,
+    userTurnId: string | undefined
+  ): boolean {
+    if (!meta) return false;
+    if ((meta.externalHistory?.importedTurnCount ?? 0) > 0) return true;
+    return [meta.lastHandledUserMsgId, meta.processingUserMsgId, meta.latestUserMsgId].some(
+      (turnId) => !!turnId && turnId !== userTurnId
+    );
+  }
+
+  private async buildCreateHistoryReplay(args: {
+    sessionId: SessionId;
+    sessionDoc: SessionDocument;
+    userTurnId?: string;
+    meta?: SessionMeta;
+  }): Promise<ReplayPromptResult | undefined> {
+    const { sessionId, sessionDoc, userTurnId, meta } = args;
+    if (!userTurnId || !this.hasPriorCreateHistory(meta, userTurnId)) {
+      return undefined;
+    }
+
+    try {
+      const replayHistory = await this.waitForReplayableHistory({
+        sessionId,
+        sessionDoc,
+        excludeTurnId: userTurnId,
+      });
+      const hasReplayableEntry = replayHistory.some(
+        (entry) =>
+          !isReplayEntryExcluded(entry, userTurnId) &&
+          (entry.role === 'user' || entry.role === 'assistant')
+      );
+      if (!hasReplayableEntry) {
+        this.deps.logger.warn(
+          `[${sessionId}] Continuing create without history replay; prior turns were expected but none are replayable`
+        );
+        return undefined;
+      }
+      const replay = await this.buildHistoryReplay(sessionDoc, userTurnId);
+      if (replay.stats.messagesIncluded === 0) {
+        this.deps.logger.warn(
+          `[${sessionId}] Continuing create without history replay; replay contained no messages`
+        );
+        return undefined;
+      }
+      return replay;
+    } catch (error) {
+      this.deps.logger.warn(
+        `[${sessionId}] Continuing create without history replay: ${formatErrorMessage(error)}`
+      );
+      return undefined;
+    }
   }
 
   private async getSessionBackend(
@@ -5695,17 +6646,20 @@ export class SessionExecutionService {
     sessionDoc: SessionDocument;
     excludeTurnId?: string;
     timeoutMs?: number;
-  }): Promise<SessionHistoryInput[]> {
+  }): Promise<Awaited<ReturnType<SessionExecutionService['getSessionHistoryQuery']>>> {
     // Mirrors what `buildReplayPromptFromHistory` counts: system notices are
     // skipped there, so waiting must not treat a synced failure notice as
     // proof that the conversation arrived.
-    const hasReplayableEntry = (history: SessionHistoryInput[]): boolean =>
+    const hasReplayableEntry = (
+      history: Awaited<ReturnType<SessionExecutionService['getSessionHistoryQuery']>>
+    ): boolean =>
       history.some(
         (entry) =>
-          entry.id !== args.excludeTurnId && (entry.role === 'user' || entry.role === 'assistant')
+          !isReplayEntryExcluded(entry, args.excludeTurnId) &&
+          (entry.role === 'user' || entry.role === 'assistant')
       );
 
-    let latest = await this.getSessionHistory(args.sessionDoc);
+    let latest = await this.getSessionHistoryQuery(args.sessionDoc);
     if (hasReplayableEntry(latest)) {
       return latest;
     }
@@ -5715,14 +6669,18 @@ export class SessionExecutionService {
 
     const timeoutMs = args.timeoutMs ?? REPLAYABLE_HISTORY_SYNC_TIMEOUT_MS;
     const startedAtMs = Date.now();
-    return await new Promise<SessionHistoryInput[]>((resolve) => {
+    return await new Promise<
+      Awaited<ReturnType<SessionExecutionService['getSessionHistoryQuery']>>
+    >((resolve) => {
       let settled = false;
       let checking = false;
       let recheckRequested = false;
       let unsubscribe: (() => void) | undefined;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
-      const finish = (history: SessionHistoryInput[]): void => {
+      const finish = (
+        history: Awaited<ReturnType<SessionExecutionService['getSessionHistoryQuery']>>
+      ): void => {
         if (settled) {
           return;
         }
@@ -5747,7 +6705,7 @@ export class SessionExecutionService {
           try {
             do {
               recheckRequested = false;
-              const next = await this.getSessionHistory(args.sessionDoc);
+              const next = await this.getSessionHistoryQuery(args.sessionDoc);
               if (settled) {
                 return;
               }
@@ -5889,6 +6847,7 @@ export class SessionExecutionService {
     await this.setTerminalUserTurnStatus(sessionId, sessionDoc, userTurnId, 'failed');
     await this.upsertSessionMeta(sessionId, {
       lastHandledUserMsgId: userTurnId,
+      lastFailedUserMsgId: userTurnId,
       processingUserMsgId: undefined,
     });
   }
@@ -5903,6 +6862,100 @@ export class SessionExecutionService {
       project: meta?.project,
       fallbackBranch: this.deps.preferredBaseBranch,
     });
+  }
+
+  /** The session manager rereads Project groups and parents; each read must stay in scope. */
+  private encryptedInputGuard(
+    authorized: readonly LocalProjectId[]
+  ): NonNullable<SessionConfig['authorizeExecutionInputs']> {
+    return (input) =>
+      this.assertEncryptedScopeWithin(authorized, {
+        projects: [input.project],
+        projectRuns: [input.projectRun],
+        live: null,
+      });
+  }
+
+  /** Refuse a start whose directories were changed after authorization. */
+  private async assertEncryptedScopeWithin(
+    authorized: readonly LocalProjectId[],
+    input: Parameters<SessionExecutionService['encryptedExecutionScope']>[0]
+  ): Promise<void> {
+    const allowed = new Set(authorized);
+    if ((await this.encryptedExecutionScope(input)).some((id) => !allowed.has(id)))
+      throw new Error('e2ee_machine_not_shared: the execution scope changed after authorization');
+  }
+
+  /**
+   * Encrypted sharing authorizes the local projects a turn can reach, resolved here
+   * from machine state, never from the request alone. The live process's own config,
+   * synced metadata, the request, a parent Session and Project group members are
+   * united: an extra source can only add a project to check, never remove one the
+   * machine will use. Directories come from this machine's registry by ID; no
+   * requested path is accepted. An empty result is a projectless conversation.
+   */
+  /** The encrypted sharing scope of an existing session, read from this machine's state. */
+  async encryptedSessionExecutionScope(sessionId: SessionId): Promise<LocalProjectId[]> {
+    const meta = await (
+      await this.deps.workspaceDocument.getOrCreateSessionDoc(sessionId)
+    ).getMetaState();
+    return await this.encryptedExecutionScope({
+      projects: [meta ? this.resolveProjectFromMeta(meta) : undefined],
+      projectRuns: [meta?.projectRun],
+      parentSessionId: meta?.parentSessionId,
+      live: this.deps.sessionManager.getSession(sessionId),
+    });
+  }
+
+  private async encryptedExecutionScope(input: {
+    projects: readonly (ProjectRef | undefined)[];
+    projectRuns: readonly (SessionProjectRun | undefined)[];
+    parentSessionId?: SessionId;
+    live: ISession | null | undefined;
+  }): Promise<LocalProjectId[]> {
+    const projects = [...input.projects];
+    const runs = [...input.projectRuns];
+    const own = input.live?.getExecutionScope?.();
+    projects.push(own?.project);
+    runs.push(own?.projectRun);
+    const parentSessionId =
+      input.parentSessionId ?? own?.parentSessionId ?? input.live?.getParentSessionId();
+    if (parentSessionId) {
+      // A child Tab runs in its parent's directories.
+      const parent = this.deps.sessionManager.getSession(parentSessionId)?.getExecutionScope?.();
+      const parentMeta = await (
+        await this.deps.workspaceDocument.getOrCreateSessionDoc(parentSessionId)
+      ).getMetaState();
+      projects.push(parent?.project, this.resolveProjectFromMeta(parentMeta));
+      runs.push(parent?.projectRun, parentMeta?.projectRun);
+    }
+    const ids = new Set<LocalProjectId>();
+    for (const project of projects) if (project?.kind === 'local') ids.add(project.localProjectId);
+    const preferLocal = new Set<string>();
+    for (const run of runs)
+      for (const member of Object.values(run?.members ?? {})) {
+        if (member.src.kind === 'local' && member.src.machineId === this.deps.machineId)
+          ids.add(member.src.localProjectId);
+        if (
+          member.repositoryCheckout?.kind === 'local' &&
+          member.repositoryCheckout.machineId === this.deps.machineId
+        )
+          ids.add(member.repositoryCheckout.localProjectId);
+        // An unpinned repository Member may use any local copy of that repository.
+        if (member.src.kind === 'github' && member.src.preferLocal)
+          preferLocal.add(member.src.repoFullName.toLowerCase());
+      }
+    if (preferLocal.size) {
+      const local = await readMachineLocalProjects(
+        this.deps.workspaceDocument.repo,
+        this.deps.workspaceId,
+        this.deps.machineId as MachineId
+      );
+      for (const row of Object.values(local))
+        if (row.githubRepoFullName && preferLocal.has(row.githubRepoFullName.toLowerCase()))
+          ids.add(row.id);
+    }
+    return [...ids].sort();
   }
 
   private resolveProjectFromMeta(
@@ -5969,10 +7022,46 @@ export class SessionExecutionService {
     return { kind: 'github', repoFullName, branch };
   }
 
+  /** Encrypted starts run as the verified signer; a row's `userId` stays display data. */
+  private async verifiedRequesterUserId(
+    sessionId: string,
+    userTurnId: string | undefined,
+    inputConfig: unknown
+  ): Promise<string | undefined> {
+    const gate = this.deps.encryptedExecution;
+    if (!gate?.resolveRequester || !userTurnId) return undefined;
+    const requester = await Effect.runPromise(
+      gate.resolveRequester({
+        workspaceId: this.deps.workspaceId,
+        sessionId,
+        userTurnId,
+        inputConfig,
+      })
+    ).catch(() => undefined);
+    return requester && 'userId' in requester ? requester.userId : undefined;
+  }
+
+  private async withVerifiedRequester<
+    T extends { sessionId: string; userTurnId?: string; userId: string; acpSessionConfig: unknown },
+  >(message: T): Promise<T> {
+    const userId = await this.verifiedRequesterUserId(
+      message.sessionId,
+      message.userTurnId,
+      message.acpSessionConfig
+    );
+    return userId ? { ...message, userId } : message;
+  }
+
   async continueSession(
-    message: SessionChatRequestValidated,
+    rawMessage: SessionChatRequestValidated,
     dispatchOptions?: SessionDispatchOptions
   ): Promise<void> {
+    if (this.machineIdentityRestoreSealed) return;
+    const message =
+      dispatchOptions?.dispatchSource === 'inbox'
+        ? rawMessage
+        : await this.withVerifiedRequester(rawMessage);
+    if (this.machineIdentityRestoreSealed) return;
     if (
       dispatchOptions?.dispatchSource === 'inbox' &&
       (!dispatchOptions.inboxBatch || !this.operationInbox)
@@ -5980,6 +7069,7 @@ export class SessionExecutionService {
       throw new Error('INBOX_BATCH_REQUIRED');
     }
     const turn = await this.prepareContinueSessionTurn(message, dispatchOptions);
+    if (this.machineIdentityRestoreSealed) return;
     if (
       dispatchOptions?.dispatchSource !== 'inbox' &&
       (await this.markCancelledUserTurnBeforeOwner({
@@ -6014,6 +7104,8 @@ export class SessionExecutionService {
     prepareOptions?: { sessionDoc?: SessionDocument }
   ): Promise<VisibleSessionTurnPlan> {
     const { sessionId, acpSessionConfig, userId, userName, userEmail, userTurnId } = message;
+    const requiredNativeSessionId =
+      normalizeSessionTurnInputConfig(acpSessionConfig)?._lodyAutomation?.nativeSessionId;
     // System-caused turns own an assistant entry, not a user dispatch pointer.
     const executionUserTurnId =
       dispatchOptions?.dispatchSource === 'inbox' || dispatchOptions?.dispatchSource === 'goal'
@@ -6031,6 +7123,8 @@ export class SessionExecutionService {
       message.project?.kind === 'local' ? undefined : message.project?.branch?.trim();
     let session = this.deps.sessionManager.getSession(sessionId);
     let project: ProjectRef | undefined = message.project;
+    // Encrypted turns start from the metadata they were authorized with, never a later read.
+    let authorized: { ids: readonly LocalProjectId[]; meta: SessionMeta | undefined } | undefined;
     const acpReplaySuppression = this.createAcpReplaySuppressionResource(sessionId);
 
     let replayPromptResult: ReplayPromptResult | null = null;
@@ -6054,7 +7148,17 @@ export class SessionExecutionService {
     const restoreMissingSession = Effect.fnUntraced(function* (
       ctx: VisibleSessionTurnContext
     ): Effect.fn.Return<ISession, unknown, Scope.Scope> {
-      const meta = yield* self.tryPromise(() => sessionDoc.getMetaState());
+      const current = yield* self.tryPromise(() => sessionDoc.getMetaState());
+      const frozen = authorized?.meta;
+      const meta: SessionMeta | undefined =
+        authorized && current
+          ? {
+              ...current,
+              project: frozen?.project,
+              projectRun: frozen?.projectRun,
+              parentSessionId: frozen?.parentSessionId,
+            }
+          : current;
       project = project ?? self.resolveProjectFromMeta(meta, message.project?.branch);
       const localProjectId = project?.kind === 'local' ? project.localProjectId : undefined;
       const restoreWorkdir = localProjectId
@@ -6123,6 +7227,12 @@ export class SessionExecutionService {
       const requestedResumeSessionId = acpSessionConfig.resume;
       const storedResumeSessionId = resolveResumableAcpSessionId(meta);
       const resumeSessionId = requestedResumeSessionId ?? storedResumeSessionId;
+      if (
+        requiredNativeSessionId &&
+        (storedResumeSessionId !== requiredNativeSessionId ||
+          resumeSessionId !== requiredNativeSessionId)
+      )
+        return yield* Effect.fail(new Error('AUTOMATION_NATIVE_SESSION_CHANGED'));
       const resumeSource = requestedResumeSessionId
         ? 'request'
         : storedResumeSessionId
@@ -6195,6 +7305,18 @@ export class SessionExecutionService {
         },
       };
 
+      if (authorized) {
+        const allowed = authorized.ids;
+        yield* self.tryPromise(() =>
+          self.assertEncryptedScopeWithin(allowed, {
+            projects: [project],
+            projectRuns: [restoreConfig.projectRun],
+            parentSessionId: restoreConfig.parentSessionId,
+            live: null,
+          })
+        );
+        restoreConfig.authorizeExecutionInputs = self.encryptedInputGuard(allowed);
+      }
       const restoreAttempt = Effect.gen(function* () {
         if (resumeSessionId) {
           yield* acpReplaySuppression.acquire;
@@ -6212,6 +7334,7 @@ export class SessionExecutionService {
               () =>
                 self.deps.sessionManager.createSession(restoreConfig, {
                   resumeSessionId,
+                  requireExactResume: !!requiredNativeSessionId,
                 }),
               { terminateOnCancel: true }
             ),
@@ -6223,6 +7346,8 @@ export class SessionExecutionService {
         yield* ctx.abortIfCancelled({ terminateSession: true });
         const requested = resumeSessionId;
         const actual = restoredSession.acpSessionId ?? null;
+        if (requiredNativeSessionId && actual !== requiredNativeSessionId)
+          return yield* Effect.fail(new Error('AUTOMATION_NATIVE_RESUME_UNCONFIRMED'));
         if (requested) {
           self.deps.logger.debug(
             `[${sessionId}] Session restore result (requestedAcpSessionId=${requested} actualAcpSessionId=${actual ?? 'null'} resumed=${actual === requested ? 'yes' : 'no'})`
@@ -6237,13 +7362,10 @@ export class SessionExecutionService {
           // to resume, even though the user turn is durable in Loro history.
           // This freshly created ACP session has no knowledge of that turn,
           // so reconstruct its context before sending the current request.
-          const history = self.getSessionHistory(sessionDoc);
-          const historySnapshot = yield* self.tryPromise(() => history);
-          if (historySnapshot.length > 0) {
-            replayPromptResult = buildReplayPromptFromHistory({
-              history: historySnapshot,
-              excludeTurnId: message.userTurnId,
-            });
+          {
+            replayPromptResult = yield* self.tryPromise(() =>
+              self.buildHistoryReplay(sessionDoc, message.userTurnId)
+            );
             if (replayPromptResult.stats.messagesIncluded > 0) {
               usedHistoryReplay = true;
               self.deps.logger.debug(
@@ -6261,6 +7383,7 @@ export class SessionExecutionService {
         Effect.catch((error) =>
           Effect.gen(function* () {
             yield* ctx.abortIfCancelled();
+            if (requiredNativeSessionId) return yield* Effect.fail(error);
             const errMessage = formatErrorMessage(error);
             const lowerMessage = errMessage.toLowerCase();
             const isAcpResumeError =
@@ -6296,10 +7419,9 @@ export class SessionExecutionService {
               );
               const fallbackReplay =
                 replayHistory.length > 0
-                  ? buildReplayPromptFromHistory({
-                      history: replayHistory,
-                      excludeTurnId: message.userTurnId,
-                    })
+                  ? yield* self.tryPromise(() =>
+                      self.buildHistoryReplay(sessionDoc, message.userTurnId)
+                    )
                   : null;
 
               if (!fallbackReplay || fallbackReplay.stats.messagesIncluded === 0) {
@@ -6404,10 +7526,10 @@ export class SessionExecutionService {
       ctx: VisibleSessionTurnContext
     ): Effect.fn.Return<void, unknown, Scope.Scope> {
       const { turnId, runtime, abortIfCancelled, openAssistantEntry, prompt } = ctx;
+      if (requiredNativeSessionId && readySession.acpSessionId !== requiredNativeSessionId)
+        yield* Effect.fail(new Error('AUTOMATION_NATIVE_SESSION_CHANGED'));
       let activeSession = readySession;
       let staleAcpPromptRecoveryAttempted = false;
-      let baseCommitHash: string | null = null;
-      let turnStartWorkingTreeDiff: GitWorkingTreeDiffBaseline | null = null;
 
       // A requester switch re-derives commit identity for this turn only;
       // the bounded policy lookup falls back to owner rules on failure.
@@ -6441,8 +7563,10 @@ export class SessionExecutionService {
           { sessionId, turnId, inputBlocks: sessionInputBlocks.length },
           async () =>
             await self.deps.buildAcpPromptBlocks({
+              requesterUserId: message.userId,
               workspaceId: message.workspaceId,
               sessionId,
+              userTurnId: message.userTurnId,
               inputBlocks: sessionInputBlocks,
               issuePRMentions: acpSessionConfig.issuePRMentions,
               replayPromptText:
@@ -6460,8 +7584,8 @@ export class SessionExecutionService {
         if (!usedHistoryReplay || !replayPromptResult) {
           return undefined;
         }
-        const history = yield* self.tryPromise(() => self.getSessionHistory(sessionDoc));
-        if (hasRecentResumeNotice(history)) {
+        const history = yield* self.tryPromise(() => self.getSessionHistoryQuery(sessionDoc));
+        if (hasRecentResumeNotice(history as SessionHistoryInput[])) {
           return undefined;
         }
 
@@ -6503,7 +7627,7 @@ export class SessionExecutionService {
 
       const applyPromptConfig = (
         targetSession: ISession,
-        triggerReason: 'initial' | 'stale_acp_recovery'
+        triggerReason: 'initial' | 'stale_acp_recovery' | 'owner_change'
       ): Effect.Effect<void, unknown, never> =>
         self.tryPromise((signal) =>
           traceAsync(
@@ -6526,49 +7650,34 @@ export class SessionExecutionService {
           )
         );
 
-      const validatePromptCredentials = Effect.fnUntraced(function* (
+      const validatePromptCredentials = (
         targetSession: ISession,
-        triggerReason: 'initial' | 'stale_acp_recovery'
-      ): Effect.fn.Return<void, unknown, never> {
-        // Validate this runtime's owner-bound authority before submitting a turn.
-        yield* self.tryPromise(() =>
+        triggerReason: 'initial' | 'stale_acp_recovery' | 'owner_change'
+      ) =>
+        self.tryPromise(() =>
           traceAsync(
             self.deps.logger,
             'execution.validate_credentials',
             { sessionId, turnId, triggerReason },
-            async () =>
-              await self.deps.sessionManager.validateSessionCredentials(targetSession, userId)
+            () =>
+              self.deps.sessionManager.validateSessionCredentials(
+                targetSession,
+                userId,
+                triggerReason === 'initial' ? 'replace-before-prompt' : undefined
+              )
           )
         );
-        return undefined;
-      });
 
-      const capturePromptBaseline = Effect.fnUntraced(function* (
-        targetSession: ISession,
-        triggerReason: 'initial' | 'stale_acp_recovery'
-      ): Effect.fn.Return<void, unknown, never> {
-        const workdir = targetSession.getWorkdir();
-        const runGit: GitRunner = (args) => targetSession.exec('git', args, workdir, false);
-        baseCommitHash = yield* self.tryPromise(() =>
-          traceAsync(
-            self.deps.logger,
-            'execution.get_base_commit_hash',
-            { sessionId, turnId, triggerReason },
-            async () => await getCurrentCommitHash(runGit)
-          )
-        );
-        turnStartWorkingTreeDiff = yield* self.tryPromise(() =>
-          traceAsync(
-            self.deps.logger,
-            'execution.capture_worktree_diff_baseline',
-            { sessionId, turnId, triggerReason },
-            async () => await captureGitWorkingTreeDiffBaseline(runGit)
-          )
-        );
-        runtime.project = project;
-        runtime.baseCommitHash = baseCommitHash;
-        runtime.turnStartWorkingTreeDiff = turnStartWorkingTreeDiff;
-        return undefined;
+      const restoreRetiredSession = Effect.fnUntraced(function* () {
+        runtime.cancellationDrain = undefined;
+        session = null;
+        runtime.session = undefined;
+        runtime.pendingSession = undefined;
+        yield* abortIfCancelled();
+        const replacement = yield* restoreMissingSession(ctx);
+        bindReadySession(replacement);
+        yield* acpReplaySuppression.release;
+        return replacement;
       });
 
       // Inbox has already crossed its durable start fence before prompt submission.
@@ -6615,18 +7724,18 @@ export class SessionExecutionService {
                 self.deps.sessionManager.retireSessionForReconfiguration(activeSession)
               );
               runtime.disconnectedTransport = false;
-              runtime.cancellationDrain = undefined;
-              session = null;
-              runtime.session = undefined;
-              runtime.pendingSession = undefined;
-
-              const restoredSession = yield* restoreMissingSession(ctx);
-              bindReadySession(restoredSession);
-              yield* acpReplaySuppression.release;
+              const restoredSession = yield* restoreRetiredSession();
+              self.deps.setSessionActivePresencePhase(sessionId, 'thinking');
+              yield* self.tryPromise(() => sessionDoc.setStatus(SessionStatusFactory.running()));
+              self.captureStatusChanged(sessionId, 'running', undefined, 'stale_acp_recovery');
+              self.scheduleLiveActivitySummarySync(userId, {
+                sessionId,
+                triggerReason: 'stale_acp_recovery',
+                status: 'running',
+              });
               yield* applyPromptConfig(restoredSession, 'stale_acp_recovery');
               yield* maybeRecordHistoryReplayNotice();
               yield* validatePromptCredentials(restoredSession, 'stale_acp_recovery');
-              yield* capturePromptBaseline(restoredSession, 'stale_acp_recovery');
 
               let retryPromptBlocks = promptBlocks;
               if (usedHistoryReplay && !hadHistoryReplay && replayPromptResult?.promptText) {
@@ -6661,12 +7770,20 @@ export class SessionExecutionService {
 
       yield* abortIfCancelled();
 
-      const promptBlocks = yield* self.tryPromise(() => promptBlocksPromise);
+      let promptBlocks = yield* self.tryPromise(() => promptBlocksPromise);
 
       yield* abortIfCancelled();
 
-      yield* validatePromptCredentials(activeSession, 'initial');
-      yield* capturePromptBaseline(activeSession, 'initial');
+      const ownerChanged =
+        (yield* validatePromptCredentials(activeSession, 'initial')) === 'retired';
+      if (ownerChanged) {
+        const replacement = yield* restoreRetiredSession();
+        yield* applyPromptConfig(replacement, 'owner_change');
+        yield* maybeRecordHistoryReplayNotice();
+        promptBlocks = yield* self.tryPromise(buildPromptBlocksForCurrentResumeState);
+        yield* validatePromptCredentials(replacement, 'owner_change');
+      }
+      runtime.project = project;
 
       yield* abortIfCancelled();
 
@@ -6674,7 +7791,9 @@ export class SessionExecutionService {
 
       yield* abortIfCancelled();
 
-      yield* promptWithStaleACPRecovery(promptBlocks);
+      // The owner handoff permits one submission. A disconnect after that handoff
+      // cannot establish that the replacement did not consume the prompt.
+      yield* ownerChanged ? prompt(promptBlocks) : promptWithStaleACPRecovery(promptBlocks);
 
       const completedTurnId = runtime.turnId;
       const completedUserTurnId = runtime.userTurnId ?? executionUserTurnId;
@@ -6713,8 +7832,6 @@ export class SessionExecutionService {
               session: activeSession,
               sessionDoc,
               turnId: completedTurnId,
-              baseCommitHash,
-              turnStartWorkingTreeDiff,
               project,
               producedOutput,
               isTurnCancelled: () => self.isTurnCancelled(sessionId, completedTurnId),
@@ -6812,7 +7929,19 @@ export class SessionExecutionService {
       body: (ctx) =>
         Effect.gen(function* () {
           ctx.setUnhandledErrorContext(turnErrorContext);
-          yield* ctx.claimExecution();
+          let scopedMeta: SessionMeta | undefined;
+          const authorizedIds = yield* ctx.claimExecution(async () => {
+            const meta = await sessionDoc.getMetaState();
+            scopedMeta = meta;
+            return self.encryptedExecutionScope({
+              projects: [message.project, self.resolveProjectFromMeta(meta)],
+              projectRuns: [meta?.projectRun],
+              parentSessionId: meta?.parentSessionId,
+              live: self.deps.sessionManager.getSession(sessionId),
+            });
+          });
+          if (authorizedIds) authorized = { ids: authorizedIds, meta: scopedMeta };
+          yield* self.tryPromise(() => self.acquireParentAdmission(ctx.runtime, sessionDoc));
           const memoryPressureResult = yield* self.tryPromise(() =>
             self.evictForTurnStart(sessionId)
           );
@@ -6844,10 +7973,13 @@ export class SessionExecutionService {
           self.captureStatusChanged(sessionId, 'initializing', undefined, 'chat_dispatch');
 
           let readySession = session;
+          // MCP servers are mounted at ACP startup. Replace between prompts so the
+          // driving turn's selection takes effect without hot-loading a busy agent.
           if (
             readySession &&
-            JSON.stringify(readySession.getMemoryBinding?.() ?? null) !==
-              JSON.stringify(acpSessionConfig.memory ?? null)
+            (mcpSelectionChanged(readySession, acpSessionConfig) ||
+              JSON.stringify(readySession.getMemoryBinding?.() ?? null) !==
+                JSON.stringify(acpSessionConfig.memory ?? null))
           ) {
             yield* ctx.abortIfCancelled();
             const previousSession = readySession;
@@ -6942,10 +8074,14 @@ export class SessionExecutionService {
   }
 
   async startSession(
-    message: SessionCreateRequestValidated,
+    rawMessage: SessionCreateRequestValidated,
     dispatchOptions?: SessionDispatchOptions
   ): Promise<void> {
+    if (this.machineIdentityRestoreSealed) return;
+    const message = await this.withVerifiedRequester(rawMessage);
+    if (this.machineIdentityRestoreSealed) return;
     const turn = await this.prepareStartSessionTurn(message, dispatchOptions);
+    if (this.machineIdentityRestoreSealed) return;
     const userTurnId =
       typeof message.userTurnId === 'string' && message.userTurnId.trim()
         ? message.userTurnId.trim()
@@ -7178,7 +8314,19 @@ export class SessionExecutionService {
       }) =>
         Effect.gen(function* () {
           setUnhandledErrorContext(turnErrorContext);
-          yield* claimExecution();
+          const scopeInputs = () => ({
+            projects: [
+              project,
+              existingMeta ? self.resolveProjectFromMeta(existingMeta) : undefined,
+            ],
+            projectRuns: [sessionConfig.projectRun, existingMeta?.projectRun, message.projectRun],
+            parentSessionId: message.parentSessionId ?? existingMeta?.parentSessionId,
+            live: self.deps.sessionManager.getSession(sessionId),
+          });
+          const authorizedIds = yield* claimExecution(() =>
+            self.encryptedExecutionScope(scopeInputs())
+          );
+          yield* self.tryPromise(() => self.acquireParentAdmission(runtime, sessionDoc));
           const memoryPressureResult = yield* self.tryPromise(() =>
             self.evictForTurnStart(sessionId)
           );
@@ -7202,6 +8350,15 @@ export class SessionExecutionService {
             unhandledErrorContext: turnErrorContext,
           });
 
+          yield* abortIfCancelled();
+          const replayPromptResult = yield* self.tryPromise(() =>
+            self.buildCreateHistoryReplay({
+              sessionId,
+              sessionDoc,
+              userTurnId,
+              meta: existingMeta,
+            })
+          );
           yield* abortIfCancelled();
           if (project?.kind === 'local') {
             if (!workdir) {
@@ -7271,6 +8428,14 @@ export class SessionExecutionService {
                   (id) => self.deps.sessionManager.resolveLocalProjectRootPath(id)
                 )
               : undefined;
+            // A file stat, not a git process: `.git` is a directory in a clone and a file in
+            // a worktree. Failure only omits the PR-link sentence.
+            const gitRepository =
+              project?.kind === 'github' ||
+              (await stat(joinPath(session.getWorkdir(), '.git')).then(
+                () => true,
+                () => false
+              ));
             const sessionInputBlocks = resolveSessionExecutionInputBlocks({
               ...agentConfig,
               prompt: buildPrompt(
@@ -7282,6 +8447,9 @@ export class SessionExecutionService {
                   branchToRename,
                   projectRun,
                   projectFileRoots,
+                  gitRepository,
+                  // The same fact that puts the shim on PATH: managed broker credentials.
+                  managedGhShim: session.getGitHubCredentials().mode === 'managed',
                 }
               ),
             });
@@ -7291,9 +8459,15 @@ export class SessionExecutionService {
               { sessionId, turnId, inputBlocks: sessionInputBlocks.length },
               async () =>
                 await self.deps.buildAcpPromptBlocks({
+                  requesterUserId: message.userId,
                   workspaceId,
                   sessionId,
+                  userTurnId,
                   inputBlocks: sessionInputBlocks,
+                  replayPromptText:
+                    replayPromptResult && replayPromptResult.stats.messagesIncluded > 0
+                      ? replayPromptResult.promptText
+                      : undefined,
                 })
             );
           };
@@ -7312,7 +8486,16 @@ export class SessionExecutionService {
             if (self.turnRuntimeBySession.get(sessionId) === runtime) runtime.startStage = stage;
           };
           sessionConfig.worktreeScriptHistoryInsertBeforeEntryId = turnId;
-          const session = yield* self.startWithTransientRetry({
+          // Parent metadata may change after authorization; recheck before any process starts.
+          if (authorizedIds) {
+            const allowed = authorizedIds;
+            yield* self.tryPromise(() => self.assertEncryptedScopeWithin(allowed, scopeInputs()));
+            sessionConfig.authorizeExecutionInputs = self.encryptedInputGuard(allowed);
+          }
+          // Session creation enriches its config with the acquired credential environment.
+          // Preserve launch inputs for a replacement before handing them to the manager.
+          const replacementConfig = { ...sessionConfig, resume: true };
+          let session = yield* self.startWithTransientRetry({
             sessionId,
             runtime,
             config: sessionConfig,
@@ -7381,62 +8564,69 @@ export class SessionExecutionService {
           self.deps.logger.debug(
             `[${sessionId}] session ready (workdir=${session.getWorkdir()} acpSessionId=${session.acpSessionId ?? 'null'})`
           );
-          yield* self.tryPromise((signal) =>
-            traceAsync(
-              self.deps.logger,
-              'execution.apply_acp_mode_model',
-              { sessionId, turnId },
-              async () =>
-                await self.deps.applyAcpModeAndModel(
-                  session,
-                  {
-                    ...agentConfig,
-                    configOptionValues: agentConfig.configOptionValues,
-                  },
-                  {
-                    sessionDoc,
-                    basedOnUserTurnId: userTurnId,
-                    signal,
-                  }
-                )
-            )
-          );
+          const configurePrompt = (target: ISession) =>
+            self.tryPromise((signal) =>
+              traceAsync(
+                self.deps.logger,
+                'execution.apply_acp_mode_model',
+                { sessionId, turnId },
+                async () =>
+                  await self.deps.applyAcpModeAndModel(
+                    target,
+                    {
+                      ...agentConfig,
+                      configOptionValues: agentConfig.configOptionValues,
+                    },
+                    {
+                      sessionDoc,
+                      basedOnUserTurnId: userTurnId,
+                      signal,
+                    }
+                  )
+              )
+            );
+
+          yield* configurePrompt(session);
 
           yield* abortIfCancelled();
 
-          const containerWorkdir = session.getWorkdir();
-          const runGit: GitRunner = (args) => session.exec('git', args, containerWorkdir, false);
-          const baseCommitHash = yield* self.tryPromise(() =>
-            traceAsync(
-              self.deps.logger,
-              'execution.get_base_commit_hash',
-              { sessionId, turnId },
-              async () => await getCurrentCommitHash(runGit)
-            )
-          );
-          const turnStartWorkingTreeDiff = yield* self.tryPromise(() =>
-            traceAsync(
-              self.deps.logger,
-              'execution.capture_worktree_diff_baseline',
-              { sessionId, turnId },
-              async () => await captureGitWorkingTreeDiffBaseline(runGit)
-            )
-          );
           runtime.project = project;
-          runtime.baseCommitHash = baseCommitHash;
-          runtime.turnStartWorkingTreeDiff = turnStartWorkingTreeDiff;
 
           yield* abortIfCancelled();
 
           yield* openAssistantEntry();
 
-          const promptBlocks = yield* self.tryPromise(() => promptBlocksPromise);
-          yield* self.tryPromise(() =>
+          let promptBlocks = yield* self.tryPromise(() => promptBlocksPromise);
+          const validation = yield* self.tryPromise(() =>
             self.deps.sessionManager.validateSessionCredentials(
               session,
-              sessionConfig.requesterUserId
+              sessionConfig.requesterUserId,
+              'replace-before-prompt'
             )
           );
+          if (validation === 'retired') {
+            runtime.session = undefined;
+            yield* abortIfCancelled();
+            if (authorizedIds) {
+              yield* self.tryPromise(() =>
+                self.assertEncryptedScopeWithin(authorizedIds, scopeInputs())
+              );
+            }
+            session = yield* trackPendingSession(
+              () => self.deps.sessionManager.createSession(replacementConfig),
+              { terminateOnCancel: true }
+            );
+            bindSession(session);
+            yield* abortIfCancelled({ terminateSession: true });
+            yield* configurePrompt(session);
+            promptBlocks = yield* self.tryPromise(() => startPromptBlocksBuild(session));
+            yield* self.tryPromise(() =>
+              self.deps.sessionManager.validateSessionCredentials(
+                session,
+                sessionConfig.requesterUserId
+              )
+            );
+          }
           yield* abortIfCancelled();
 
           yield* prompt(promptBlocks);
@@ -7479,8 +8669,6 @@ export class SessionExecutionService {
                   session,
                   sessionDoc,
                   turnId: completedTurnId,
-                  baseCommitHash,
-                  turnStartWorkingTreeDiff,
                   project,
                   producedOutput,
                   isTurnCancelled: () => self.isTurnCancelled(sessionId, completedTurnId),
@@ -7547,6 +8735,10 @@ export class SessionExecutionService {
 
   /** Metadata stop barriers also cover descendants created after the UI snapshot. */
   async reconcileCollaborationStops(): Promise<void> {
+    for (const sessionId of [...this.releasedTurnBySession.keys()]) {
+      if (await isSessionCollaborationStopped(this.deps.workspaceDocument.repo, sessionId))
+        this.releasedTurnBySession.delete(sessionId);
+    }
     for (const [sessionId, runtime] of this.turnRuntimeBySession) {
       if (await isSessionCollaborationStopped(this.deps.workspaceDocument.repo, sessionId)) {
         await this.cancelSession(
@@ -7580,6 +8772,35 @@ export class SessionExecutionService {
         .map((e) => e.id),
       ...queued.map((e) => e.userTurnId?.trim() || `queued-${e.$cid}`),
     ];
+  }
+
+  private async pauseQueuedDrafts(sessionId: SessionId): Promise<void> {
+    // Stop must not wait for a document join or a stalled preparation read.
+    // The renderer also pauses its drafts before publishing the durable Stop marker.
+    const doc = this.deps.workspaceDocument.sessions?.get(sessionId);
+    if (!doc) return;
+    const queue = await doc.getMessageQueue();
+    const cids = queue.filter((item) => !item.paused).map((item) => item.$cid);
+    if (cids.length) await doc.pauseMessageQueueItems(cids);
+  }
+
+  private async retainStoppedQueue(sessionId: SessionId): Promise<void> {
+    try {
+      const doc = this.deps.workspaceDocument.sessions?.get(sessionId);
+      if (!doc) return;
+      const queue = await doc.getMessageQueue();
+      const stopped = queue.filter(
+        (item) =>
+          !item.paused &&
+          this.isInboxInputCanceled(sessionId, item.userTurnId?.trim() || `queued-${item.$cid}`)
+      );
+      if (stopped.length) await doc.pauseMessageQueueItems(stopped.map((item) => item.$cid));
+    } catch (error) {
+      // SQLite already prevents dispatch; the watcher repairs the display marker.
+      this.deps.logger.warn(
+        `[${sessionId}] Could not retain stopped queue: ${formatErrorMessage(error)}`
+      );
+    }
   }
 
   private liveTurnId(sessionId: SessionId): string | undefined {
@@ -7686,6 +8907,9 @@ export class SessionExecutionService {
         return { success: false, error: error instanceof Error ? error.message : String(error) };
       }
     }
+    // Stop also ends the authority of work the Agent continues by itself.
+    this.releasedTurnBySession.delete(sessionId);
+    this.withdrawNativeWorkCompletion(sessionId);
     this.deps.logger.info(`Session stop requested: ${sessionId}`);
     this.deps.logger.debug(`[${sessionId}] Received stop request for turn ${turnId}`);
     const activeTurnId = this.deps.getActiveTurnId(sessionId);
@@ -7706,6 +8930,7 @@ export class SessionExecutionService {
           message.cancelId
         );
         if (paused) {
+          await this.retainStoppedQueue(sessionId);
           const successor = this.turnRuntimeBySession.get(sessionId);
           if (successor?.inboxOwner?.input?.inputId === `inbox:${target.executionId}`)
             return this.cancelSession({ ...message, turnId: successor.turnId }, options);
@@ -7715,6 +8940,8 @@ export class SessionExecutionService {
       // Stop always ends the turn the user sees: with no execution here, the
       // unfinished entry is closed instead of ignored.
       if (await this.closeDeadAssistantTurn(sessionId, { turnId, requireSettledUserTurn: false })) {
+        if (options.pauseInbox !== false && message.pauseInbox !== false)
+          await this.pauseQueuedDrafts(sessionId);
         this.refreshCodeCollabSharedStateAfterTurn(sessionId);
       } else {
         this.deps.logger.debug(
@@ -7727,6 +8954,15 @@ export class SessionExecutionService {
     }
 
     const stoppedRuntime = this.turnRuntimeBySession.get(sessionId);
+    // Legacy and degraded hosts still retain ordinary queued drafts on Stop.
+    // Interrupt-and-send and Edit & Resend opt out explicitly.
+    if (
+      (!this.operationInbox || !pauseInbox) &&
+      options.pauseInbox !== false &&
+      message.pauseInbox !== false
+    ) {
+      await this.pauseQueuedDrafts(sessionId);
+    }
     if (this.operationInbox && stoppedRuntime?.invocation?.requesterUserId && pauseInbox) {
       const scope = {
         workspaceId: this.deps.workspaceId,
@@ -7742,6 +8978,7 @@ export class SessionExecutionService {
           message.cancelId
         );
         if (!paused) return { success: false, error: 'Execution changed before Stop.' };
+        await this.retainStoppedQueue(sessionId);
         const successor = this.turnRuntimeBySession.get(sessionId);
         if (
           successor &&
@@ -7898,16 +9135,19 @@ export class SessionExecutionService {
     }
   }
 
-  async getMachineStatus(_message: MachineStatusRequestValidated): Promise<MachineStatusResponse> {
+  async getMachineStatus(message: MachineStatusRequestValidated): Promise<MachineStatusResponse> {
     this.deps.logger.debug('Received machine status request');
 
     try {
       const resources = await this.deps.collectMachineResources();
+      // Advisory: an unreadable volume omits disk, never the status answer.
+      const disk = message.includeDisk ? await readLodyDataDiskInfo() : undefined;
       return {
         type: 'machine/status_response',
         machineId: this.deps.machineId,
         success: true,
         resources,
+        ...(disk ? { disk } : {}),
         lifecycle: this.deps.getMachineLifecycleCapability(),
       };
     } catch (error) {
@@ -8031,10 +9271,19 @@ export class SessionExecutionService {
       };
     }
 
-    const config = await this.deps.workspaceDocument.getAgentConfigForMachineLaunch(
-      message.configId,
-      this.deps.machineId
-    );
+    const cancelled = () => ({
+      ...base,
+      success: true as const,
+      disposition: 'cancelled' as const,
+    });
+    if (options.signal?.aborted) return cancelled();
+    const config = await this.deps.workspaceDocument
+      .getAgentConfigForMachineLaunch(message.configId, this.deps.machineId)
+      .catch((error: unknown) => {
+        if (options.signal?.aborted) return undefined;
+        throw error;
+      });
+    if (options.signal?.aborted) return cancelled();
     if (!config || (config.cliType === 'custom' && !config.customAcp)) {
       return {
         ...base,
@@ -8045,7 +9294,13 @@ export class SessionExecutionService {
     }
     const resolvedBase = { ...base, agentType: config.agentType };
     const profileStore = getCodexProfileStore();
-    const codexProfile = await profileStore.resolve(this.deps.workspaceId, config, true);
+    const codexProfile = await profileStore
+      .resolve(this.deps.workspaceId, config, true)
+      .catch((error: unknown) => {
+        if (options.signal?.aborted) return undefined;
+        throw error;
+      });
+    if (options.signal?.aborted) return cancelled();
 
     const onProgress = (event: AcpAuthenticationProgressEvent): void => {
       if (event.status === 'auth-methods') {
@@ -8068,127 +9323,155 @@ export class SessionExecutionService {
         ...event,
       });
     };
-    const result = await this.acpAuthenticationManager.authenticate({
-      agentConfigId: config.id,
-      requestId: message.requestId,
-      cliType: config.cliType,
-      agentType: config.agentType,
-      customAcp: config.customAcp,
-      runtimeOverrides: config.runtimeOverrides,
-      magpieGatewayUrl: config.magpieGatewayUrl,
-      env: config.env,
-      onProgress,
-      codexProfile,
-      authenticateManagedProfile:
-        codexProfile?.profile.mode === 'api-key'
-          ? async ({ signal, requestInput }) => {
-              const frozenBinding = JSON.stringify(config.codexAuth);
-              const input = await requestInput(
-                {
-                  title: 'Codex API Key',
-                  description: `Confirm the destination: ${codexProfile.profile.mode === 'api-key' ? codexProfile.profile.baseUrl : ''}. The key is stored only on this machine.`,
-                  fields: [{ id: 'apiKey', type: 'secret', label: 'API Key', required: true }],
-                },
-                `Enter an API Key for ${codexProfile.profile.mode === 'api-key' ? codexProfile.profile.baseUrl : ''}`
-              );
-              const assertCurrent = async () => {
-                signal.throwIfAborted();
-                const current = await this.deps.workspaceDocument.getAgentConfigForMachineLaunch(
-                  config.id,
-                  this.deps.machineId
+    const cancelAuthentication = () => this.acpAuthenticationManager.cancel(message.requestId);
+    options.signal?.addEventListener('abort', cancelAuthentication, { once: true });
+    try {
+      if (options.signal?.aborted) return cancelled();
+      const authentication = this.acpAuthenticationManager.authenticate({
+        agentConfigId: config.id,
+        requestId: message.requestId,
+        cliType: config.cliType,
+        agentType: config.agentType,
+        customAcp: config.customAcp,
+        runtimeOverrides: config.runtimeOverrides,
+        magpieGatewayUrl: config.magpieGatewayUrl,
+        env: config.env,
+        ...(message.methodId ? { methodId: message.methodId } : {}),
+        onProgress,
+        codexProfile,
+        authenticateManagedProfile:
+          codexProfile?.profile.mode === 'api-key'
+            ? async ({ signal, requestInput }) => {
+                const frozenBinding = JSON.stringify(config.codexAuth);
+                const input = await requestInput(
+                  {
+                    title: 'Codex API Key',
+                    description: `Confirm the destination: ${codexProfile.profile.mode === 'api-key' ? codexProfile.profile.baseUrl : ''}. The key is stored only on this machine.`,
+                    fields: [{ id: 'apiKey', type: 'secret', label: 'API Key', required: true }],
+                  },
+                  `Enter an API Key for ${codexProfile.profile.mode === 'api-key' ? codexProfile.profile.baseUrl : ''}`
                 );
-                if (!current || JSON.stringify(current.codexAuth) !== frozenBinding)
-                  throw new Error('Provider changed during authentication; try again');
-                assertManagedCodexProfileConfig(current);
-              };
-              await assertCurrent();
-              await profileStore.withApiKeyCandidate(
-                codexProfile,
-                String(input.apiKey ?? ''),
-                async (candidateKey) => {
-                  await this.deps.fetchAcpCapabilities(
-                    config.cliType,
-                    config.agentType,
-                    config.env,
-                    config.customAcp,
-                    config.runtimeOverrides,
-                    {
-                      signal,
-                      magpieGatewayUrl: config.magpieGatewayUrl,
-                      codexProfile: { profile: codexProfile, candidateKey },
-                      verifyCodexCredential: true,
-                    }
+                const assertCurrent = async () => {
+                  signal.throwIfAborted();
+                  const current = await this.deps.workspaceDocument.getAgentConfigForMachineLaunch(
+                    config.id,
+                    this.deps.machineId
                   );
-                  await assertCurrent();
-                },
-                signal
-              );
+                  if (!current || JSON.stringify(current.codexAuth) !== frozenBinding)
+                    throw new Error('Provider changed during authentication; try again');
+                  assertManagedCodexProfileConfig(current);
+                };
+                await assertCurrent();
+                await profileStore.withApiKeyCandidate(
+                  codexProfile,
+                  String(input.apiKey ?? ''),
+                  async (candidateKey) => {
+                    await this.deps.fetchAcpCapabilities(
+                      config.cliType,
+                      config.agentType,
+                      config.env,
+                      config.customAcp,
+                      config.runtimeOverrides,
+                      {
+                        signal,
+                        magpieGatewayUrl: config.magpieGatewayUrl,
+                        codexProfile: { profile: codexProfile, candidateKey },
+                        verifyCodexCredential: true,
+                      }
+                    );
+                    await assertCurrent();
+                  },
+                  signal
+                );
+              }
+            : undefined,
+      });
+      // authenticate reserves its slot synchronously; catch aborts during registration.
+      if (options.signal?.aborted) cancelAuthentication();
+      const result = await authentication;
+      if (options.signal?.aborted) return cancelled();
+      if (result.success && result.disposition === 'authenticated') {
+        const refreshController = new AbortController();
+        const refreshTimeoutMs = Math.max(
+          1,
+          Math.min(
+            ACP_POST_AUTH_REFRESH_MAX_MS,
+            ACP_AUTHENTICATION_WORKFLOW_DEADLINE_MS - (Date.now() - workflowStartedAt)
+          )
+        );
+        const refreshTimeout = setTimeout(() => refreshController.abort(), refreshTimeoutMs);
+        refreshTimeout.unref?.();
+        let refresh: MachineAcpCapabilitiesRefreshResponse;
+        try {
+          refresh = await this.refreshMachineAcpCapabilitiesForConfig(
+            {
+              type: 'machine/acp-capabilities-refresh',
+              machineId: message.machineId,
+              workspaceId: message.workspaceId,
+              configId: message.configId,
+              cliType: config.cliType,
+              agentType: config.agentType,
+              customAcp: config.customAcp,
+              runtimeOverrides: config.runtimeOverrides,
+              magpieGatewayUrl: config.magpieGatewayUrl,
+              env: config.env,
+              codexAuth: config.codexAuth,
+              // Authentication changes what the agent will advertise (models and
+              // config options gated on the account), and the persisted entry was
+              // stamped with the same launch inputs, so only a real probe can tell
+              // the caller whether the new credentials actually work.
+              force: true,
+            },
+            {
+              signal: options.signal
+                ? AbortSignal.any([refreshController.signal, options.signal])
+                : refreshController.signal,
             }
-          : undefined,
-    });
-    if (result.success && result.disposition === 'authenticated') {
-      const refreshController = new AbortController();
-      const refreshTimeoutMs = Math.max(
-        1,
-        Math.min(
-          ACP_POST_AUTH_REFRESH_MAX_MS,
-          ACP_AUTHENTICATION_WORKFLOW_DEADLINE_MS - (Date.now() - workflowStartedAt)
-        )
-      );
-      const refreshTimeout = setTimeout(() => refreshController.abort(), refreshTimeoutMs);
-      refreshTimeout.unref?.();
-      let refresh: MachineAcpCapabilitiesRefreshResponse;
-      try {
-        refresh = await this.refreshMachineAcpCapabilitiesForConfig(
-          {
-            type: 'machine/acp-capabilities-refresh',
+          );
+        } catch (error) {
+          refresh = {
+            type: 'machine/acp-capabilities-refresh_response',
             machineId: message.machineId,
-            workspaceId: message.workspaceId,
             configId: message.configId,
             cliType: config.cliType,
             agentType: config.agentType,
-            customAcp: config.customAcp,
-            runtimeOverrides: config.runtimeOverrides,
-            magpieGatewayUrl: config.magpieGatewayUrl,
-            env: config.env,
-            codexAuth: config.codexAuth,
-            // Authentication changes what the agent will advertise (models and
-            // config options gated on the account), and the persisted entry was
-            // stamped with the same launch inputs, so only a real probe can tell
-            // the caller whether the new credentials actually work.
-            force: true,
-          },
-          { signal: refreshController.signal }
-        );
-      } catch (error) {
-        refresh = {
-          type: 'machine/acp-capabilities-refresh_response',
-          machineId: message.machineId,
-          configId: message.configId,
-          cliType: config.cliType,
-          agentType: config.agentType,
-          success: false,
-          error: refreshController.signal.aborted
-            ? 'Authentication succeeded, but capability verification timed out'
-            : formatErrorMessage(error),
-        };
-      } finally {
-        clearTimeout(refreshTimeout);
+            success: false,
+            error: refreshController.signal.aborted
+              ? 'Authentication succeeded, but capability verification timed out'
+              : formatErrorMessage(error),
+          };
+        } finally {
+          clearTimeout(refreshTimeout);
+        }
+        if (options.signal?.aborted) return cancelled();
+        if (!refresh.success) {
+          return {
+            ...resolvedBase,
+            ...result,
+            capabilitiesRefreshed: false,
+            authRequired: refresh.authRequired,
+            authMethods: refresh.authMethods,
+            error: refresh.error ?? 'Authentication succeeded, but capability refresh failed',
+          };
+        }
+        if (hasEmptyModelSelectOption(refresh.capability?.configOptions)) {
+          // Auth worked, but the agent's catalog is still degraded: that is not
+          // a successful verification, and the caller must not mark the provider
+          // verified on the strength of the authentication alone.
+          return {
+            ...resolvedBase,
+            ...result,
+            capabilitiesRefreshed: false,
+            error: 'Authentication succeeded, but the provider reported no usable models',
+          };
+        }
+        return { ...resolvedBase, ...result, capabilitiesRefreshed: true };
       }
-      if (!refresh.success) {
-        return {
-          ...resolvedBase,
-          ...result,
-          capabilitiesRefreshed: false,
-          authRequired: refresh.authRequired,
-          authMethods: refresh.authMethods,
-          error: refresh.error ?? 'Authentication succeeded, but capability refresh failed',
-        };
-      }
-      return { ...resolvedBase, ...result, capabilitiesRefreshed: true };
-    }
 
-    return { ...resolvedBase, ...result };
+      return { ...resolvedBase, ...result };
+    } finally {
+      options.signal?.removeEventListener('abort', cancelAuthentication);
+    }
   }
 
   async refreshMachineAcpCapabilities(
@@ -8233,6 +9516,7 @@ export class SessionExecutionService {
         magpieGatewayUrl: config.magpieGatewayUrl,
         env: config.env,
         codexAuth: config.codexAuth,
+        sessionDefaults: config.sessionDefaults,
       },
       options
     );
@@ -8267,7 +9551,9 @@ export class SessionExecutionService {
   ): Promise<MachineAcpCapabilitiesRefreshResponse> {
     // Config identity is part of the key because the response and cache row are
     // both config-scoped even when two configs share identical launch inputs.
-    const dedupeKey = computeAcpRefreshDedupeKey(
+    // A refresh that reads every model's options does more work than one that
+    // does not, so the two never share an in-flight probe.
+    const dedupeKey = `${computeAcpRefreshDedupeKey(
       message.configId,
       message.cliType,
       message.agentType,
@@ -8275,7 +9561,7 @@ export class SessionExecutionService {
       message.customAcp,
       message.runtimeOverrides,
       message.magpieGatewayUrl
-    );
+    )}${message.readModelOptions ? ':model-options' : ''}`;
 
     this.deps.logger.debug(
       `[acp-capabilities] Refresh requested (cliType=${message.cliType} agentType=${message.agentType} force=${message.force === true})`
@@ -8450,6 +9736,8 @@ export class SessionExecutionService {
         modelReasoningEfforts,
         modelCapabilities,
         capabilitySourceVersion,
+        authMethods,
+        modelConfigOptions,
       } = await this.deps.fetchAcpCapabilities(
         message.cliType,
         message.agentType,
@@ -8459,6 +9747,7 @@ export class SessionExecutionService {
         {
           agentConfigId: message.configId,
           magpieGatewayUrl: message.magpieGatewayUrl,
+          sessionDefaults: message.sessionDefaults,
           signal: options.signal,
           codexProfile: codexProfile ? { profile: codexProfile } : undefined,
           onManagedRuntimeProgress: (event) => {
@@ -8467,10 +9756,42 @@ export class SessionExecutionService {
               toManagedRuntimeProgressMessage(this.deps.machineId, event)
             );
           },
+          // Built-in adapters only switch models in-session. A registry or
+          // custom agent may persist each switch (registry Cursor rewrites
+          // its global default model), so they refresh as before.
+          ...(message.readModelOptions && message.cliType === 'builtin'
+            ? {
+                readModelOptions: {
+                  onProgress: (progress) => {
+                    if (options.signal?.aborted) return;
+                    options.onAcpBinaryProgress?.({
+                      type: 'machine/acp-binary-progress',
+                      machineId: this.deps.machineId,
+                      agentType: message.agentType,
+                      status: 'reading-model-options',
+                      configId: message.configId,
+                      modelId: progress.modelId,
+                      modelName: progress.modelName,
+                      modelIndex: progress.index,
+                      modelCount: progress.total,
+                    });
+                  },
+                },
+              }
+            : {}),
         }
       );
 
       options.signal?.throwIfAborted();
+      // Only agent-driven providers authenticate through the ACP exchange. A
+      // built-in provider signs in with its own native command, and the
+      // adapter's advertised methods do not describe it. A probe that could not
+      // read the list reports `undefined`, which stays "never asked" rather than
+      // claiming the agent offers no way to sign in.
+      const advertisedAuthMethods =
+        authMethods && usesAcpProtocolAuthentication(message.cliType, message.agentType)
+          ? authMethods.map(summarizeAcpAuthMethod)
+          : undefined;
       const capability = await this.deps.workspaceDocument.updateAcpCapabilities(
         this.deps.machineId,
         message.configId,
@@ -8493,12 +9814,25 @@ export class SessionExecutionService {
         modelReasoningEfforts,
         acknowledgedSteer,
         goalActions,
-        { signal: options.signal, sessionTitle, rateLimits, modelCapabilities }
+        {
+          signal: options.signal,
+          sessionTitle,
+          rateLimits,
+          modelCapabilities,
+          authMethods: advertisedAuthMethods,
+          modelConfigOptions,
+        }
       );
       this.acpCapabilityLaunchInputFingerprints.set(
         message.configId,
         fingerprintAcpLaunchInputs(message)
       );
+      if (hasEmptyModelSelectOption(configOptions)) {
+        this.deps.logger.warn(
+          `[acp-refresh] ${message.cliType}/${message.agentType} advertised a model select with zero options; the persisted entry stays degraded and will be re-probed on the next refresh`,
+          { configId: message.configId }
+        );
+      }
 
       return {
         type: 'machine/acp-capabilities-refresh_response',
@@ -8517,20 +9851,43 @@ export class SessionExecutionService {
         })),
         capability,
         availableCommands,
+        ...(advertisedAuthMethods ? { authMethods: advertisedAuthMethods } : {}),
       };
     } catch (error) {
       return this.buildFailedAcpRefreshResponse(message, error);
     }
   }
 
-  private buildFailedAcpRefreshResponse(
+  private async buildFailedAcpRefreshResponse(
     message: ResolvedMachineAcpCapabilitiesRefreshRequest,
     error: unknown
-  ): MachineAcpCapabilitiesRefreshResponse {
+  ): Promise<MachineAcpCapabilitiesRefreshResponse> {
     const errorMessage = formatErrorMessage(error);
     this.deps.logger.debug(
       `[acp-capabilities] Refresh failed (cliType=${message.cliType} agentType=${message.agentType}): ${errorMessage}`
     );
+    const requiredAuthMethods =
+      error instanceof AcpAuthenticationRequiredError
+        ? error.authMethods.map(summarizeAcpAuthMethod)
+        : undefined;
+    if (requiredAuthMethods) {
+      // The agent answered "authenticate first" before any capability write, yet it did
+      // publish its methods. Record them: a Provider added a moment ago becomes a visible
+      // sign-in method without a second probe.
+      await Promise.resolve()
+        .then(() =>
+          this.deps.workspaceDocument.updateAcpAuthMethods?.(
+            this.deps.machineId,
+            message.configId,
+            requiredAuthMethods
+          )
+        )
+        .catch((cause: unknown) => {
+          this.deps.logger.debug(
+            `[acp-capabilities] Could not record advertised methods: ${formatErrorMessage(cause)}`
+          );
+        });
+    }
     return {
       type: 'machine/acp-capabilities-refresh_response',
       machineId: this.deps.machineId,
@@ -8538,12 +9895,7 @@ export class SessionExecutionService {
       cliType: message.cliType,
       agentType: message.agentType,
       success: false,
-      ...(error instanceof AcpAuthenticationRequiredError
-        ? {
-            authRequired: true,
-            authMethods: error.authMethods.map(summarizeAcpAuthMethod),
-          }
-        : {}),
+      ...(requiredAuthMethods ? { authRequired: true, authMethods: requiredAuthMethods } : {}),
       error: errorMessage,
     };
   }
@@ -8896,6 +10248,7 @@ const buildAcpCapabilitiesRefreshResponseFromCache = (
   })),
   capability,
   availableCommands: capability.availableCommands,
+  ...(capability.authMethods ? { authMethods: capability.authMethods } : {}),
 });
 
 const findRegistryAcpAgent = (agentType: string): RegistryAcpAgent | undefined =>
@@ -8917,6 +10270,7 @@ const fingerprintAcpLaunchInputs = (inputs: {
   customAcp?: CustomAcpLaunchSpec;
   runtimeOverrides?: BuiltinRuntimeOverrides;
   magpieGatewayUrl?: string;
+  sessionDefaults?: AgentConfigMeta['sessionDefaults'];
 }): string =>
   createHash('sha256')
     .update(
@@ -8930,6 +10284,8 @@ const fingerprintAcpLaunchInputs = (inputs: {
         inputs.magpieGatewayUrl
       )
     )
+    // The probe applies these, so a cached probe taken under other defaults is stale.
+    .update(`\x00${JSON.stringify(inputs.sessionDefaults ?? null)}`)
     .digest('hex');
 
 const computeAcpRefreshDedupeKey = (

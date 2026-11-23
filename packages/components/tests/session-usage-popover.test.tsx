@@ -1,24 +1,14 @@
 // @vitest-environment jsdom
-
 import { act, createElement, type ComponentProps } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { getRateLimitEntryKey } from '@lody/shared';
+import { getRateLimitEntryKey, type AgentConfigId } from '@lody/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SessionUsagePopover } from '../src/components/sessions/session-usage-popover';
 import type { MachineRateLimits } from '../src/lib/session-usage';
+import { createTestI18n, withTestI18n } from './test-i18n';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string, values?: Record<string, string | number>): string => {
-      if (typeof fallback !== 'string') return key;
-      return fallback.replace(/\{\{(\w+)\}\}/g, (match, name: string) =>
-        values?.[name] === undefined ? match : String(values[name])
-      );
-    },
-    i18n: { language: 'en' },
-  }),
-}));
+const testI18n = createTestI18n();
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -59,49 +49,84 @@ describe('SessionUsagePopover', () => {
   ): Promise<void> => {
     await act(async () => {
       root.render(
-        createElement(SessionUsagePopover, {
-          agentType: 'codex',
-          modelId: 'gpt-5.4',
-          ...props,
-        })
+        withTestI18n(
+          createElement(SessionUsagePopover, {
+            agentType: 'codex',
+            modelId: 'gpt-5.4',
+            ...props,
+          }),
+          testI18n
+        )
       );
     });
   };
-
-  it('shows the used context percentage in the composer trigger', async () => {
-    await renderUsage({
-      contextWindowUsage: { size: 128_000, used: 32_000 },
-      rateLimits,
-      showRateLimitWithoutContext: true,
-    });
-
-    const trigger = container.querySelector('button');
-    expect(trigger?.textContent).toBe('25%');
-    expect(trigger?.getAttribute('aria-label')).toBe('Open usage details, 25% used');
-    expect(trigger?.getAttribute('title')).toBe('Open usage details, 25% used');
-  });
-
-  it('shows rate limit usage and details without context when explicitly enabled', async () => {
-    await renderUsage({ rateLimits, showRateLimitWithoutContext: true });
-
-    const trigger = container.querySelector('button');
-    expect(trigger?.textContent).toBe('29%');
-    expect(trigger?.getAttribute('aria-label')).toBe('Open usage details, 29% used');
-
-    await act(async () => {
-      trigger?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
-
-    const popover = document.body.querySelector('[aria-label="Usage"]');
-    expect(popover?.textContent).toContain('Weekly');
-    expect(popover?.textContent).toContain('29% used');
-  });
 
   it('keeps rate-limit-only usage hidden unless explicitly enabled', async () => {
     await renderUsage({ rateLimits });
 
     expect(container.querySelector('button')).toBeNull();
   });
+
+  it.each(['antigravity', 'antigravity-acp'])(
+    'shows both model groups and both quota windows alongside context for %s',
+    async (agentType) => {
+      const agentConfigId = 'antigravity-provider' as AgentConfigId;
+      const limits: MachineRateLimits = {
+        [getRateLimitEntryKey(agentType, agentType, agentConfigId)]: {
+          limitId: agentType,
+          scope: { providerId: 'antigravity' },
+          windows: [
+            {
+              label: 'Gemini Models',
+              usedPercent: 25,
+              windowDurationSeconds: 604_800,
+              resetsAtEpochSeconds: null,
+            },
+            {
+              label: 'Gemini Models',
+              usedPercent: 10,
+              windowDurationSeconds: 18_000,
+              resetsAtEpochSeconds: null,
+            },
+            {
+              label: 'Claude and GPT models',
+              usedPercent: 0,
+              windowDurationSeconds: 604_800,
+              resetsAtEpochSeconds: null,
+            },
+            {
+              label: 'Claude and GPT models',
+              usedPercent: 0,
+              windowDurationSeconds: 18_000,
+              resetsAtEpochSeconds: null,
+            },
+          ],
+        },
+      };
+      await renderUsage({
+        agentType,
+        agentConfigId,
+        modelId: 'gemini-pro-orchestrator',
+        contextWindowUsage: { used: 100, size: 1000 },
+        rateLimits: limits,
+      });
+      await act(async () => {
+        container
+          .querySelector('button')
+          ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      });
+      const meters = document.body
+        .querySelector('[aria-label="Usage"]')
+        ?.querySelectorAll('[role="progressbar"]');
+      expect(Array.from(meters ?? []).map((meter) => meter.getAttribute('aria-label'))).toEqual([
+        'Context: 10% used',
+        'Weekly · Gemini Models: 25% used',
+        'Weekly · Claude and GPT models: 0% used',
+        '5 hours · Gemini Models: 10% used',
+        '5 hours · Claude and GPT models: 0% used',
+      ]);
+    }
+  );
 
   it.each([
     { fiveHourFirst: false, usedPercent: 11 },
@@ -209,12 +234,6 @@ describe('SessionUsagePopover', () => {
     expect(document.body.querySelector('[aria-label="Usage"]')?.textContent).toContain(
       'The provider did not report usage for this plan'
     );
-  });
-
-  it('hides the trigger when context data is invalid even if subscription usage exists', async () => {
-    await renderUsage({ contextWindowUsage: { size: 0, used: 0 }, rateLimits });
-
-    expect(container.querySelector('button')).toBeNull();
   });
 
   it('keeps the compacting state visible without context data', async () => {

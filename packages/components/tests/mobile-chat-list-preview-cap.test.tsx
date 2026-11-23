@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
@@ -15,10 +14,10 @@ import { initI18n } from '../src/i18n';
 
 /**
  * Every bucket of the mobile chat list previews at most
- * `MOBILE_CHAT_PREVIEW_MAX_ROOTS` TOP-LEVEL rows and ends in a "Show all (N)"
- * toggle — the same model the desktop sidebar's `MAX_VISIBLE_SESSIONS` applies
- * per group. Without it, one busy project buries every other project and
- * worktree below the fold.
+ * `MOBILE_CHAT_PREVIEW_MAX_ROOTS` TOP-LEVEL rows and offers "Show more" — one
+ * more page per tap, with "Show less" returning to the preview. The same model
+ * the desktop sidebar's `MAX_VISIBLE_SESSIONS` applies per group. Without it,
+ * one busy project buries every other project and worktree below the fold.
  */
 
 const HOUR = 60 * 60 * 1000;
@@ -117,6 +116,16 @@ function toggleLabels(): string[] {
   return toggles().map((button) => button.textContent?.trim() ?? '');
 }
 
+function collapseToggles(): HTMLButtonElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLButtonElement>('[data-chat-list-preview-collapse]')
+  );
+}
+
+function collapseLabels(): string[] {
+  return collapseToggles().map((button) => button.textContent?.trim() ?? '');
+}
+
 describe('mobile chat list group preview cap', () => {
   it('caps only when the caller opts in, independently of grouping', () => {
     // Both directions matter, and neither follows from the other. The
@@ -132,54 +141,37 @@ describe('mobile chat list group preview cap', () => {
 
     render(makeProjectItems(9, 'p1'), { groupBy: 'none' });
     expect(rows()).toHaveLength(MOBILE_CHAT_PREVIEW_MAX_ROOTS);
-    expect(toggleLabels()).toEqual(['Show all (9)']);
+    expect(toggleLabels()).toEqual(['Show more']);
+    expect(collapseLabels()).toEqual([]);
   });
 
-  it('previews five rows per overflowing bucket and leaves the rest alone', () => {
-    // Three boundary points in one list: over the cap (trimmed, toggle),
-    // exactly at it (untouched, no toggle — an off-by-one in the `>` would
-    // surface here and nowhere else), and under it (untouched, no toggle).
-    render([
-      ...makeProjectItems(9, 'p1'),
-      ...makeProjectItems(MOBILE_CHAT_PREVIEW_MAX_ROOTS, 'p2'),
-      ...makeProjectItems(2, 'p3'),
-    ]);
-    expect(titles()).toEqual([
-      'Session p1-0',
-      'Session p1-1',
-      'Session p1-2',
-      'Session p1-3',
-      'Session p1-4',
-      'Session p2-0',
-      'Session p2-1',
-      'Session p2-2',
-      'Session p2-3',
-      'Session p2-4',
-      'Session p3-0',
-      'Session p3-1',
-    ]);
-    expect(toggleLabels()).toEqual(['Show all (9)']);
-  });
-
-  it('expands and re-collapses only the bucket that was tapped', () => {
-    render([...makeProjectItems(9, 'p1'), ...makeProjectItems(8, 'p2')]);
-    expect(toggleLabels()).toEqual(['Show all (9)', 'Show all (8)']);
+  it('reveals one page per tap and collapses back to the preview in one tap', () => {
+    render([...makeProjectItems(12, 'p1'), ...makeProjectItems(8, 'p2')]);
+    expect(toggleLabels()).toEqual(['Show more', 'Show more']);
 
     act(() => {
       toggles()[0]!.click();
     });
-    expect(titles().filter((title) => title.includes('p1-'))).toHaveLength(9);
+    expect(titles().filter((title) => title.includes('p1-'))).toHaveLength(10);
     // The untapped bucket keeps its preview.
     expect(titles().filter((title) => title.includes('p2-'))).toHaveLength(5);
-    expect(toggleLabels()).toEqual(['Show less', 'Show all (8)']);
+    expect(toggleLabels()).toEqual(['Show more', 'Show more']);
+    expect(collapseLabels()).toEqual(['Show less']);
     expect(toggles()[0]!.getAttribute('aria-expanded')).toBe('true');
 
     act(() => {
       toggles()[0]!.click();
     });
+    expect(titles().filter((title) => title.includes('p1-'))).toHaveLength(12);
+    expect(toggleLabels()).toEqual(['Show more']);
+    expect(collapseLabels()).toEqual(['Show less']);
+
+    act(() => {
+      collapseToggles()[0]!.click();
+    });
     expect(titles().filter((title) => title.includes('p1-'))).toHaveLength(5);
-    expect(toggleLabels()).toEqual(['Show all (9)', 'Show all (8)']);
-    expect(toggles()[0]!.getAttribute('aria-expanded')).toBe('false');
+    expect(toggleLabels()).toEqual(['Show more', 'Show more']);
+    expect(collapseLabels()).toEqual([]);
   });
 
   it('counts top-level rows, so a preview never splits an opener', () => {
@@ -235,7 +227,7 @@ describe('mobile chat list group preview cap', () => {
     render(chats);
     expect(titles()).not.toContain('Session opener');
     expect(titles()).not.toContain('Session opened-a');
-    expect(toggleLabels()).toEqual(['Show all (8)']);
+    expect(toggleLabels()).toEqual(['Show more']);
 
     act(() => {
       toggles()[0]!.click();
@@ -265,38 +257,7 @@ describe('mobile chat list group preview cap', () => {
       'Session p1-3',
       'Session p1-4',
     ]);
-    expect(toggleLabels()).toEqual(['Show all (6)']);
-  });
-
-  it('pulls the toggle back into view when a bucket collapses', () => {
-    // Measured in Chromium with `overflow-anchor: none` (Safari/iOS ships no
-    // scroll anchoring): collapsing a 14-row bucket drops the toggle from
-    // y=328 to y=-68, off the top of the viewport. With this correction it
-    // lands at y=0. jsdom has no layout, so what is observable here is WHICH
-    // element the list asks the browser to keep on screen.
-    let scrolled: { target: Element; options: unknown } | null = null;
-    const original = Element.prototype.scrollIntoView;
-    Element.prototype.scrollIntoView = function scrollIntoView(options) {
-      scrolled = { target: this, options };
-    };
-    try {
-      render(makeProjectItems(9, 'p1'));
-      act(() => {
-        toggles()[0]!.click();
-      });
-      // Expanding only appends rows BELOW the toggle. Moving the viewport
-      // there would yank the list out from under the reader.
-      expect(scrolled).toBeNull();
-
-      act(() => {
-        toggles()[0]!.click();
-      });
-      expect(scrolled).not.toBeNull();
-      expect(scrolled!.target).toBe(toggles()[0]);
-      expect(scrolled!.options).toEqual({ block: 'nearest' });
-    } finally {
-      Element.prototype.scrollIntoView = original;
-    }
+    expect(toggleLabels()).toEqual(['Show more']);
   });
 
   it('does not write the preview state into the shared opener-fold atom', () => {
@@ -334,5 +295,55 @@ describe('mobile chat list group preview cap', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('mobile pin sections', () => {
+  it('splits pinned rows into their sections, keeping the manual order', () => {
+    render(
+      [
+        makeItem({ id: 'loose', title: 'loose', isPinned: true, latestMessageAt: NOW }),
+        makeItem({
+          id: 'deps-bump',
+          title: 'deps-bump',
+          isPinned: true,
+          pinSectionId: 'maintenance',
+          orderKey: '81',
+          latestMessageAt: NOW,
+        }),
+        makeItem({
+          id: 'weekly-mirror',
+          title: 'weekly-mirror',
+          isPinned: true,
+          pinSectionId: 'maintenance',
+          orderKey: '80',
+          latestMessageAt: NOW - 50 * HOUR,
+        }),
+        ...makeProjectItems(1),
+      ],
+      { pinSections: [{ id: 'maintenance', name: 'Maintenance', orderKey: '80' }] }
+    );
+    expect(titles().slice(0, 3)).toEqual(['loose', 'weekly-mirror', 'deps-bump']);
+    const text = container.textContent ?? '';
+    expect(text.indexOf('Pinned')).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf('Maintenance')).toBeGreaterThan(text.indexOf('Pinned'));
+  });
+});
+
+describe('mobile pin sections before the sections are read', () => {
+  it('holds back a sectioned pin instead of showing it unsectioned', () => {
+    // No workspace runtime: the section catalog has not been read.
+    render([
+      makeItem({ id: 'loose', title: 'loose', isPinned: true, latestMessageAt: NOW }),
+      makeItem({
+        id: 'weekly-mirror',
+        title: 'weekly-mirror',
+        isPinned: true,
+        pinSectionId: 'maintenance',
+        orderKey: '80',
+        latestMessageAt: NOW,
+      }),
+    ]);
+    expect(titles()).toEqual(['loose']);
   });
 });

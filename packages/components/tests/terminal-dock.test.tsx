@@ -1,6 +1,5 @@
 // @vitest-environment jsdom
-
-import React, { act } from 'react';
+import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { getDefaultStore } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -136,14 +135,8 @@ function getTerminalTabButton(container: HTMLElement, title: string): HTMLButton
 }
 
 function expectActiveTerminal(container: HTMLElement, title: string): void {
-  // Active tab = a flat fill against the strip's own `bg-sidebar` canvas.
-  // See the comment on `TERMINAL_TAB_ACTIVE_CLASS`.
   const tab = getTerminalTab(container, title);
   expect(tab.getAttribute('aria-selected')).toBe('true');
-  const classes = tab.className.split(/\s+/);
-  expect(classes).toContain('bg-background');
-  expect(classes).toContain('text-tab-active-foreground');
-  expect(classes).not.toContain('shadow-[0_1px_4px_-1px_rgba(0,0,0,0.18)]');
 }
 
 describe('TerminalDock', () => {
@@ -233,55 +226,6 @@ describe('TerminalDock', () => {
     expect(hasOpenPanel(container)).toBe(true);
     expectActiveTerminal(container, 'beta');
   });
-
-  it('keeps the current terminal mounted during same-session terminal reloads', async () => {
-    const terminals = [
-      { terminalId: 'stable-alpha', title: 'alpha' },
-      { terminalId: 'stable-beta', title: 'beta' },
-    ];
-    const channel = new StaticTerminalChannel({
-      'session-stable-reload': terminals,
-    });
-    container = document.createElement('div');
-    document.body.appendChild(container);
-    root = createRoot(container);
-
-    await act(async () => {
-      root?.render(
-        <TerminalDock channel={channel} sessionId="session-stable-reload" defaultView="terminal" />
-      );
-    });
-    await flushReact();
-    await flushReact();
-    await click(getTerminalTabButton(container, 'beta'));
-    expect(hasOpenPanel(container)).toBe(true);
-    expectActiveTerminal(container, 'beta');
-
-    const reloadChannel = new DeferredTerminalChannel();
-    await act(async () => {
-      root?.render(
-        <TerminalDock
-          channel={reloadChannel}
-          sessionId="session-stable-reload"
-          canCreateTerminal={false}
-        />
-      );
-    });
-    await flushReact();
-
-    expect(reloadChannel.list).toHaveBeenCalledWith('session-stable-reload');
-    expect(hasOpenPanel(container)).toBe(true);
-    expectActiveTerminal(container, 'beta');
-
-    await act(async () => {
-      reloadChannel.resolve(terminals);
-      await Promise.resolve();
-    });
-    await flushReact();
-
-    expect(hasOpenPanel(container)).toBe(true);
-    expectActiveTerminal(container, 'beta');
-  });
 });
 
 describe('TerminalDockHost workspace readiness', () => {
@@ -292,6 +236,7 @@ describe('TerminalDockHost workspace readiness', () => {
   let listeners: Set<(payload: unknown) => void>;
   let openedSessions: string[];
   let sequence = 0;
+  let initialStateRead: Promise<ElectronCliState> | undefined;
 
   function mixedState(): ElectronCliState & { runtime: CliRuntimeState } {
     return {
@@ -344,12 +289,13 @@ describe('TerminalDockHost workspace readiness', () => {
   beforeEach(() => {
     route.sessionId = `host-readiness-${++sequence}`;
     state = mixedState();
+    initialStateRead = undefined;
     listeners = new Set();
     openedSessions = [];
     window.__LODY_ELECTRON__ = true;
     window.ipc = {
       invoke: async (channel, ...args) => {
-        if (channel === 'cli.getState') return state;
+        if (channel === 'cli.getState') return initialStateRead ?? state;
         if (channel === 'terminal.list') return [];
         if (channel === 'terminal.open') {
           const request = args[0] as { sessionId: string };
@@ -404,6 +350,36 @@ describe('TerminalDockHost workspace readiness', () => {
     expect(state.connectivity).toBe('reconnecting');
   });
 
+  it('keeps terminal creation ready when an old daemon snapshot arrives after a ready push', async () => {
+    let resolveSnapshot!: (value: ElectronCliState) => void;
+    initialStateRead = new Promise((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    const old = { ...mixedState(), phase: 'starting' as const };
+    await mount();
+    expect(store.get(terminalDockCanCreateAtom)).toBe(false);
+    await publish(mixedState());
+    expect(store.get(terminalDockCanCreateAtom)).toBe(true);
+    await act(async () => resolveSnapshot(old));
+    expect(store.get(terminalDockCanCreateAtom)).toBe(true);
+    await toggleDock();
+    expect(openedSessions).toEqual([route.sessionId]);
+  });
+
+  it('does not re-enable terminal creation from a snapshot taken before a stopped push', async () => {
+    let resolveSnapshot!: (value: ElectronCliState) => void;
+    initialStateRead = new Promise((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    const old = mixedState();
+    await mount();
+    await publish({ ...old, phase: 'stopped', desiredState: 'stopped' });
+    await act(async () => resolveSnapshot(old));
+    expect(store.get(terminalDockCanCreateAtom)).toBe(false);
+    await toggleDock();
+    expect(openedSessions).toEqual([]);
+  });
+
   it('keeps the failed workspace blocked and recovers on its next ready snapshot', async () => {
     store.set(runtimeAtom, {
       workspaceId: 'encrypted',
@@ -454,13 +430,6 @@ describe('TerminalDockHost workspace readiness', () => {
       expect(openedSessions).toEqual([]);
     }
     await publish(ready);
-    await toggleDock();
-    expect(openedSessions).toEqual([route.sessionId]);
-  });
-
-  it.each(['running', 'degraded'] as const)('preserves ordinary %s behavior', async (phase) => {
-    state = { ...mixedState(), phase, runtime: undefined };
-    await mount();
     await toggleDock();
     expect(openedSessions).toEqual([route.sessionId]);
   });

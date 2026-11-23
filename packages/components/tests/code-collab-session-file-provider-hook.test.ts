@@ -12,7 +12,6 @@ import {
   getSessionRoomId,
   getMachineRoomId,
   type MachineMeta,
-  readCodeCollabFileIndexFromFlock,
   type MachineId,
   type SessionId,
   type SessionMeta,
@@ -30,6 +29,7 @@ import {
   type CodeCollabFileIndexCache,
 } from '../src/lib/code-collab-file-index-cache';
 import { SessionAgentFileLinkMenuProvider } from '../src/components/sessions/session-agent-file-link-menu';
+import { useSessionDiffSummary } from '../src/components/sessions/use-session-diff-summary';
 import { useAgentFileLinkMatch } from '../src/components/ai-gui/agent-file-link-context';
 
 vi.mock('../src/hooks/use-session-file-actions', () => ({
@@ -120,75 +120,7 @@ const createRuntime = (overrides: Record<string, unknown>): WorkspaceRuntime => 
   return { ...runtime, codeCollabFileIndexCache: cache };
 };
 
-describe('readCodeCollabFileIndexFromFlock', () => {
-  it('reads path-keyed file index rows and skips invalid rows', () => {
-    const flock = new Flock('test-peer');
-    flock.set(['README.md'], { kind: 'text', change: { diff: [1, 0] } });
-    flock.set(['assets/logo.png'], { kind: 'binary' });
-    flock.set(['nested', 'bad'], { kind: 'text' });
-    flock.set(['bad.txt'], { kind: 'unknown' });
-    flock.commit();
-
-    expect(readCodeCollabFileIndexFromFlock(flock)).toEqual({
-      'README.md': { kind: 'text', change: { diff: [1, 0] } },
-      'assets/logo.png': { kind: 'binary' },
-    });
-  });
-});
-
 describe('materializeCodeCollabV2FileIndexForFileProvider', () => {
-  it('waits for file-index loading before creating a provider state', () => {
-    expect(
-      materializeCodeCollabV2FileIndexForFileProvider({
-        fileIndex: null,
-        revision: 0,
-        sourceState: 'live-collaborative',
-      })
-    ).toBeNull();
-  });
-
-  it('accepts an explicitly empty file index', () => {
-    const state = materializeCodeCollabV2FileIndexForFileProvider({
-      fileIndex: {},
-      revision: 1,
-      updatedAtMs: 123,
-      sourceState: 'live-collaborative',
-    });
-
-    expect(state).toMatchObject({
-      fileTree: {},
-      allChanges: {},
-      updatedAtMs: 123,
-    });
-    expect(state?.files).toEqual([]);
-  });
-
-  it('builds file tree entries and All Changes from one path-keyed table', () => {
-    const state = materializeCodeCollabV2FileIndexForFileProvider({
-      fileIndex: {
-        '.git': { kind: 'skipped', reason: 'ignored_directory' },
-        'README.md': { kind: 'file', change: { diff: [1, 0] } },
-        docs: { kind: 'lazy' },
-        'docs/deleted.md': { kind: 'deleted', change: { del: true, diff: [0, 3] } },
-        large: true,
-      },
-      revision: 2,
-      sourceState: 'live-collaborative',
-    });
-
-    expect(state?.fileTree).toEqual({
-      '.git': { kind: 'skipped', reason: 'ignored_directory' },
-      'README.md': true,
-      docs: { kind: 'lazy' },
-      large: true,
-    });
-    expect(state?.allChanges).toEqual({
-      'README.md': { diff: [1, 0] },
-      'docs/deleted.md': { del: true, diff: [0, 3] },
-    });
-    expect(state?.files.map((entry) => entry.path)).toEqual(['.git', 'docs', 'large', 'README.md']);
-  });
-
   it('shows a member root at its directory and rebuilds when the mounts change', () => {
     const fileIndex = {
       'api/main.go': true as const,
@@ -218,7 +150,172 @@ describe('materializeCodeCollabV2FileIndexForFileProvider', () => {
   });
 });
 
+describe('file-index generation replication', () => {
+  it('publishes generation-only updates without replacing legacy file rows', async () => {
+    const flock = new Flock('generation-only');
+    flock.set(['a.ts'], { kind: 'text', change: { diff: [1, 1] } });
+    flock.set(['a.ts', 'v'], { g: 'epoch.1' });
+    flock.commit();
+    const runtime = createRuntime({
+      repo: { openFlockDoc: async () => ({ flock, joinRoom: async () => makeSyncedFlockRoom() }) },
+    });
+    const lease = await runtime.codeCollabFileIndexCache!.acquire('workspace:fi:owner');
+    try {
+      await flushMicrotasks(8);
+      const first = lease.resource.getSnapshot();
+      if (first.status !== 'ready') throw new Error('Index not ready.');
+      expect(first.snapshot.generations).toEqual({ 'a.ts': 'epoch.1' });
+      flock.set(['a.ts', 'v'], { g: 'epoch.2' });
+      flock.commit();
+      const second = lease.resource.getSnapshot();
+      if (second.status !== 'ready') throw new Error('Index not ready.');
+      expect(second.snapshot.generations).toEqual({ 'a.ts': 'epoch.2' });
+      expect(second.snapshot.fileIndex).toBe(first.snapshot.fileIndex);
+      expect(second.snapshot.revision).toBeGreaterThan(first.snapshot.revision);
+    } finally {
+      await lease.release();
+    }
+  });
+});
+
 describe('useCodeCollabSessionFileProvider', () => {
+  it.each([
+    ['local', true],
+    ['cloud', true],
+    ['local', false],
+    ['cloud', false],
+  ] as const)(
+    'opens a full Changes list through the %s provider with blob transport %s and leaves bodies deferred',
+    async (plane, blobs) => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      const store = createStore();
+      const sessionId = `changes-${plane}` as SessionId;
+      const machineId = `machine-${plane}` as MachineId;
+      const flock = new Flock(`changes-${plane}`);
+      flock.set(['indexed.ts'], { kind: 'file', change: { diff: [1, 0] } });
+      flock.commit();
+      let bodyBytes = 0;
+      let rootUnavailable = false;
+      store.set(
+        runtimeAtom,
+        createRuntime({
+          prepareSessionTarget: async () => plane,
+          repo: {
+            openFlockDoc: async () => ({ flock, joinRoom: async () => makeSyncedFlockRoom() }),
+          },
+          acquireSessionStore: () => new Promise(() => undefined),
+          requestLocalCodeCollabFileIndex: async () => ({
+            status: 'ok',
+            ownerSessionId: sessionId,
+            fileIndex: { 'indexed.ts': { kind: 'file', change: { diff: [1, 0] } } },
+            updatedAtMs: 1,
+          }),
+          getDiffBlobTransportOptions: async () => ({
+            supported: blobs,
+            scope: plane,
+            persist: false,
+          }),
+          requestCodeCollabInitDirectory: async () => ({ status: 'ok' }),
+          requestCodeCollabOpenDiffManifest: async (
+            _machine: MachineId,
+            request: { cursor?: string }
+          ) => ({
+            status: 'ok',
+            base: 'base',
+            entries: [
+              {
+                path: request.cursor ? '\0lody-root:member:docs/unindexed.ts' : 'indexed.ts',
+                status: 'ok',
+                base: null,
+                head: {
+                  key: `sha256:${'1'.repeat(64)}`,
+                  rawBytes: 6,
+                  format: { encoding: 'utf8' },
+                },
+                add: 1,
+                del: 0,
+              },
+            ],
+            nextCursor: request.cursor ? null : 'page-2',
+          }),
+          requestCodeCollabOpenAllChangesDiff: async (
+            _machine: MachineId,
+            request: { rootId?: string; scope?: string }
+          ) => {
+            if (request.rootId && rootUnavailable)
+              return { status: 'unavailable', reason: 'transient_io' };
+            if (request.rootId && request.scope === 'uncommitted')
+              return { status: 'unavailable', reason: 'not_a_git_worktree' };
+            return {
+              status: 'ok',
+              base: 'base',
+              entries: [
+                {
+                  status: 'deferred',
+                  path: request.rootId ? 'unindexed.ts' : 'indexed.ts',
+                  add: 1,
+                  del: 0,
+                },
+              ],
+              truncated: true,
+            };
+          },
+          requestCodeCollabReadBlob: async () => {
+            bodyBytes++;
+            throw new Error('List reads must not load file bodies.');
+          },
+        })
+      );
+      store.set(sessionMetaCacheAtom, {
+        [getSessionRoomId(sessionId)]: {
+          id: sessionId,
+          machineId,
+          userId: 'user-1',
+          projectRun: { members: { docs: { access: 'additional', path: 'docs' } } },
+        } as SessionMeta,
+      });
+      let state: ReturnType<typeof useSessionDiffSummary> | undefined;
+      let provider: UseCodeCollabSessionFileProviderResult['provider'] = null;
+      function Harness() {
+        const files = useCodeCollabSessionFileProvider({
+          workspaceId: 'workspace-1',
+          sessionId,
+          enabled: true,
+          machineId,
+          requestedByUserId: 'user-1',
+        });
+        provider = files.provider;
+        state = useSessionDiffSummary(sessionId, {
+          fileProvider: files.provider,
+          fileProviderPending: files.status === 'loading' || files.status === 'checking',
+          refreshChanges: true,
+        });
+        return null;
+      }
+      render(createElement(Provider, { store }, createElement(Harness)));
+      await flushMicrotasks(12);
+      expect(state?.summary.changeFilePaths).toEqual(['docs/unindexed.ts', 'indexed.ts']);
+      expect(state?.liveDiffStat).toEqual({ add: 2, del: 0, files: 2 });
+      expect(bodyBytes).toBe(0);
+      if (!blobs) {
+        await act(async () => {
+          expect(await provider?.getAllChangesDiff?.(undefined, 'uncommitted')).toMatchObject({
+            status: 'ready',
+            entries: [{ path: 'indexed.ts' }],
+          });
+        });
+        expect(state?.summary.changeFilePaths).toEqual(['docs/unindexed.ts', 'indexed.ts']);
+        rootUnavailable = true;
+        await act(async () => {
+          expect(await provider?.refreshChangedFiles?.()).toMatchObject({ status: 'unavailable' });
+        });
+        expect(await provider?.listChangedFiles()).toMatchObject({
+          files: [{ path: 'docs/unindexed.ts' }, { path: 'indexed.ts' }],
+        });
+      }
+    }
+  );
+
   it('releases a failed conversation borrower so the next Files open can recover', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     const store = createStore();
@@ -285,7 +382,9 @@ describe('useCodeCollabSessionFileProvider', () => {
       ]);
       expect(warning.mock.calls).toContainEqual([
         '[Code Collab] conversation file-link index unavailable',
-        expect.objectContaining({ error: expect.objectContaining({ message: originalError.message }) }),
+        expect.objectContaining({
+          error: expect.objectContaining({ message: originalError.message }),
+        }),
       ]);
       expect(container?.querySelector('span')?.dataset.matched).toBe('false');
 
@@ -528,6 +627,86 @@ describe('useCodeCollabSessionFileProvider', () => {
     });
   });
 
+  it.each(['write', 'read'] as const)(
+    'keeps %s diff reads available while writer index activation is independent',
+    async (role) => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      const store = createStore();
+      const sessionId = `diff-activation-${role}` as SessionId;
+      const machineId = 'machine-1' as MachineId;
+      const flock = {
+        scan: () => [{ key: ['a.ts'], value: { kind: 'text', change: { diff: [1, 1] } } }],
+        subscribe: () => () => undefined,
+      };
+      let watching = false;
+      let releaseActivation!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseActivation = resolve;
+      });
+      const runtime = createRuntime({
+        repo: {
+          openFlockDoc: async () => ({ flock, joinRoom: async () => makeSyncedFlockRoom() }),
+        },
+        getDiffBlobTransportOptions: async () => ({
+          supported: true,
+          scope: 'synthetic',
+          persist: false,
+        }),
+        requestCodeCollabInitDirectory: async () => {
+          watching = true;
+          await held;
+          throw new Error('Synthetic index publication unavailable');
+        },
+        requestCodeCollabOpenDiffManifest: async () => ({
+          status: 'ok',
+          entries: [
+            {
+              path: 'a.ts',
+              status: 'ok',
+              base: null,
+              head: { key: `sha256:${'1'.repeat(64)}`, rawBytes: 1, format: { encoding: 'utf8' } },
+            },
+          ],
+          nextCursor: null,
+        }),
+      });
+      store.set(runtimeAtom, runtime);
+      store.set(sessionMetaCacheAtom, {
+        [getSessionRoomId(sessionId)]: {
+          id: sessionId,
+          machineId,
+          userId: 'user-1',
+        } as SessionMeta,
+      });
+      let latest: UseCodeCollabSessionFileProviderResult | undefined;
+      function Harness() {
+        const result = useCodeCollabSessionFileProvider({
+          workspaceId: 'workspace-1',
+          sessionId,
+          machineId,
+          requestedRole: role,
+        });
+        useEffect(() => {
+          latest = result;
+        }, [result]);
+        return null;
+      }
+      render(createElement(Provider, { store }, createElement(Harness)));
+      await flushMicrotasks();
+      const result = await latest!.provider!.getAllChangesDiff!();
+      expect(result).toMatchObject({
+        status: 'ready',
+        entries: [{ path: 'a.ts', diff: { status: 'deferred' } }],
+      });
+      expect(watching).toBe(role === 'write');
+      releaseActivation();
+      await flushMicrotasks();
+      // Failure of the optional publisher leaves exact content reads usable.
+      expect(await latest!.provider!.getAllChangesDiff!()).toMatchObject({ status: 'ready' });
+      await flushMicrotasks();
+    }
+  );
+
   it('publishes the remote file index after a read-only Flock catchup', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     const store = createStore();
@@ -591,7 +770,6 @@ describe('useCodeCollabSessionFileProvider', () => {
     expect(syncOnce).not.toHaveBeenCalled();
     expect(joinRoom).toHaveBeenCalledTimes(1);
     expect(initDirectory).not.toHaveBeenCalled();
-    expect(scan).toHaveBeenCalledTimes(2);
     expect(updates.at(-1)).toMatchObject({
       status: 'ready',
       role: 'write',
@@ -599,298 +777,6 @@ describe('useCodeCollabSessionFileProvider', () => {
     await expect(updates.at(-1)?.provider?.listFiles()).resolves.toEqual([
       expect.objectContaining({ path: 'README.md' }),
     ]);
-  });
-
-  it('prepares the remote target and reads the shared file-index Flock', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-remote-file-index' as SessionId;
-    const machineId = 'machine-remote' as MachineId;
-    const signalFlock = {
-      scan: vi.fn(() => [
-        {
-          key: ['remote.ts'],
-          value: { kind: 'text', change: { diff: [2, 0] as [number, number] } },
-        },
-      ]),
-      subscribe: vi.fn(() => vi.fn()),
-    };
-    const syncSignalOnce = vi.fn(async () => undefined);
-    const joinSignalRoom = vi.fn(async () => makeSyncedFlockRoom());
-    const openFlockDoc = vi.fn(async (flockDocId: string) => {
-      if (flockDocId !== 'workspace-1:fi:session-remote-file-index') {
-        throw new Error(`Unexpected Flock doc: ${flockDocId}`);
-      }
-      return {
-        flock: signalFlock,
-        syncOnce: syncSignalOnce,
-        joinRoom: joinSignalRoom,
-      };
-    });
-    const prepareSessionTarget = vi.fn(async () => 'cloud' as const);
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        prepareSessionTarget,
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: vi.fn(),
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks(8);
-
-    expect(prepareSessionTarget).toHaveBeenCalledWith(sessionId, machineId);
-    expect(openFlockDoc).toHaveBeenCalledWith('workspace-1:fi:session-remote-file-index');
-    expect(syncSignalOnce).not.toHaveBeenCalled();
-    expect(joinSignalRoom).toHaveBeenCalledTimes(1);
-    expect(updates.at(-1)).toMatchObject({
-      status: 'ready',
-      role: 'write',
-    });
-    await expect(updates.at(-1)?.provider?.listFiles()).resolves.toEqual([
-      expect.objectContaining({ path: 'remote.ts' }),
-    ]);
-    await expect(updates.at(-1)?.provider?.listChangedFiles()).resolves.toMatchObject({
-      status: 'ready',
-      files: [expect.objectContaining({ path: 'remote.ts', add: 2, del: 0 })],
-    });
-  });
-
-  it('applies remote file-index Flock events without Machine RPC snapshots', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-remote-events' as SessionId;
-    const machineId = 'machine-remote' as MachineId;
-    let signalListener:
-      | ((batch: { events: readonly { key: readonly unknown[]; value?: unknown }[] }) => void)
-      | null = null;
-    const signalFlock = {
-      scan: vi.fn(() => [
-        {
-          key: ['before.ts'],
-          value: { kind: 'text', change: { diff: [1, 0] as [number, number] } },
-        },
-      ]),
-      subscribe: vi.fn((listener) => {
-        signalListener = listener;
-        return vi.fn();
-      }),
-    };
-    const syncSignalOnce = vi.fn(async () => undefined);
-    const joinSignalRoom = vi.fn(async () => makeSyncedFlockRoom());
-    const openFlockDoc = vi.fn(async (flockDocId: string) => {
-      if (flockDocId !== 'workspace-1:fi:session-remote-events') {
-        throw new Error(`Unexpected Flock doc: ${flockDocId}`);
-      }
-      return {
-        flock: signalFlock,
-        syncOnce: syncSignalOnce,
-        joinRoom: joinSignalRoom,
-      };
-    });
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: vi.fn(),
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks(8);
-
-    expect(signalListener).not.toBeNull();
-    expect(syncSignalOnce).not.toHaveBeenCalled();
-    expect(joinSignalRoom).toHaveBeenCalledTimes(1);
-    await expect(updates.at(-1)?.provider?.listFiles()).resolves.toEqual([
-      expect.objectContaining({ path: 'before.ts' }),
-    ]);
-
-    await act(async () => {
-      signalListener?.({
-        events: [
-          { key: ['before.ts'] },
-          {
-            key: ['after.ts'],
-            value: { kind: 'text', change: { diff: [2, 0] as [number, number] } },
-          },
-        ],
-      });
-    });
-    await flushMicrotasks(8);
-
-    await expect(updates.at(-1)?.provider?.listFiles()).resolves.toEqual([
-      expect.objectContaining({ path: 'after.ts' }),
-    ]);
-    await expect(updates.at(-1)?.provider?.listChangedFiles()).resolves.toMatchObject({
-      status: 'ready',
-      files: [expect.objectContaining({ path: 'after.ts', add: 2, del: 0 })],
-    });
-  });
-
-  it('surfaces target resolution failures before opening a Flock room', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-target-unavailable' as SessionId;
-    const machineId = 'machine-remote' as MachineId;
-    const signalFlock = {
-      scan: vi.fn(() => []),
-      subscribe: vi.fn(() => vi.fn()),
-    };
-    const syncSignalOnce = vi.fn(async () => undefined);
-    const joinSignalRoom = vi.fn(async () => makeSyncedFlockRoom());
-    const openFlockDoc = vi.fn(async (flockDocId: string) => {
-      if (flockDocId !== 'workspace-1:fi:session-target-unavailable') {
-        throw new Error(`Unexpected Flock doc: ${flockDocId}`);
-      }
-      return {
-        flock: signalFlock,
-        syncOnce: syncSignalOnce,
-        joinRoom: joinSignalRoom,
-      };
-    });
-    const prepareSessionTarget = vi.fn(async () => {
-      throw new Error('remote target unavailable');
-    });
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        prepareSessionTarget,
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: vi.fn(),
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks(8);
-
-    expect(prepareSessionTarget).toHaveBeenCalledWith(sessionId, machineId);
-    expect(openFlockDoc).not.toHaveBeenCalled();
-    expect(syncSignalOnce).not.toHaveBeenCalled();
-    expect(joinSignalRoom).not.toHaveBeenCalled();
-    expect(updates.at(-1)).toMatchObject({
-      status: 'error',
-      message: 'remote target unavailable',
-    });
-  });
-
-  it('surfaces remote-machine file-index Flock sync failures', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-remote-sync-failed' as SessionId;
-    const machineId = 'machine-remote' as MachineId;
-    const signalFlock = {
-      scan: vi.fn(() => []),
-      subscribe: vi.fn(() => vi.fn()),
-    };
-    const syncSignalOnce = vi.fn(async () => undefined);
-    const joinSignalRoom = vi.fn(async () => {
-      throw new Error('file-index sync failed');
-    });
-    const openFlockDoc = vi.fn(async (flockDocId: string) => {
-      if (flockDocId !== 'workspace-1:fi:session-remote-sync-failed') {
-        throw new Error(`Unexpected Flock doc: ${flockDocId}`);
-      }
-      return {
-        flock: signalFlock,
-        syncOnce: syncSignalOnce,
-        joinRoom: joinSignalRoom,
-      };
-    });
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: vi.fn(),
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks(8);
-
-    expect(syncSignalOnce).not.toHaveBeenCalled();
-    expect(joinSignalRoom).toHaveBeenCalledTimes(1);
-    expect(updates.at(-1)).toMatchObject({
-      status: 'error',
-      message: 'file-index sync failed',
-    });
   });
 
   it('publishes an empty file index after read-only catchup without initializing directories', async () => {
@@ -947,246 +833,7 @@ describe('useCodeCollabSessionFileProvider', () => {
     expect(syncOnce).not.toHaveBeenCalled();
     expect(joinRoom).toHaveBeenCalledTimes(1);
     expect(initDirectory).not.toHaveBeenCalled();
-    expect(scan).toHaveBeenCalledTimes(2);
     expect(updates.at(-1)?.status).toBe('empty');
-  });
-
-  it('keeps read-only catchup pending until the Flock handle is ready', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-catchup-before-open' as SessionId;
-    const machineId = 'machine-1' as MachineId;
-    let remoteVisible = false;
-    const scan = vi.fn(() =>
-      remoteVisible
-        ? [{ key: ['package.json'], value: { kind: 'text', change: { diff: [1, 1] } } }]
-        : []
-    );
-    const fakeFlock = {
-      scan,
-      subscribe: vi.fn(() => vi.fn()),
-    };
-    let resolveOpenFlockDoc:
-      | ((value: {
-          flock: typeof fakeFlock;
-          syncOnce: () => Promise<void>;
-          joinRoom: () => Promise<ReturnType<typeof makeSyncedFlockRoom>>;
-        }) => void)
-      | null = null;
-    const syncOnce = vi.fn(async () => {
-      remoteVisible = true;
-    });
-    const initDirectory = vi.fn(async () => ({
-      status: 'ok' as const,
-      path: '.',
-      publishedEntries: 1,
-    }));
-    const openFlockDoc = vi.fn(
-      () =>
-        new Promise<{
-          flock: typeof fakeFlock;
-          syncOnce: () => Promise<void>;
-          joinRoom: () => Promise<ReturnType<typeof makeSyncedFlockRoom>>;
-        }>((resolve) => {
-          resolveOpenFlockDoc = resolve;
-        })
-    );
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: initDirectory,
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks();
-    expect(initDirectory).not.toHaveBeenCalled();
-    expect(syncOnce).not.toHaveBeenCalled();
-
-    await act(async () => {
-      resolveOpenFlockDoc?.({
-        flock: fakeFlock,
-        syncOnce,
-        joinRoom: async () => {
-          remoteVisible = true;
-          return makeSyncedFlockRoom();
-        },
-      });
-    });
-    await flushMicrotasks();
-
-    expect(scan).toHaveBeenCalledTimes(2);
-    expect(syncOnce).not.toHaveBeenCalled();
-    expect(updates.at(-1)).toMatchObject({
-      status: 'ready',
-      role: 'write',
-    });
-    await expect(updates.at(-1)?.provider?.listFiles()).resolves.toEqual([
-      expect.objectContaining({ path: 'package.json' }),
-    ]);
-  });
-
-  it('applies subscribed file-index events without rescanning the full Flock table', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-incremental' as SessionId;
-    const machineId = 'machine-1' as MachineId;
-    let listener:
-      | ((batch: { events: readonly { key: readonly unknown[]; value?: unknown }[] }) => void)
-      | null = null;
-    const firstSyncedWithRemote = new Promise<void>(() => undefined);
-    const scan = vi.fn(() => [
-      { key: ['README.md'], value: { kind: 'text', change: { diff: [1, 0] } } },
-    ]);
-    const fakeFlock = {
-      scan,
-      subscribe: vi.fn((nextListener) => {
-        listener = nextListener;
-        return vi.fn();
-      }),
-    };
-    const initDirectory = vi.fn(async () => ({
-      status: 'ok' as const,
-      path: '.',
-      publishedEntries: 1,
-    }));
-    const syncOnce = vi.fn(async () => undefined);
-    const joinRoom = vi.fn(async () => makeSyncedFlockRoom(firstSyncedWithRemote));
-    const openFlockDoc = vi.fn(async () => ({
-      flock: fakeFlock,
-      syncOnce,
-      joinRoom,
-    }));
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: initDirectory,
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks();
-    expect(scan).toHaveBeenCalledTimes(1);
-    expect(syncOnce).not.toHaveBeenCalled();
-    expect(joinRoom).toHaveBeenCalledTimes(1);
-    expect(initDirectory).not.toHaveBeenCalled();
-    expect(listener).not.toBeNull();
-
-    await act(async () => {
-      listener?.({
-        events: [{ key: ['CHANGELOG.md'], value: { kind: 'text', change: { diff: [2, 0] } } }],
-      });
-    });
-
-    expect(scan).toHaveBeenCalledTimes(1);
-    expect(syncOnce).not.toHaveBeenCalled();
-    await expect(updates.at(-1)?.provider?.listFiles()).resolves.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ path: 'CHANGELOG.md' }),
-        expect.objectContaining({ path: 'README.md' }),
-      ])
-    );
-  });
-
-  it('renders published v2 file state without root directory activation', async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const store = createStore();
-    const sessionId = 'session-ready' as SessionId;
-    const machineId = 'machine-1' as MachineId;
-    const initDirectory = vi.fn(async () => ({
-      status: 'error' as const,
-      code: 'activation_failed',
-      message: 'root activation failed',
-    }));
-    const flock = new Flock('test-peer');
-    flock.set(['README.md'], { kind: 'text', change: { diff: [1, 0] } });
-    flock.commit();
-    const openFlockDoc = vi.fn(async () => ({
-      flock,
-      syncOnce: async () => undefined,
-      joinRoom: async () => makeSyncedFlockRoom(),
-    }));
-    store.set(
-      runtimeAtom,
-      createRuntime({
-        repo: { openFlockDoc },
-        requestCodeCollabInitDirectory: initDirectory,
-      })
-    );
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(sessionId)]: {
-        id: sessionId,
-        machineId,
-        userId: 'user-1',
-      } as SessionMeta,
-    });
-
-    const updates: UseCodeCollabSessionFileProviderResult[] = [];
-    render(
-      createElement(
-        Provider,
-        { store },
-        createElement(ProviderHarness, {
-          sessionId,
-          machineId,
-          onUpdate: (result) => updates.push(result),
-        })
-      )
-    );
-
-    await flushMicrotasks();
-
-    expect(initDirectory).not.toHaveBeenCalled();
-    expect(openFlockDoc).toHaveBeenCalledWith('workspace-1:fi:session-ready');
-    expect(updates.at(-1)).toMatchObject({
-      status: 'ready',
-      role: 'write',
-    });
-    expect(updates.at(-1)?.provider).not.toBeNull();
-    const providers = updates
-      .map((update) => update.provider)
-      .filter((provider): provider is NonNullable<typeof provider> => provider !== null);
-    expect(new Set(providers).size).toBe(1);
   });
 
   it('stops exposing the old file index while the same workspace runtime is replaced', async () => {

@@ -42,10 +42,15 @@ export const machinePairCommand = new Command('pair')
       process.removeListener('SIGINT', abort);
       const { startCommand } = await import('./start');
       await startCommand.parseAsync(['--paired-workspace', result.reference], { from: 'user' });
-    } catch {
+    } catch (error) {
       // Never print SDK errors, the command, credentials, or public proof blobs.
+      const code = error instanceof Error ? error.message : '';
       console.error(
-        'Pairing has not completed. Retry the same command to resume. If the desktop reports cancellation or expiry, create a new command there.'
+        code === 'e2ee_waiting_for_key'
+          ? 'This machine is approved, but no desktop has delivered the current workspace key yet. Open the encrypted workspace on an approved desktop, then retry the same command.'
+          : code === 'e2ee_pairing_claimed_by_another_machine'
+            ? 'This pairing command was already used by another machine. Cancel it in the Lody app if it is still shown, then create a new command there. Retrying this command will not help.'
+            : 'Pairing has not completed. Retry the same command to resume. If the desktop reports cancellation or expiry, create a new command there.'
       );
       process.exitCode = 1;
     } finally {

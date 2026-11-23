@@ -1,3 +1,8 @@
+import { daemonLossObserver } from '../src/lib/e2ee/client-loss-observer';
+vi.hoisted(() => {
+  Object.assign(globalThis, { __LODY_E2E_DAEMON_LOSS__: true });
+  process.env.LODY_E2E = '1';
+});
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   ACPSessionId,
@@ -365,7 +370,20 @@ describe('AgentClient plan mode permission restoration', () => {
     it.each(['resolve', 'reject'] as const)(
       'keeps cancelled raw prompts pending until they %s',
       async (outcome) => {
-        const { client } = createTestClient();
+        const { client } = createTestClient({ workspaceId: 'e2e-probe' as WorkspaceId });
+        daemonLossObserver.register(
+          { workspaceId: 'e2e-probe', machineId: 'machine', accountId: 'account' },
+          () => ({
+            intakeClosed: false,
+            pending: {
+              processorActive: 0,
+              processorQueued: 0,
+              watcherChecks: 0,
+              executionTurns: 0,
+              executionBookkeeping: 0,
+            },
+          })
+        );
         const raw = Promise.withResolvers<PromptResponse>();
         // @ts-expect-error - focused transport-boundary setup
         client.connection = { prompt: () => raw.promise, cancel: async () => {} };
@@ -377,6 +395,7 @@ describe('AgentClient plan mode permission restoration', () => {
         await expect(local).rejects.toThrow('Agent prompt aborted');
 
         const drain = client.pendingPromptCompletion;
+        expect(daemonLossObserver.inspect('e2e-probe')?.pending.executionBookkeeping).toBe(1);
         expect(drain).not.toBeNull();
         let drained = false;
         void drain?.then(() => {
@@ -388,6 +407,7 @@ describe('AgentClient plan mode permission restoration', () => {
         if (outcome === 'resolve') raw.resolve({ stopReason: 'cancelled' });
         else raw.reject(new Error('ACP connection closed'));
         await drain;
+        expect(daemonLossObserver.inspect('e2e-probe')?.pending.executionBookkeeping).toBe(0);
         expect(client.pendingPromptCompletion).toBeNull();
       }
     );
@@ -395,7 +415,23 @@ describe('AgentClient plan mode permission restoration', () => {
     it.each(['original', 'steer'] as const)(
       'drains both Claude handoff requests when %s finishes first',
       async (first) => {
-        const { client } = createTestClient({ agentType: 'claude' });
+        const { client } = createTestClient({
+          agentType: 'claude',
+          workspaceId: 'e2e-handoff' as WorkspaceId,
+        });
+        daemonLossObserver.register(
+          { workspaceId: 'e2e-handoff', machineId: 'machine', accountId: 'account' },
+          () => ({
+            intakeClosed: false,
+            pending: {
+              processorActive: 0,
+              processorQueued: 0,
+              watcherChecks: 0,
+              executionTurns: 0,
+              executionBookkeeping: 0,
+            },
+          })
+        );
         const original = Promise.withResolvers<PromptResponse>();
         const steered = Promise.withResolvers<PromptResponse>();
         let steerId = '';
@@ -428,6 +464,7 @@ describe('AgentClient plan mode permission restoration', () => {
         if (outcome.outcome !== 'applied') throw new Error('Expected applied steer');
         outcome.application.release();
         await application;
+        expect(daemonLossObserver.inspect('e2e-handoff')?.pending.executionBookkeeping).toBe(2);
         const drain = client.pendingPromptCompletion;
         let drained = false;
         void drain?.then(() => {
@@ -441,10 +478,12 @@ describe('AgentClient plan mode permission restoration', () => {
           await steer.completion;
         }
         expect(drained).toBe(false);
+        expect(daemonLossObserver.inspect('e2e-handoff')?.pending.executionBookkeeping).toBe(1);
         expect(client.pendingPromptCompletion).not.toBeNull();
         original.resolve({ stopReason: 'end_turn' });
         steered.resolve({ stopReason: 'end_turn' });
         await Promise.all([initial, steer.completion, drain]);
+        expect(daemonLossObserver.inspect('e2e-handoff')?.pending.executionBookkeeping).toBe(0);
         expect(client.pendingPromptCompletion).toBeNull();
       }
     );
@@ -603,140 +642,6 @@ describe('AgentClient plan mode permission restoration', () => {
       });
       await drain;
       expect(client.pendingPromptCompletion).toBeNull();
-    });
-
-    it('handles rate limit extension notifications', async () => {
-      const { client, onRateLimitUpdate } = createTestClient();
-      const limits = {
-        schemaVersion: 2 as const,
-        planName: '"pro"',
-        limitName: null,
-        limitId: 'codex',
-        windows: [
-          {
-            usedPercent: 18,
-            windowDurationMins: 7 * 24 * 60,
-            resetsAt: 1777400602,
-          },
-        ],
-        fiveHour: 3,
-        sevenDay: 82,
-        fiveHourResetAt: 1777288209,
-        sevenDayResetAt: 1777400602,
-      };
-
-      await expect(client.extNotification?.('_acp_ext:session_rate_limits', limits)).resolves.toBe(
-        undefined
-      );
-
-      expect(onRateLimitUpdate).toHaveBeenCalledWith({
-        limitId: 'codex',
-        limitName: null,
-        planName: '"pro"',
-        scope: { providerId: 'codex' },
-        windows: [
-          {
-            usedPercent: 18,
-            windowDurationSeconds: 604800,
-            resetsAtEpochSeconds: 1777400602,
-          },
-        ],
-      });
-    });
-
-    it('keeps handling rate limit extension method requests', async () => {
-      const { client, onRateLimitUpdate } = createTestClient();
-      const limits = {
-        planName: null,
-        fiveHour: 3,
-        sevenDay: 82,
-        fiveHourResetAt: 1777288209,
-        sevenDayResetAt: 1777400602,
-      };
-
-      await expect(client.extMethod('_acp_ext:session_rate_limits', limits)).resolves.toEqual({});
-
-      expect(onRateLimitUpdate).toHaveBeenCalledWith({
-        limitId: 'codex',
-        planName: null,
-        scope: { providerId: 'codex' },
-        windows: [
-          {
-            usedPercent: 3,
-            windowDurationSeconds: 18000,
-            resetsAtEpochSeconds: 1777288209,
-          },
-          {
-            usedPercent: 82,
-            windowDurationSeconds: 604800,
-            resetsAtEpochSeconds: 1777400602,
-          },
-        ],
-      });
-    });
-
-    it('routes completed Codex proposed plan extension notifications through proposed plan updates', async () => {
-      const { client, onUpdateMessage } = createTestClient();
-
-      await client.extNotification?.('_acp_ext:codex_proposed_plan', {
-        schemaVersion: 1,
-        sessionId: 'acp-test',
-        turnId: 'codex-turn-1',
-        markdown: '- Inspect event routing',
-        status: 'completed',
-        isLatest: true,
-      });
-
-      expect(onUpdateMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionId: 'acp-test',
-          update: expect.objectContaining({
-            sessionUpdate: 'plan_update',
-            plan: {
-              type: 'markdown',
-              planId: 'codex-turn-1',
-              content: '- Inspect event routing',
-            },
-          }),
-        })
-      );
-    });
-
-    it('ignores non-standard Codex proposed plan extension method names', async () => {
-      const { client, onUpdateMessage } = createTestClient();
-
-      await client.extNotification?.('codex_proposed_plan', {
-        schemaVersion: 1,
-        sessionId: 'acp-test',
-        turnId: 'codex-turn-1',
-        markdown: '- Inspect event routing',
-        status: 'completed',
-        isLatest: true,
-      });
-
-      expect(onUpdateMessage).not.toHaveBeenCalled();
-    });
-
-    it('routes in-progress Codex proposed plan deltas through proposed plan updates', async () => {
-      const { client, onUpdateMessage } = createTestClient();
-
-      await client.extNotification?.('_acp_ext:codex_proposed_plan', {
-        schemaVersion: 1,
-        sessionId: 'acp-test',
-        turnId: 'codex-turn-1',
-        markdown: '- Inspect event routing',
-        status: 'delta',
-        isLatest: true,
-      });
-
-      expect(onUpdateMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          update: expect.objectContaining({
-            sessionUpdate: 'plan_update',
-            plan: expect.objectContaining({ planId: 'codex-turn-1' }),
-          }),
-        })
-      );
     });
 
     it('routes image generation tool calls to begin/end callbacks and suppresses them', async () => {
@@ -1347,6 +1252,107 @@ describe('unstable_createElicitation (AskUserQuestion bridge)', () => {
     });
   });
 
+  it.each([
+    { answer: 'CSV', expected: { q1: '2' } },
+    { answer: 'XML', expected: { q1_other: 'XML' } },
+  ])('bridges native Antigravity questions and submits $answer', async ({ answer, expected }) => {
+    const { client, onRequestPermission } = createTestClient({ agentType: 'antigravity' });
+    onRequestPermission.mockResolvedValueOnce({
+      outcome: {
+        outcome: 'selected',
+        optionId: 'answer',
+        _meta: { lody: { elicitation: { version: 1, answers: { q1: answer } } } },
+      },
+    } as unknown as Awaited<ReturnType<typeof onRequestPermission>>);
+    const request = {
+      mode: 'form',
+      sessionId: 'acp-test',
+      toolCallId: 'native-question',
+      message: 'The agent has a question.',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          q1: {
+            type: 'string',
+            title: 'Which format?',
+            oneOf: [
+              { const: '1', title: 'JSON' },
+              { const: '2', title: 'CSV' },
+            ],
+          },
+          q1_other: { type: 'string', title: 'Other' },
+        },
+      },
+    } as unknown as CreateElicitationRequest;
+    await expect(client.unstable_createElicitation(request)).resolves.toEqual({
+      action: 'accept',
+      content: expected,
+    });
+    const calls = onRequestPermission.mock.calls as unknown as Array<
+      [string, RequestPermissionRequest]
+    >;
+    expect(calls[0]?.[1].toolCall.toolCallId).toBe('native-question');
+    expect(parseAskUserQuestionPermissionMeta(calls[0]?.[1]._meta)?.questions).toEqual([
+      {
+        id: 'q1',
+        question: 'Which format?',
+        header: '',
+        options: [{ label: 'JSON' }, { label: 'CSV' }],
+        multiSelect: false,
+        allowCustomAnswer: true,
+      },
+    ]);
+  });
+
+  it('bridges a Droid question and returns its custom answer in the expected fields', async () => {
+    const { client, onRequestPermission } = createTestClient({
+      cliType: 'registry',
+      agentType: 'factory-droid',
+    });
+    onRequestPermission.mockResolvedValueOnce({
+      outcome: {
+        outcome: 'selected',
+        optionId: 'answer',
+        _meta: { lody: { elicitation: { version: 1, answers: { question_1: 'DuckDB' } } } },
+      },
+    } as unknown as Awaited<ReturnType<typeof onRequestPermission>>);
+    const request = {
+      mode: 'form',
+      sessionId: 'acp-test',
+      message: 'Droid needs your answers to continue.',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          question_1: {
+            type: 'string',
+            title: 'Database',
+            description: 'Which database?',
+            oneOf: [
+              { const: 'option_0', title: 'PostgreSQL' },
+              { const: 'option_1', title: 'SQLite' },
+              { const: 'other', title: 'Other answer' },
+            ],
+          },
+          question_1_other: { type: 'string', title: 'Database: Other answer' },
+        },
+        required: ['question_1'],
+      },
+    } as unknown as CreateElicitationRequest;
+    await expect(client.unstable_createElicitation(request)).resolves.toEqual({
+      action: 'accept',
+      content: { question_1: 'other', question_1_other: 'DuckDB' },
+    });
+    const calls = onRequestPermission.mock.calls as unknown as Array<
+      [string, RequestPermissionRequest]
+    >;
+    const parsed = parseAskUserQuestionPermissionMeta(calls[0]?.[1]._meta);
+    expect(parsed?.questions[0]).toMatchObject({
+      id: 'question_1',
+      question: 'Which database?',
+      options: [{ label: 'PostgreSQL' }, { label: 'SQLite' }],
+    });
+  });
+
   it('returns cancel when the user dismisses the question', async () => {
     const { client, onRequestPermission } = createTestClient({ agentType: 'claude' });
     onRequestPermission.mockResolvedValueOnce({
@@ -1529,7 +1535,7 @@ describe('AgentClient goal session info', () => {
     ]);
   });
 
-  it('normalizes provider-neutral goal metadata for non-canonical agents', async () => {
+  it('normalizes Core goal metadata at the durable boundary', async () => {
     const { client, onThreadGoalUpdated, onUpdateMessage } = createTestClient({
       agentType: 'claude',
     });
@@ -1539,17 +1545,16 @@ describe('AgentClient goal session info', () => {
       update: {
         sessionUpdate: 'session_info_update',
         _meta: {
-          goal: {
-            objective: 'ship the release',
-            status: 'limited',
-            tokenBudget: 42_000,
-            iterations: 7,
-            lastReason: 'waiting for review',
-            tokensUsed: 12_000,
-            timeUsedSeconds: 90,
-            createdAt: 100,
-            updatedAt: 200,
-            controlMethod: '_session/goal',
+          lody: {
+            goal: {
+              objective: 'ship the release',
+              status: 'limited',
+              tokenBudget: 42_000,
+              tokensUsed: 12_000,
+              timeUsedSeconds: 90,
+              createdAtEpochSeconds: 100,
+              updatedAtEpochSeconds: 200,
+            },
           },
         },
       },
@@ -1563,96 +1568,45 @@ describe('AgentClient goal session info', () => {
       tokenBudget: 42_000,
       tokensUsed: 12_000,
       timeUsedSeconds: 90,
-      createdAt: 100,
-      updatedAt: 200,
+      createdAt: 100_000,
+      updatedAt: 200_000,
     });
     expect(onUpdateMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('prefers valid provider-neutral metadata over a legacy Codex duplicate', async () => {
-    const { client, onThreadGoalUpdated } = createTestClient();
+  it('ignores goal metadata outside the Core namespace', async () => {
+    const { client, onThreadGoalUpdated, onThreadGoalCleared } = createTestClient();
 
     await client.sessionUpdate({
       sessionId: 'acp-test',
       update: {
         sessionUpdate: 'session_info_update',
         _meta: {
-          goal: {
-            objective: 'neutral objective',
-            status: 'active',
-            controlMethod: '_session/goal',
-          },
-          codex: {
-            goal: {
-              objective: 'legacy objective',
-              status: 'paused',
-            },
-          },
+          goal: { objective: 'top-level objective', status: 'active' },
+          codex: { goal: { objective: 'codex objective', status: 'paused' } },
         },
       },
     } as unknown as SessionNotification);
 
-    expect(onThreadGoalUpdated).toHaveBeenCalledWith({
-      type: 'goal',
-      threadId: 'acp-test',
-      objective: 'neutral objective',
-      status: 'active',
-      tokenBudget: null,
-    });
+    expect(onThreadGoalUpdated).not.toHaveBeenCalled();
+    expect(onThreadGoalCleared).not.toHaveBeenCalled();
   });
 
-  it('keeps parsing legacy Codex goal metadata', async () => {
-    const { client, onThreadGoalUpdated, onUpdateMessage } = createTestClient();
-
-    await client.sessionUpdate({
-      sessionId: 'acp-test',
-      update: {
-        sessionUpdate: 'session_info_update',
-        _meta: {
-          codex: {
-            goal: {
-              objective: 'ship the release',
-              status: 'budgetLimited',
-              tokenBudget: 42_000,
-            },
-          },
-        },
-      },
-    });
-
-    expect(onThreadGoalUpdated).toHaveBeenCalledWith({
-      type: 'goal',
-      threadId: 'acp-test',
-      objective: 'ship the release',
-      status: 'budgetLimited',
-      tokenBudget: 42_000,
-    });
-    expect(onUpdateMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it('handles a null provider-neutral goal as cleared', async () => {
+  it('handles a null Core goal as cleared', async () => {
     const { client, onThreadGoalCleared } = createTestClient({ agentType: 'claude' });
 
     await client.sessionUpdate({
       sessionId: 'acp-test',
       update: {
         sessionUpdate: 'session_info_update',
-        _meta: {
-          goal: null,
-          codex: {
-            goal: {
-              objective: 'legacy objective',
-              status: 'active',
-            },
-          },
-        },
+        _meta: { lody: { goal: null } },
       },
     } as unknown as SessionNotification);
 
     expect(onThreadGoalCleared).toHaveBeenCalledWith('acp-test');
   });
 
-  it('ignores invalid provider-neutral goal metadata without breaking the session stream', async () => {
+  it('ignores invalid Core goal metadata without breaking the session stream', async () => {
     const { client, onThreadGoalUpdated, onUpdateMessage } = createTestClient({
       agentType: 'claude',
     });
@@ -1661,23 +1615,140 @@ describe('AgentClient goal session info', () => {
       sessionId: 'acp-test',
       update: {
         sessionUpdate: 'session_info_update',
-        _meta: {
-          goal: {
-            objective: 'neutral objective',
-            status: 'active',
-            controlMethod: '_wrong/goal',
-          },
-          codex: {
-            goal: {
-              objective: 'legacy objective',
-              status: 'active',
-            },
-          },
-        },
+        _meta: { lody: { goal: { objective: 'neutral objective', status: 'unknown' } } },
       },
     } as unknown as SessionNotification);
 
     expect(onThreadGoalUpdated).not.toHaveBeenCalled();
     expect(onUpdateMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('builtin Antigravity end-turn token accounting', () => {
+  const response = {
+    stopReason: 'end_turn',
+    usage: {
+      inputTokens: 30,
+      outputTokens: 12,
+      cachedReadTokens: 70,
+      cachedWriteTokens: 4,
+      thoughtTokens: 8,
+      totalTokens: 116,
+    },
+  };
+  it('keeps each turn independent across model changes and separates reasoning and cache tokens', async () => {
+    const { client, onUsageUpdate } = createTestClient({ agentType: 'antigravity' });
+    const rows = new Map<string, unknown>();
+    onUsageUpdate.mockImplementation((u, id) => rows.set(id, u));
+    // @ts-expect-error - synthetic protocol connection
+    client.connection = { prompt: async () => response };
+    client.currentModel = { modelId: 'gemini-4-hydrogen', name: 'Hydrogen' };
+    await client.prompt('acp-test' as ACPSessionId, []);
+    client.currentModel = { modelId: 'gemini-4-carbon', name: 'Carbon' };
+    await client.prompt('acp-test' as ACPSessionId, []);
+    expect(rows.size).toBe(2);
+    expect([...rows.keys()].every((id) => id.startsWith('acp-test:scope:'))).toBe(true);
+    const usage = {
+      inputTokens: 30,
+      outputTokens: 4,
+      cacheReadInputTokens: 70,
+      cacheCreationInputTokens: 4,
+      reasoningOutputTokens: 8,
+    };
+    expect([...rows.values()]).toEqual([
+      {
+        sessionId: 'acp-test',
+        usage,
+        modelUsage: { 'gemini-4-hydrogen': usage },
+        delta: { usage, modelUsage: { 'gemini-4-hydrogen': usage } },
+      },
+      {
+        sessionId: 'acp-test',
+        usage,
+        modelUsage: { 'gemini-4-carbon': usage },
+        delta: { usage, modelUsage: { 'gemini-4-carbon': usage } },
+      },
+    ]);
+  });
+  it('records a late cancelled response under the model captured before a switch', async () => {
+    const { client, onUsageUpdate } = createTestClient({ agentType: 'antigravity' });
+    const rows: unknown[] = [];
+    onUsageUpdate.mockImplementation((u) => rows.push(u));
+    let finish: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    // @ts-expect-error - synthetic protocol connection
+    client.connection = { prompt: () => pending, cancel: async () => {} };
+    client.currentModel = { modelId: 'gemini-4-hydrogen', name: 'Hydrogen' };
+    const controller = new AbortController();
+    const prompt = client.prompt('acp-test' as ACPSessionId, [], { signal: controller.signal });
+    const rejected = expect(prompt).rejects.toThrow('aborted');
+    controller.abort();
+    await rejected;
+    client.currentModel = { modelId: 'gemini-4-carbon', name: 'Carbon' };
+    finish(response);
+    await pending;
+    await Promise.resolve();
+    expect(rows).toEqual([
+      expect.objectContaining({
+        modelUsage: { 'gemini-4-hydrogen': expect.objectContaining({ inputTokens: 30 }) },
+      }),
+    ]);
+  });
+  it.each([
+    { usage: { inputTokens: -1, outputTokens: 1 } },
+    { usage: { inputTokens: 1, outputTokens: 1, thoughtTokens: 2 } },
+    { usage: { inputTokens: 1, outputTokens: Infinity } },
+    {},
+  ])('ignores malformed optional telemetry without failing the prompt: %#', async (value) => {
+    const { client, onUsageUpdate } = createTestClient({ agentType: 'antigravity' });
+    const rows: unknown[] = [];
+    onUsageUpdate.mockImplementation((u) => rows.push(u));
+    // @ts-expect-error - synthetic protocol connection
+    client.connection = { prompt: async () => value };
+    client.currentModel = { modelId: 'gemini-4-hydrogen', name: 'Hydrogen' };
+    expect(await client.prompt('acp-test' as ACPSessionId, [])).toBe(value);
+    expect(rows).toEqual([]);
+  });
+});
+
+describe('Antigravity context capacity in usage records', () => {
+  it('records the latest native capacity without accumulating it across turns or compaction', async () => {
+    const { client, onUsageUpdate } = createTestClient({ agentType: 'antigravity' });
+    const rows: unknown[] = [];
+    onUsageUpdate.mockImplementation((u) => rows.push(u));
+    // @ts-expect-error - synthetic protocol connection
+    client.connection = {
+      prompt: async () => ({
+        stopReason: 'end_turn',
+        usage: { inputTokens: 100, outputTokens: 5 },
+      }),
+    };
+    client.currentModel = { modelId: 'gemini-4-hydrogen', name: 'Hydrogen' };
+    for (const context of [
+      { size: 1048576, used: 0 },
+      { size: 1048576, used: 12000 },
+      { size: 524288, used: 4000 },
+    ]) {
+      await client.sessionUpdate(makeUsageUpdateNotification(context));
+      await client.prompt('acp-test' as ACPSessionId, []);
+      expect(client.getAutomationObservations().context).toEqual(context);
+    }
+    expect(rows).toEqual(
+      [1048576, 1048576, 524288].map((contextWindow) => ({
+        sessionId: 'acp-test',
+        usage: { inputTokens: 100, outputTokens: 5, cacheReadInputTokens: 0, contextWindow },
+        modelUsage: {
+          'gemini-4-hydrogen': { inputTokens: 100, outputTokens: 5, cacheReadInputTokens: 0 },
+        },
+        delta: {
+          usage: { inputTokens: 100, outputTokens: 5, cacheReadInputTokens: 0, contextWindow },
+          modelUsage: {
+            'gemini-4-hydrogen': { inputTokens: 100, outputTokens: 5, cacheReadInputTokens: 0 },
+          },
+        },
+      }))
+    );
   });
 });

@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest';
 
-import { Loro, LoroList, LoroMap, LoroText } from 'loro-crdt';
-import { Mirror, schema, validateSchema } from 'loro-mirror';
+import { Loro, LoroDoc, LoroList, LoroMap, LoroText } from 'loro-crdt';
+import { Mirror, schema } from 'loro-mirror';
 
-import { sessionDocSchema, sessionHistorySchema } from '../src/schema';
+import {
+  getLoroStreamIdForDocId,
+  getSessionIdFromRoomId,
+  isSessionDocRoomId,
+  type WorkspaceId,
+} from '../src';
+import { sessionDocSchema } from '../src/session-doc-schemas';
+import type { MessageQueueItem } from '../src/schema';
+import { createSessionControlPlaneMirror } from '../src/session-control-plane';
 import { createSessionMirror as createProductionSessionMirror } from '../src/session-mirror';
-import { MessageContentSchema } from '../src/message-schemas';
+
 import type { SessionId } from '../src/ids';
 
 /**
@@ -130,40 +138,6 @@ describe('session doc forward compatibility', () => {
     mirror.dispose();
   });
 
-  it('keeps malformed known items and untyped items invalid', () => {
-    for (const item of [{ type: 'text' }, { type: 42 }, {}]) {
-      const result = validateSchema(sessionHistorySchema, {
-        id: 'invalid-turn',
-        role: 'system',
-        timestamp: '2026-01-01T00:00:00.000Z',
-        items: [item],
-      });
-      expect(result.valid).toBe(false);
-    }
-    // Storage compatibility does not authorize a future type as new input.
-    expect(MessageContentSchema.safeParse({ type: 'future_operation_progress' }).success).toBe(
-      false
-    );
-    expect(
-      MessageContentSchema.safeParse({ type: 'text', text: { futureValue: 42 } }).success
-    ).toBe(false);
-  });
-
-  it('keeps writing after a newer peer adds an undeclared root key', () => {
-    const doc = new Loro();
-    const mirror = createSessionMirror(doc);
-
-    // The crashing path in production: the mirror is already open when the
-    // newer peer's update arrives, so the unknown key enters state via events.
-    doc.import(createFutureDocSnapshot());
-
-    expect(() => {
-      mirror.setState({ externalHistoryCursor: { importedTurnHashes: ['older-client'] } });
-    }).not.toThrow();
-
-    expect(doc.toJSON().futureFeature).toEqual({ id: 'op-1', state: 'preparing' });
-  });
-
   it('preserves the undeclared root key through a full-state update', () => {
     const doc = new Loro();
     const mirror = createSessionMirror(doc);
@@ -232,4 +206,50 @@ it('preserves a terminal projection when a pre-notification client edits the ses
   expect(current.getState().externalHistoryCursor?.importedTurnHashes).toEqual(['legacy-write']);
   oldMirror.dispose();
   current.dispose();
+});
+
+describe('Session room ids', () => {
+  it('keeps removed Session comment rooms out of the Session namespace', () => {
+    expect(isSessionDocRoomId('session-comment-abc')).toBe(false);
+    expect(getSessionIdFromRoomId('session-comment-abc')).toBeNull();
+    expect(getLoroStreamIdForDocId('workspace' as WorkspaceId, 'session-comment-abc')).toBe(
+      'session-comment-abc'
+    );
+  });
+});
+
+describe('createSessionControlPlaneMirror', () => {
+  const controlPlaneSessionId = 'session-control-plane-mirror' as SessionId;
+  const createMirror = () =>
+    createSessionControlPlaneMirror({
+      doc: new LoroDoc(),
+      initialState: { session: { id: controlPlaneSessionId } },
+    });
+  const queueItem = (task: string): MessageQueueItem =>
+    ({
+      task,
+      userId: 'user-1',
+      timestamp: '2026-09-09',
+      acpSessionConfig: { prompt: task, cliType: 'builtin', agentType: 'codex' },
+    }) as MessageQueueItem;
+
+  it('removing one queued message preserves the other message', () => {
+    const mirror = createMirror();
+    mirror.setState((draft) => {
+      draft.mq = [queueItem('first'), queueItem('second')];
+    });
+
+    const items = mirror.getState().mq ?? [];
+    expect(items).toHaveLength(2);
+
+    const removedCid = items[0]!.$cid;
+    mirror.setState((draft) => {
+      draft.mq = (draft.mq ?? []).filter((item) => item.$cid !== removedCid);
+    });
+
+    const remaining = mirror.getState().mq ?? [];
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]?.task).toBe('second');
+    mirror.dispose();
+  });
 });

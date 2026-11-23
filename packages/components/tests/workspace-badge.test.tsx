@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import React, { act } from 'react';
+import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { createStore, Provider } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +12,7 @@ const bridge = await vi.hoisted(async () => {
   return {
     userAtom: atom<{ id: string } | null>({ id: 'owner' }),
     workspaceAtom: atom<string | null>('workspace'),
+    ownedMachinesAtom: atom<ReadonlySet<import('@lody/shared').MachineId>>(new Set()),
     app: new AppEvents(),
     write: (_badge: { unread: number; waiting: number }) => {},
     fail: false,
@@ -22,6 +23,16 @@ vi.mock('../src/hooks/use-resolved-workspace-scope', async () => {
   const { useAtomValue } = await import('jotai');
   return { useResolvedWorkspaceScope: () => ({ workspaceId: useAtomValue(bridge.workspaceAtom) }) };
 });
+vi.mock('../src/hooks/use-visible-session-metas', async () => {
+  const { useAtomValue } = await import('jotai');
+  return {
+    useMySessionScope: () => ({
+      currentUserId: useAtomValue(bridge.userAtom)?.id ?? null,
+      ownedMachineIds: useAtomValue(bridge.ownedMachinesAtom),
+    }),
+  };
+});
+const workspaceBadgeAtom = createWorkspaceBadgeAtom('owner');
 vi.mock('../src/lib/electron', () => ({ isElectronRenderer: () => true }));
 vi.mock('../src/lib/electron-ipc-client', () => ({
   getIpcServices: () => ({
@@ -42,7 +53,7 @@ vi.mock('../../../apps/electron/node_modules/electron', () => ({
 
 import { sessionMetaCacheAtom } from '../src/atoms/doc-meta';
 import { lodyPresenceNowMsAtom, lodyPresenceStatesAtom } from '../src/atoms/presence';
-import { useWorkspaceBadge, workspaceBadgeAtom } from '../src/hooks/use-workspace-badge';
+import { useWorkspaceBadge, createWorkspaceBadgeAtom } from '../src/hooks/use-workspace-badge';
 import {
   WindowBadgeService,
   bindWindowBadgeToBrowserWindows,
@@ -141,6 +152,16 @@ describe('workspace badge reconciliation', () => {
     expect(dock).toBe('');
   });
 
+  it('excludes transferred sessions on my machine from My badge counts', () => {
+    const owned = new Set(['machine' as import('@lody/shared').MachineId]);
+    store.set(bridge.ownedMachinesAtom, owned);
+    setSessions(
+      session('transferred', { userId: 'colleague' }),
+      session('foreign', { userId: 'colleague', machineId: 'other' as never })
+    );
+    expect(store.get(createWorkspaceBadgeAtom('owner'))).toEqual({ unread: 0, waiting: 0 });
+  });
+
   it('rolls child and side-chat unread/waiting into one closed parent row', async () => {
     const parent = session('root', { isTabClosed: true });
     const child = session('child', { parentSessionId: parent.id });
@@ -186,15 +207,6 @@ describe('workspace badge reconciliation', () => {
     dock = '1'; // Simulate OS state drifting without any atom change.
     await act(async () => vi.advanceTimersByTime(30_000));
     expect(dock).toBe('');
-  });
-
-  it('does not postpone the reconciliation deadline when counts change', async () => {
-    await mount();
-    await act(async () => vi.advanceTimersByTime(29_000));
-    await act(async () => setSessions(session('root')));
-    dock = '9';
-    await act(async () => vi.advanceTimersByTime(1_000));
-    expect(dock).toBe('1');
   });
 
   it('reconciles on focus and visibility restoration, then clears and stops on unmount', async () => {

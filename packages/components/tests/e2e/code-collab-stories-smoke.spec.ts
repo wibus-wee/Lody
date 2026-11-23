@@ -99,6 +99,44 @@ for (const storyId of CODE_COLLAB_STORY_IDS) {
   });
 }
 
+// Regression coverage for #716.
+test('keeps the narrow Monaco Find tooltip clear of its action button', async ({ page }) => {
+  test.setTimeout(60_000);
+
+  const storyId = 'sessions-codecollabmonacoeditor--realtime-status-bar-narrow';
+  const response = await page.goto(`/iframe.html?id=${storyId}&viewMode=story`);
+  expect(response?.ok(), `Story iframe did not return 2xx for ${storyId}`).toBeTruthy();
+
+  const editor = page.locator('.monaco-editor').first();
+  await expect(editor).toBeVisible({ timeout: 30_000 });
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+f');
+
+  const closeButton = page.getByLabel('Close (Escape)');
+  await expect(closeButton).toBeVisible();
+  await closeButton.hover();
+
+  const tooltip = page.locator('.workbench-hover-container').filter({ hasText: 'Close (Escape)' });
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip.locator('.hover-contents')).toHaveCSS('white-space', 'nowrap');
+
+  const buttonBounds = await closeButton.boundingBox();
+  const tooltipBounds = await tooltip.boundingBox();
+  expect(buttonBounds).not.toBeNull();
+  expect(tooltipBounds).not.toBeNull();
+  if (buttonBounds && tooltipBounds) {
+    const overlaps =
+      tooltipBounds.x < buttonBounds.x + buttonBounds.width &&
+      tooltipBounds.x + tooltipBounds.width > buttonBounds.x &&
+      tooltipBounds.y < buttonBounds.y + buttonBounds.height &&
+      tooltipBounds.y + tooltipBounds.height > buttonBounds.y;
+    expect(overlaps, 'Find tooltip must not overlap its originating action').toBe(false);
+  }
+
+  await closeButton.click();
+  await expect(page.locator('.find-widget.visible')).toHaveCount(0);
+});
+
 test('file line links reveal and highlight their range on first open and later navigation', async ({
   page,
 }) => {
@@ -235,44 +273,76 @@ test('undo to saved text clears dirty state, redo restores it, and Save advances
   await expect(editorText).toHaveText(draft);
 });
 
-test('mobile HTML opens as a readonly preview on WebKit and toggles source', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  // Exercise the unsupported-engine path in Chromium runs too.
-  await page.addInitScript(() => {
+const IOS_SAFARI_USER_AGENT =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
+
+// Chromium runs model iOS WebKit: no credentialless frames and a WebKit user agent.
+const emulateWebKitHtmlPreviewEngine = async (page: Page) => {
+  await page.addInitScript((userAgent) => {
     delete (HTMLIFrameElement.prototype as HTMLIFrameElement & { credentialless?: boolean })
       .credentialless;
-  });
+    Object.defineProperty(Navigator.prototype, 'userAgent', {
+      configurable: true,
+      get: () => userAgent,
+    });
+  }, IOS_SAFARI_USER_AGENT);
+};
+
+test('mobile HTML on WebKit stays read-only until scripts are explicitly run', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await emulateWebKitHtmlPreviewEngine(page);
   await page.goto('/iframe.html?id=sessions-codecollabhtmlpreview--mobile-preview&viewMode=story');
-  const frame = page.frameLocator('iframe[title="Preview"]');
-  await expect(frame.getByRole('heading', { name: 'Self-contained HTML preview' })).toBeVisible({
+  const readOnly = page.frameLocator('iframe[title="Preview"]');
+  await expect(readOnly.getByRole('heading', { name: 'Self-contained HTML preview' })).toBeVisible({
     timeout: 30_000,
   });
   await expect(page.locator('iframe[title="Preview"]')).toHaveAttribute('sandbox', '');
-  await frame.getByRole('button', { name: 'Clicked 0 times' }).click();
-  await expect(frame.getByRole('button', { name: 'Clicked 0 times' })).toBeVisible();
-  await frame.getByText('Try blocked navigation').click();
-  await expect(frame.getByRole('heading', { name: 'Self-contained HTML preview' })).toBeVisible();
-  await page.getByRole('button', { name: 'Hide preview', exact: true }).click();
-  await expect(page.locator('iframe[title="Preview"]')).toHaveCount(0);
+  await readOnly.getByRole('button', { name: 'Clicked 0 times' }).click();
+  await expect(readOnly.getByRole('button', { name: 'Clicked 0 times' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Run scripts', exact: true }).click();
+  const scripted = page.frameLocator('iframe[title="Managed preview"]');
+  await expect(page.locator('iframe[title="Managed preview"]')).toHaveAttribute(
+    'sandbox',
+    'allow-scripts'
+  );
+  await scripted.getByRole('button', { name: 'Clicked 0 times' }).click();
+  await expect(scripted.getByRole('button', { name: 'Clicked 1 times' })).toBeVisible();
+
+  // Navigation leaves rendered mode instead of loading another page in place.
+  await scripted.getByText('Try blocked navigation').click();
+  await expect(page.locator('iframe[title="Managed preview"]')).toHaveCount(0);
   await expect(page.locator('.monaco-editor')).toBeVisible();
+
+  // The opt-in does not survive leaving rendered mode.
   await page.getByRole('button', { name: 'Preview', exact: true }).click();
-  await expect(frame.getByRole('heading', { name: 'Self-contained HTML preview' })).toBeVisible();
+  await expect(
+    readOnly.getByRole('heading', { name: 'Self-contained HTML preview' })
+  ).toBeVisible();
+  await expect(page.locator('iframe[title="Managed preview"]')).toHaveCount(0);
 });
 
-test('mobile project HTML opens from its file row and toggles back to the original source', async ({
-  page,
-}) => {
+test('mobile project HTML stays read-only until scripts are explicitly run', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  await emulateWebKitHtmlPreviewEngine(page);
   await page.goto('/iframe.html?id=files-mobileprojectfilebrowser--default&viewMode=story');
   await page.getByRole('button', { name: 'preview.html', exact: true }).click();
-  const frame = page.frameLocator('iframe[title="Preview"]');
-  await expect(frame.getByRole('heading', { name: 'Mobile HTML report' })).toBeVisible();
-  await expect(frame.locator('body')).not.toHaveAttribute('data-executed', 'yes');
-  await frame.getByText('External link').click();
-  await expect(frame.getByRole('heading', { name: 'Mobile HTML report' })).toBeVisible();
+  const readOnly = page.frameLocator('iframe[title="Preview"]');
+  await expect(readOnly.getByRole('heading', { name: 'Mobile HTML report' })).toBeVisible();
+  await expect(readOnly.locator('body')).not.toHaveAttribute('data-executed', 'yes');
+
+  await page.getByRole('button', { name: 'Run scripts', exact: true }).click();
+  const scripted = page.frameLocator('iframe[title="HTML preview (scripts running)"]');
+  await expect(scripted.locator('body')).toHaveAttribute('data-executed', 'yes');
+  await scripted.getByRole('button', { name: 'Run script' }).click();
+  await expect(scripted.getByRole('button', { name: 'Script ran' })).toBeVisible();
+
+  await scripted.getByText('External link').click();
+  await expect(page.locator('iframe[title="HTML preview (scripts running)"]')).toHaveCount(0);
+  await expect(readOnly.getByRole('heading', { name: 'Mobile HTML report' })).toBeVisible();
+  await expect(readOnly.locator('body')).not.toHaveAttribute('data-executed', 'yes');
+
   await page.getByRole('button', { name: 'Hide preview', exact: true }).click();
   await expect(page.locator('iframe[title="Preview"]')).toHaveCount(0);
   await expect(page.locator('.monaco-editor')).toBeVisible();
-  await page.getByRole('button', { name: 'Preview', exact: true }).click();
-  await expect(frame.getByRole('heading', { name: 'Mobile HTML report' })).toBeVisible();
 });

@@ -49,9 +49,11 @@ export type HistoryAction =
       kind: 'user-status';
       turnId: string;
       status: SessionTurnStatus;
-      cancellationReason?: 'user_stop';
+      cancellationReason?: 'user_stop' | 'machine_update';
       requeueUndelivered?: boolean;
       onlyPendingApply?: boolean;
+      /** Settle only input no execution has claimed: every copy is still pending or seen. */
+      onlyAwaitingStart?: boolean;
       deliveredSteer?: boolean;
       /** Execution-owned steer projection cannot regress a terminal or ordinary input. */
       steerProjection?: boolean;
@@ -72,7 +74,18 @@ export type HistoryAction =
   | { kind: 'upsert-turn'; turn: SessionEntry; beforeTurnId?: string; beforeLastUser?: boolean }
   | { kind: 'remove-turn'; turnId: string }
   | { kind: 'agent-warning'; turn: SessionEntry; message: string }
-  | { kind: 'file-backfilled'; fileId: string; relayFileId: string; encryption?: import('../encrypted-attachment').EncryptedAttachment };
+  | {
+      kind: 'image-backfilled';
+      localImageId: string;
+      machineId: string;
+      image: import('../ai').SessionImagePayload;
+    }
+  | {
+      kind: 'file-backfilled';
+      fileId: string;
+      relayFileId: string;
+      encryption?: import('../encrypted-attachment').EncryptedAttachment;
+    };
 
 /** Which actions can be committed by reading exactly one body. */
 export function historyActionTarget(action: HistoryAction): string | undefined {
@@ -129,6 +142,11 @@ function applyUserStatus(
     if (!STEER_PROJECTABLE_USER_STATUSES.includes(canonical.status)) return false;
     for (const copy of copies)
       if (STEER_PROJECTABLE_USER_STATUSES.includes(copy.status)) write(copy);
+    return true;
+  }
+  if (action.onlyAwaitingStart) {
+    if (copies.some((copy) => copy.status !== 'pending' && copy.status !== 'seen')) return false;
+    for (const copy of copies) write(copy);
     return true;
   }
   if (action.requeueUndelivered || action.onlyPendingApply) {
@@ -315,6 +333,23 @@ export function applyHistoryAction(
       )
         return { turns: history, matched: false };
       return { turns: [...history, action.turn], matched: true };
+    }
+    case 'image-backfilled': {
+      let matched = false;
+      for (const entry of history)
+        for (const item of [...(entry.items ?? []), ...(entry.inputConfig?.inputBlocks ?? [])]) {
+          if (
+            item.type === 'image' &&
+            item.localImageId === action.localImageId &&
+            item.machineId === action.machineId &&
+            item.storageSessionId === action.image.storageSessionId &&
+            item.transport === 'local'
+          ) {
+            Object.assign(item, action.image);
+            matched = true;
+          }
+        }
+      return { turns: history, matched };
     }
     case 'file-backfilled': {
       let matched = false;

@@ -246,6 +246,54 @@ describe('LocalProjectControlService.listProjectDirectory', () => {
     expect(result.truncated).toBe(false);
   });
 
+  it('still lists the directory when a registered path or a child name is missing', async () => {
+    const directoryPath = await realpath(rootPath);
+    const srcRealPath = await realpath(path.join(rootPath, 'src'));
+    const realReaddir = fs.promises.readdir.bind(fs.promises);
+    const readdir = vi.spyOn(fs.promises, 'readdir').mockImplementation(async (target, options) => {
+      const entries = await realReaddir(target, options);
+      if (String(target) !== directoryPath) return entries;
+      entries.unshift({
+        name: undefined,
+        isDirectory: () => true,
+        isSymbolicLink: () => false,
+      } as unknown as fs.Dirent);
+      return entries;
+    });
+
+    try {
+      const result = await service.browseDirectory({
+        absolutePath: rootPath,
+        registeredProjects: {
+          ['missing-path' as LocalProjectId]: undefined as unknown as string,
+          ['blank-path' as LocalProjectId]: '   ',
+          ['project-src' as LocalProjectId]: srcRealPath,
+        },
+      });
+
+      expect(result.path).toBe(directoryPath);
+      expect(result.entries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'src',
+            absolutePath: srcRealPath,
+            registeredProjectId: 'project-src',
+          }),
+          expect.objectContaining({ name: 'ignored-dir' }),
+        ])
+      );
+      expect(result.entries.every((entry) => typeof entry.name === 'string' && entry.name)).toBe(
+        true
+      );
+      expect(result.entries.map((entry) => entry.registeredProjectId)).not.toContain(
+        'missing-path'
+      );
+      expect(result.entries.map((entry) => entry.registeredProjectId)).not.toContain('blank-path');
+    } finally {
+      readdir.mockRestore();
+    }
+  });
+
   it('supports hidden directories and cursor pagination while browsing', async () => {
     const firstPage = await service.browseDirectory({
       absolutePath: rootPath,
@@ -321,5 +369,110 @@ describe('LocalProjectControlService.readProjectFile', () => {
 
     expect(result?.content).toHaveLength(200);
     expect(result?.truncated).toBe(true);
+  });
+});
+
+describe('LocalProjectControlService.searchProjectFiles', () => {
+  let rootPath: string;
+
+  beforeEach(async () => {
+    rootPath = await realpath(await mkdtemp(path.join(os.tmpdir(), 'lody-local-project-search-')));
+    await mkdir(path.join(rootPath, 'src', 'components'), { recursive: true });
+    await mkdir(path.join(rootPath, 'docs'), { recursive: true });
+    await writeFile(path.join(rootPath, 'src', 'components', 'button.tsx'), '');
+    await writeFile(path.join(rootPath, 'src', 'components', 'button-group.tsx'), '');
+    await writeFile(path.join(rootPath, 'docs', 'buttons.md'), '');
+    await writeFile(path.join(rootPath, 'package.json'), '{}');
+  });
+
+  afterEach(async () => {
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  it('returns only the best matches up to the limit', async () => {
+    const service = new LocalProjectControlService(noopLogger);
+
+    await expect(
+      service.searchProjectFiles(rootPath, { query: 'button.tsx', limit: 2 })
+    ).resolves.toEqual({
+      // The exact name ranks first; the fuzzy (in-order) match follows it.
+      paths: ['src/components/button.tsx', 'src/components/button-group.tsx'],
+      truncated: false,
+    });
+    await expect(
+      service.searchProjectFiles(rootPath, { query: 'button', limit: 2 })
+    ).resolves.toEqual({
+      paths: ['docs/buttons.md', 'src/components/button.tsx'],
+      truncated: false,
+    });
+    await expect(service.searchProjectFiles(rootPath, { query: 'readme' })).resolves.toMatchObject({
+      paths: [],
+    });
+    await expect(service.searchProjectFiles(rootPath, { query: 'scbt' })).resolves.toMatchObject({
+      paths: ['src/components/button.tsx', 'src/components/button-group.tsx'],
+    });
+  });
+
+  it('reuses one project scan across keystrokes and rescans once it expires', async () => {
+    let nowMs = 1_000;
+    const service = new LocalProjectControlService(noopLogger, { now: () => nowMs });
+
+    await service.searchProjectFiles(rootPath, { query: 'b' });
+    await writeFile(path.join(rootPath, 'docs', 'banner.md'), '');
+
+    nowMs += 5_000;
+    expect((await service.searchProjectFiles(rootPath, { query: 'banner' })).paths).toEqual([]);
+
+    nowMs += 10_000;
+    expect((await service.searchProjectFiles(rootPath, { query: 'banner' })).paths).toEqual([
+      'docs/banner.md',
+    ]);
+  });
+});
+
+describe('LocalProjectControlService.browseDirectory symlinks', () => {
+  it('lists linked directories under their real path and drops links to files', async () => {
+    const rootPath = await realpath(await mkdtemp(path.join(os.tmpdir(), 'lody-browse-links-')));
+    try {
+      await mkdir(path.join(rootPath, 'real'));
+      await mkdir(path.join(rootPath, 'target'));
+      await writeFile(path.join(rootPath, 'file.txt'), '');
+      try {
+        await symlink(path.join(rootPath, 'target'), path.join(rootPath, 'b-link'), 'dir');
+        await symlink(path.join(rootPath, 'file.txt'), path.join(rootPath, 'c-file-link'));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'EPERM' || code === 'EACCES') return;
+        throw error;
+      }
+      const service = new LocalProjectControlService(noopLogger);
+
+      const firstPage = await service.browseDirectory({ absolutePath: rootPath, limit: 2 });
+      expect(firstPage.entries).toEqual([
+        {
+          name: 'b-link',
+          absolutePath: path.join(rootPath, 'target'),
+          isSymlink: true,
+          hidden: false,
+        },
+        {
+          name: 'real',
+          absolutePath: path.join(rootPath, 'real'),
+          isSymlink: false,
+          hidden: false,
+        },
+      ]);
+      expect(firstPage.truncated).toBe(true);
+
+      const secondPage = await service.browseDirectory({
+        absolutePath: rootPath,
+        limit: 2,
+        cursor: firstPage.nextCursor,
+      });
+      expect(secondPage.entries.map((entry) => entry.name)).toEqual(['target']);
+      expect(secondPage.truncated).toBe(false);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { MAX_RETAINED_STATE_BYTES } from '../../internal/foundation/cbor';
 /** Browser persistence only. Stored bytes and receipts never establish approval or ledger authority. @module */
 import { Context, Effect, Layer, Result, Schema } from 'effect';
 import * as Bytes from '../../internal/foundation/bytes';
@@ -160,7 +161,7 @@ const feedRow = (value: unknown) =>
       if (r.originCount !== 0) throw failure('LedgerFeedStore', 'corrupt');
     } else {
       if (
-        !blob(r.origin) ||
+        !blob(r.origin, MAX_RETAINED_STATE_BYTES) ||
         !integer(r.originCount, 1) ||
         !r.tail ||
         r.tail.count < r.originCount ||
@@ -345,7 +346,48 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
           }
         });
       let pinRevision: number | undefined;
+      const observationKey = 'epoch-write-grace';
+      const observation = (value: unknown): Uint8Array | null => {
+        if (value === undefined) return null;
+        if (!(value instanceof Uint8Array) || value.length > 1024 * 1024)
+          throw failure('EpochWriteObservations', 'corrupt');
+        return new Uint8Array(value);
+      };
       const pins = LedgerPinStore.of({
+        writeGrace: {
+          read: () =>
+            run<Uint8Array | null>('EpochWriteObservations', ['meta'], 'readonly', (tx, done) =>
+              tx.request(tx.store('meta').get(observationKey), (value) => done(observation(value)))
+            ),
+          compareAndSet: (expected, next) =>
+            attempt('EpochWriteObservations', () => {
+              if (!(next instanceof Uint8Array) || next.length > 1024 * 1024)
+                return Effect.fail(failure('EpochWriteObservations', 'corrupt'));
+              const nextObservation = new Uint8Array(next);
+              const before = expected === null ? null : new Uint8Array(expected);
+              return run<boolean>('EpochWriteObservations', ['meta'], 'readwrite', (tx, done) =>
+                tx.request(tx.store('meta').get(observationKey), (value) => {
+                  const current = observation(value);
+                  if (
+                    before === null
+                      ? current !== null
+                      : current === null || !bytesEqual(current, before)
+                  ) {
+                    done(false);
+                    return;
+                  }
+                  tx.request(tx.store('meta').put(nextObservation, observationKey), () =>
+                    tx.request(tx.store('meta').get(observationKey), (saved) => {
+                      const checked = observation(saved);
+                      if (!checked || !bytesEqual(checked, nextObservation))
+                        throw failure('EpochWriteObservations', 'corrupt');
+                      done(true);
+                    })
+                  );
+                })
+              );
+            }),
+        },
         read: () =>
           run<typeof Pin.Type>('LedgerPinStore', ['pin'], 'readonly', (tx, done) =>
             tx.request(tx.store('pin').get(0), (v) => done(pinRow(v)))
@@ -441,7 +483,11 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
           }),
         initialize: (input, originCount, tailInput) =>
           attempt('LedgerFeedStore', () => {
-            if (!(input instanceof Uint8Array) || !blob(input) || !integer(originCount, 1))
+            if (
+              !(input instanceof Uint8Array) ||
+              !blob(input, MAX_RETAINED_STATE_BYTES) ||
+              !integer(originCount, 1)
+            )
               throw failure('LedgerFeedStore', 'corrupt');
             const origin = new Uint8Array(input),
               tail = copyTail('LedgerFeedStore', tailInput);
@@ -528,13 +574,58 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
               })
             );
           }),
+        rebuild: (expectedInput, input, originCount, tailInput) =>
+          attempt('LedgerFeedStore', () => {
+            const expected = copyTail('LedgerFeedStore', expectedInput),
+              tail = copyTail('LedgerFeedStore', tailInput),
+              origin = new Uint8Array(input);
+            if (
+              !blob(origin, MAX_RETAINED_STATE_BYTES) ||
+              originCount !== tail.count ||
+              tail.count < expected.count ||
+              tail.bootstrap ||
+              tail.bytes !== origin.length ||
+              (tail.count === expected.count && !bytesEqual(tail.head, expected.head))
+            )
+              throw failure('LedgerFeedStore', 'corrupt');
+            return run<void>('LedgerFeedStore', ['feed', 'records'], 'readwrite', (tx, done) =>
+              tx.request(tx.store('feed').get(0), (v) => {
+                const r = feedRow(v);
+                if (!r.origin || !sameTail(r.tail, expected))
+                  throw failure('LedgerFeedStore', 'conflict');
+                tx.request(tx.store('records').clear(), () => {
+                  const updated = {
+                    ...r,
+                    revision: nextRevision('LedgerFeedStore', r.revision),
+                    origin,
+                    originCount,
+                    tail,
+                  };
+                  verifiedWrite(
+                    tx,
+                    'feed',
+                    0,
+                    updated,
+                    feedRow,
+                    (a, b) =>
+                      a.revision === b.revision &&
+                      a.originCount === b.originCount &&
+                      sameBytes(a.origin, b.origin) &&
+                      sameTail(a.tail, b.tail),
+                    () => done(undefined),
+                    'LedgerFeedStore'
+                  );
+                });
+              })
+            );
+          }),
         rebase: (expectedInput, input, originCount, tailInput) =>
           attempt('LedgerFeedStore', () => {
             const expected = copyTail('LedgerFeedStore', expectedInput),
               tail = copyTail('LedgerFeedStore', tailInput);
             if (
               !(input instanceof Uint8Array) ||
-              !blob(input) ||
+              !blob(input, MAX_RETAINED_STATE_BYTES) ||
               originCount !== expected.count ||
               tail.count !== originCount ||
               tail.bootstrap ||
@@ -588,8 +679,8 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
             );
           }),
       });
-      const submission = (work: (tx: Transaction, done: (v: void) => void) => void) =>
-        run<void>('SubmissionJournal', ['submission'], 'readwrite', work);
+      const submission = <A>(work: (tx: Transaction, done: (v: A) => void) => void) =>
+        run<A>('SubmissionJournal', ['submission'], 'readwrite', work);
       const writeSubmission = (
         tx: Transaction,
         r: typeof Submission.Type,
@@ -630,7 +721,7 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
           const record = ownedRecord(input),
             before = beforeInput ? rawCheckpoint('SubmissionJournal', beforeInput) : null,
             after = rawCheckpoint('SubmissionJournal', afterInput);
-          return submission((tx, done) =>
+          return submission<number>((tx, done) =>
             tx.request(tx.store('submission').get(0), (v) => {
               const r = submissionRow(v);
               if (
@@ -650,7 +741,7 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
                   checkpoint: after,
                   outcome,
                 },
-                done
+                () => done(r.revision + 1)
               );
             })
           );
@@ -674,12 +765,12 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
           attempt('SubmissionJournal', () => {
             checkAnchor(anchor);
             const record = ownedRecord(input);
-            return submission((tx, done) =>
+            return submission<number | null>((tx, done) =>
               tx.request(tx.store('submission').get(0), (v) => {
                 const r = submissionRow(v);
                 if (r.record !== null) {
                   if (!bytesEqual(r.record, record)) throw failure('SubmissionJournal', 'conflict');
-                  done(undefined);
+                  done(null);
                   return;
                 }
                 writeSubmission(
@@ -690,7 +781,7 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
                     record,
                     outcome: null,
                   },
-                  done
+                  () => done(r.revision + 1)
                 );
               })
             );
@@ -700,7 +791,37 @@ export const indexedDbClientStores = (options: IndexedDbStoreOptions) => {
           attempt('SubmissionJournal', () => {
             if (outcome !== 'Committed' && outcome !== 'Conflict')
               throw failure('SubmissionJournal', 'corrupt');
-            return transition(anchor, record, before, after, outcome);
+            return transition(anchor, record, before, after, outcome).pipe(Effect.asVoid);
+          }),
+        rejectUnsent: (anchor, input, checkpoint, revision) =>
+          attempt('SubmissionJournal', () => {
+            checkAnchor(anchor);
+            const record = ownedRecord(input),
+              expected = rawCheckpoint('SubmissionJournal', checkpoint);
+            return submission<boolean>((tx, done) =>
+              tx.request(tx.store('submission').get(0), (value) => {
+                const r = submissionRow(value);
+                if (
+                  r.revision !== revision ||
+                  r.outcome !== null ||
+                  !sameBytes(r.record, record) ||
+                  !sameCheckpoint(r.checkpoint, expected)
+                ) {
+                  done(false);
+                  return;
+                }
+                writeSubmission(
+                  tx,
+                  {
+                    ...r,
+                    revision: nextRevision('SubmissionJournal', r.revision),
+                    record: null,
+                    outcome: null,
+                  },
+                  () => done(true)
+                );
+              })
+            );
           }),
         acknowledge: (anchor, result) =>
           attempt('SubmissionJournal', () => {

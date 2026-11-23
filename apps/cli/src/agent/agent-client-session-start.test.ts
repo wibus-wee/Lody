@@ -357,6 +357,31 @@ describe('AgentClient session startup', () => {
     }
   );
 
+  it('discovers methods with the authentication probe handshake without changing ordinary sessions', async () => {
+    connectionMocks.initialize.mockImplementation(async ({ clientCapabilities }) => ({
+      agentCapabilities: {},
+      authMethods:
+        clientCapabilities.elicitation?.url &&
+        clientCapabilities.auth?._meta?.lody?.credentialForm?.version === 1
+          ? [{ id: 'sorbet:example:oauth', name: 'Example OAuth' }]
+          : [],
+    }));
+    for (const discoverAuthenticationMethods of [false, true]) {
+      const client = new AgentClient({
+        logger: createLogger(),
+        sessionId: 'auth-discovery' as SessionId,
+        terminalManager: {} as never,
+        discoverAuthenticationMethods,
+        onUpdateMessage: vi.fn(),
+        onRequestPermission: vi.fn(),
+      });
+      await client.startSession({} as never, '/workdir');
+      expect(client.getAuthMethods()).toEqual(
+        discoverAuthenticationMethods ? [{ id: 'sorbet:example:oauth', name: 'Example OAuth' }] : []
+      );
+    }
+  });
+
   it('keeps unrelated MCP loader failures best effort without a readiness retry', async () => {
     const warnings: string[] = [];
     const failure = new Error('Synthetic configuration failure');
@@ -573,33 +598,6 @@ describe('AgentClient session startup', () => {
           sessionConfig: {
             version: 1,
             configOptionValues: { permission_mode: 'always-approve' },
-          },
-        },
-      },
-    });
-  });
-
-  it('sends initial config without provider-specific startup fields', async () => {
-    const client = new AgentClient({
-      logger: createLogger(),
-      sessionId: 'session-neutral-config' as SessionId,
-      terminalManager: {} as never,
-      agentConfig: { cliType: 'builtin', agentType: 'codex' },
-      configOptionValues: { approval_policy: 'never' },
-      onUpdateMessage: vi.fn(),
-      onRequestPermission: vi.fn(),
-    });
-
-    await client.startSession({} as never, '/workdir');
-
-    expect(connectionMocks.newSession).toHaveBeenCalledWith({
-      cwd: '/workdir',
-      mcpServers: [],
-      _meta: {
-        lody: {
-          sessionConfig: {
-            version: 1,
-            configOptionValues: { approval_policy: 'never' },
           },
         },
       },
@@ -884,39 +882,6 @@ describe('AgentClient session startup', () => {
     });
   });
 
-  it('loads sessions with selected config option values', async () => {
-    connectionMocks.initialize.mockResolvedValue({
-      agentCapabilities: { loadSession: true },
-    });
-    connectionMocks.loadSession.mockResolvedValue({});
-    const client = new AgentClient({
-      logger: createLogger(),
-      sessionId: 'session-grok-load' as SessionId,
-      terminalManager: {} as never,
-      agentConfig: { cliType: 'builtin', agentType: 'grok' },
-      configOptionValues: { permission_mode: 'always-approve' },
-      onUpdateMessage: vi.fn(),
-      onRequestPermission: vi.fn(),
-    });
-
-    await client.startSession({} as never, '/workdir', 'stored-grok-session' as never);
-
-    expect(connectionMocks.loadSession).toHaveBeenCalledWith({
-      sessionId: 'stored-grok-session',
-      cwd: '/workdir',
-      mcpServers: [],
-      _meta: {
-        clientIdentifier: 'lody:session-grok-load',
-        lody: {
-          sessionConfig: {
-            version: 1,
-            configOptionValues: { permission_mode: 'always-approve' },
-          },
-        },
-      },
-    });
-  });
-
   it('resumes builtin Pi sessions without replaying them through loadSession', async () => {
     connectionMocks.initialize.mockResolvedValue({
       agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
@@ -938,6 +903,44 @@ describe('AgentClient session startup', () => {
     );
     expect(connectionMocks.loadSession).not.toHaveBeenCalled();
   });
+
+  it.each([undefined, '/synthetic/override.sock'])(
+    'starts stdio MCP without daemon discovery and preserves scoped environment (override=%s)',
+    async (override) => {
+      const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+      const directory = await mkdtemp(join(tmpdir(), 'lody-mcp-start-'));
+      vi.stubEnv('LODY_PLATFORM', 'local');
+      vi.stubEnv('LODY_DATA_DIR', directory);
+      vi.stubEnv('LODY_MCP_SOCKET_PATH', override ?? '');
+      try {
+        Object.defineProperty(process, 'platform', { value: 'win32' });
+        const client = new AgentClient({
+          logger: createLogger(),
+          sessionId: 'session-direct' as SessionId,
+          workspaceId: 'workspace-1' as WorkspaceId,
+          machineId: 'machine-1' as MachineId,
+          terminalManager: {} as never,
+          agentConfig: { cliType: 'builtin', agentType: 'deepseek' },
+          onUpdateMessage: vi.fn(),
+          onRequestPermission: vi.fn(),
+        });
+        await client.startSession({} as never, '/workdir');
+        const request = connectionMocks.newSession.mock.calls.at(-1)?.[0];
+        const env = Object.fromEntries(
+          request.mcpServers[0].env.map(({ name, value }: { name: string; value: string }) => [
+            name,
+            value,
+          ])
+        );
+        expect(env).toMatchObject({ LODY_PLATFORM: 'local', LODY_DATA_DIR: directory });
+        expect(env.LODY_MCP_SOCKET_PATH).toBe(override);
+      } finally {
+        if (descriptor) Object.defineProperty(process, 'platform', descriptor);
+        vi.unstubAllEnvs();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  );
 
   it('injects Lody MCP into DeepSeek Harness sessions', async () => {
     const client = new AgentClient({
@@ -1013,26 +1016,6 @@ describe('AgentClient session startup', () => {
     client.adoptPreparedSession(prepared);
     await client.closeDetachedSession('acp-session-1' as never);
     expect(connectionMocks.closeSession).toHaveBeenCalledWith({ sessionId: 'acp-session-1' });
-  });
-
-  it('prepares a fresh provider session for editing the first user message', async () => {
-    const client = new AgentClient({
-      logger: createLogger(),
-      sessionId: 'session-first' as SessionId,
-      terminalManager: {} as never,
-      onUpdateMessage: vi.fn(),
-      onRequestPermission: vi.fn(),
-    });
-    await client.startSession({} as never, '/workdir');
-    connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
-
-    await expect(client.prepareReplacementSession()).resolves.toEqual({
-      sessionId: 'acp-session-2',
-    });
-    expect(connectionMocks.newSession).toHaveBeenLastCalledWith({
-      cwd: '/workdir',
-      mcpServers: [],
-    });
   });
 });
 

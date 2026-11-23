@@ -31,6 +31,7 @@ an older ledger.
 | [`RecoveryVaultStore`](#recoveryvaultstore) | Backend | your vault storage client | `RecoveryVaults` |
 | [`WorkspaceScope`](#workspacescope) | Application | `Layer.succeed(WorkspaceScope, { genesis })` | everything |
 | [`LedgerViewSource`](#ledgerviewsource) | Application | `LedgerFeed.viewSource`, or your own verified view | `VerifiedLedger` |
+| [`LedgerFeedInvalidation`](#ledgerfeedinvalidation) | Application (optional) | workspace RAM-cache owner | `LedgerFeed` verified publication |
 | [`EpochPublicationSource`](#epochpublicationsource) | Application | lookup of the current epoch's publication record | `KeyDistributor` |
 | [`LedgerSync`](#ledgersync) | Application | your feed sync (`LedgerFeedSource` pages → `LedgerFeed.accept`, checkpoint chosen independently) | `WorkspaceControl`, `E2eeWorkspace` |
 | `RecoveryVaultLocalStore` | Local storage | a local key/value store with compare-and-swap | `RecoveryVaults` |
@@ -61,11 +62,16 @@ write the protocol relies on for authority.
 
 - `read(anchor)` returns every record from genesis and the checkpoint the log
   claims. The library re-verifies all of it.
+- Optional `readFrom(anchor, base)` returns only the untrusted suffix after a genuine
+  verified view. Submission verifies the suffix and its checkpoint; unsupported adapters,
+  older parents and pins before retained history use `read`. Server status never
+  establishes commitment.
 - `appendCas(anchor, expected, record)` appends **only if** the log still ends
   at `expected`. It must never append unconditionally. Appending the same bytes
   twice must be idempotent or rejected.
-- Failures are `LedgerLogError`. After any failure the library reads back to
-  learn the outcome, so a lost response is safe.
+- Failures are `LedgerLogError`. The library reads back to learn uncertain outcomes.
+  Only an explicitly qualified first-attempt self-service quota refusal can release
+  its unsent original; a lost response always retains the exact original for retry.
 
 ### LedgerFeedSource
 
@@ -107,6 +113,21 @@ compare-and-swap. It never receives the unlock secret, the vault master key or
 a private recovery key. Wire schemas are in `@lody/e2ee-core/host`; see the
 [backend guide](backend-guide.md#5-recovery-vault).
 
+Optional `RecoveryVaultStore.readEntries` reads 1–8 distinct ids in request order,
+with null for missing entries and a 256 KiB combined body budget. Password unlock
+uses it for its fixed eight slots, validates count and ids, then performs the same
+candidate selection, Argon2id, active-index authentication and rollback checks.
+Adapters use four concurrent original reads only when the endpoint is definitively
+absent on an older deployment; other refusals and malformed replies remain failures.
+
+`RecoveryVault.readEntry` borrows its own temporary master-key copy under the
+session lock, then releases that lock before fetching immutable ciphertext. A
+slow workspace package cannot block another package read or index access. The
+reader owns and wipes its copy after actual settlement, including failure; vault
+close stops new reads and waits for admitted readers. Index mutation serialization
+and local/remote CAS stay unchanged. Returned packages remain caller-owned and
+must be wiped after use.
+
 ## Platform ports
 
 ### DeviceIdentity
@@ -125,6 +146,11 @@ The pair works only with core HPKE in the same isolate; it cannot be exported,
 structured-cloned or passed to native WebCrypto. Close rejects new use, drains
 admitted HPKE and wipes owned private bytes; Scope release closes automatically.
 This crypto adapter provides neither durable protection nor admission.
+`withTransportSeed(open)` is the one purpose-limited seed handoff: it passes a copy
+of the Ed25519 seed to the mobile shell's native iroh opener (its EndpointId is
+this signing key), wipes the copy when `open` settles, refuses after close, and
+makes close wait for an admitted handoff. The opener runs uninterruptibly, so
+callers acquire its resource with `acquireRelease`. Hosts pass no other consumer.
 
 ### KeyProtector / CandidateProtector
 
@@ -195,6 +221,15 @@ These are synthetic compatibility checks, not native custody or IDB acceptance.
 `{ genesis }`: the workspace this composition serves. Every store and workflow
 binds itself to it; a store created for another workspace is refused.
 
+### LedgerFeedInvalidation
+
+Optional workspace-scoped `invalidate(): void`. Capture this port when building
+`LedgerFeed` to retire dependent RAM grants synchronously after durable append,
+in the same non-yielding segment that publishes a changed verified head/count.
+It must neither throw nor start I/O. Unchanged heads, cursor-only progress and
+rejected pages do not call it. It grants no authority and changes no ledger format;
+hosts without a dependent RAM cache need not provide it.
+
 ### LedgerViewSource
 
 `current()` returns the newest *genuine* ledger view the application holds.
@@ -215,6 +250,10 @@ record this device's own publication, and verifies it first. Typically a
 backwards scan of your local feed.
 
 ### LedgerSync
+
+Optional `ingest(page, checkpoint)` sends inline originals through the same feed
+verification and persistence as ordinary reads. The caller supplies the independent
+checkpoint and exact current request offset. It grants no authority or freshness.
 
 `refresh()` selects the target checkpoint independently and reads the local
 feed up to it; `current()` returns the stored state. `WorkspaceControl` and
@@ -258,7 +297,9 @@ Lab.
 
 `LedgerFeedStore.rebase` CAS-checks the entire expected tail, replaces the origin
 and its count, removes covered records, and writes/read-checks the new tail in
-one transaction. A stale tail returns conflict without mutation.
+one transaction. A stale tail returns conflict without mutation. Optional `rebuild`
+uses the same atomic replacement after the workflow has independently replayed the
+highest retained checkpoint; it never modifies pins or other journals.
 
 ## Browser ledger and original stores
 
@@ -305,16 +346,22 @@ WebKit tests do not replace iOS 16.4 real-device or power-loss acceptance. There
 guarantee against user/browser eviction; loss of persistent identity protection
 must be handled by the host under the approved custody contract.
 
+`LedgerPinStore.writeGrace` optionally stores bounded timing-only bytes with atomic compare-and-set and durable readback. SQLite and IndexedDB implement it beside their bound pins; reads return owned copies. Conflicts never mutate the row. Missing/corrupt observations or clock continuity cannot start a new grace on pinned reopen. This journal is neither key material nor ledger/write authority; omission disables retained-key grace.
+
 ## Browser custody and installation
 
-`browserClientWriter({ accountId, workspaceId })` provides `ClientCustodyWriter`
+`browserClientWriter({ accountId, workspaceId, queueTimeout? })` provides `ClientCustodyWriter`
 under `WorkspaceScope`. Enter `writer.run` before allocating an installation, hold
 it through finite local protection/storage work, and release before network waits.
 The origin's Web Lock binds account/workspace/genesis across tabs and workers,
-independent of database/device names. Busy fails conflict without queueing or
-stealing. Reentry is limited to the holding fiber; a child fiber must acquire its
-own lease and fails conflict while the parent holds it. Close fences new calls
-and waits for actual native settlement.
+independent of database/device names. Calls of one tab queue in order before the
+lock, so a content read never collides with a key round in the same tab; the wait
+is bounded by `queueTimeout` (default 15 s, `0` never waits) and ends with conflict,
+on interruption, or when the writer closes. Another tab that finds the lock busy
+fails conflict at once. Nothing steals from or times out a holder. Reentry is
+limited to the holding fiber; a child fiber must acquire its own lease and fails
+conflict at once while the parent holds it. Close fences new calls and waits for
+actual native settlement.
 
 `indexedDbClientInstallationStore(options)` captures the stable scope before the
 host knows its device. Ordinary CAS retains the first incarnation and wrapped
@@ -404,3 +451,5 @@ These ports contain no private credentials, authorization decision, network
 operation or crypto/network await inside IndexedDB transactions. The opt-in
 [`@lody/e2ee-client`](../../e2ee-client/README.md) host owns proof verification,
 actual custody readback, approval, current membership and confirmation/ACK.
+
+`SubmissionJournal.prepare` returns a new slot’s unique revision, or null for an identical occupied original. `observe` advances the revision even at an unchanged checkpoint. `rejectUnsent` clears only an unfinished matching original/checkpoint/revision, retaining the pin; only P09’s fresh first-attempt pre-CAS quota refusal uses it.

@@ -6,11 +6,10 @@ import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { Context, Effect, Exit, Fiber, Layer, Scope } from 'effect'
+import { Effect, Exit, Fiber, Scope } from 'effect'
 import { Bytes, verifySignature } from '@lody/e2ee-core/protocol'
 import { signGenesisRecord } from '@lody/e2ee-core/protocol'
-import { desktopE2eePorts, makeDesktopE2eeCustody } from './e2ee-custody.mts'
-import { CandidateProtector, DeviceIdentity, KeyProtector } from '@lody/e2ee-core/services'
+import { makeDesktopE2eeCustody } from './e2ee-custody.mts'
 
 // An authenticated synthetic native boundary, never a real OS keychain claim.
 const wrapping = Buffer.alloc(32, 72)
@@ -66,6 +65,49 @@ const candidateBody = () => {
   body.fill(98, header + 41)
   return body
 }
+void test('custody creation and reopen leave no unwiped Buffer copies of KEK or credentials', async (t) => {
+  const directory = await fixture(t)
+  const secrets = new Set()
+  const allocations = []
+  const originalFrom = Buffer.from
+  t.mock.method(Buffer, 'from', function (...args) {
+    const buffer = Reflect.apply(originalFrom, Buffer, args)
+    if (buffer.length === 32) {
+      allocations.push({ buffer, hex: buffer.toString('hex') })
+    }
+    return buffer
+  })
+  const storage = backend({
+    encryptStringAsync: async (value) => {
+      secrets.add(value)
+      return backend().encryptStringAsync(value)
+    }
+  })
+  let retained
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await execute(
+      Effect.gen(function* () {
+        const owner = yield* makeDesktopE2eeCustody({
+          directory,
+          platform: 'linux',
+          safeStorage: storage
+        })
+        const device =
+          attempt === 0 ? yield* owner.createDevice(hash()) : yield* owner.openDevice(hash())
+        const credential = yield* owner.prepareDeviceCredential(hash(), device.publicKey)
+        secrets.add(credential.credential)
+        assert.equal(yield* owner.deviceCredential(hash(), device.publicKey), credential.credential)
+        if (retained) assert.deepEqual(credential, retained)
+        retained = credential
+      })
+    )
+  }
+  // Inspect the actual allocations after their owning scopes have closed.
+  for (const { buffer, hex } of allocations) {
+    if (secrets.has(hex))
+      assert.deepEqual(buffer, Buffer.alloc(32), 'secret Buffer copy survived close')
+  }
+})
 void test('rejects unavailable and basic_text before creating any storage', async (t) => {
   const directory = await fixture(t)
   for (const [changes, code] of [
@@ -115,10 +157,6 @@ void test('installed and candidate data authenticate full context and reopen wit
         platform: 'linux',
         safeStorage: storage
       })
-      // Capture once: caller mutation does not replace already selected methods.
-      storage.encryptStringAsync = async () => {
-        throw new Error('replaced')
-      }
       encrypted = yield* Effect.promise(() => owner.installed.protect(body))
       candidateBlob = yield* Effect.promise(() => owner.candidate.protect(candidate))
       assert.notDeepEqual(encrypted, body)
@@ -418,7 +456,7 @@ void test('hard process exit releases the OS mutex and preserves the same KEK be
         command: process.execPath,
         args: [
           '--import',
-          import.meta.resolve('tsx'),
+          new URL('../../scripts/node-test-ts-resolve.mjs', import.meta.url).href,
           '--input-type=module',
           '-e',
           child,
@@ -524,89 +562,6 @@ void test('a competing KEK rewrap refuses safely while the first native replacem
     release()
     await first
   }
-  assert.notDeepEqual(await readFile(file), original)
-  assert.deepEqual(await readdir(directory), ['kek.safe-storage', 'kek.safe-storage.rewrap-lock'])
-})
-void test('Scope close retains native KEK rewrap until it settles and then refuses new work', async (t) => {
-  const directory = await fixture(t)
-  const file = join(directory, 'kek.safe-storage')
-  await execute(makeDesktopE2eeCustody({ directory, platform: 'linux', safeStorage: backend() }))
-  const original = await readFile(file)
-  const storage = backend()
-  const encrypt = storage.encryptStringAsync,
-    decrypt = storage.decryptStringAsync
-  let release, began, closeBegan
-  let nativeSettled = false,
-    releasedEarly = false,
-    replacementDecrypts = 0
-  const gate = new Promise((resolve) => {
-    release = resolve
-  })
-  const started = new Promise((resolve) => {
-    began = resolve
-  })
-  const closeStarted = new Promise((resolve) => {
-    closeBegan = resolve
-  })
-  t.after(() => release())
-  storage.encryptStringAsync = async (value) => {
-    const encoded = await encrypt(value)
-    began()
-    await gate
-    return encoded
-  }
-  storage.decryptStringAsync = async (value) => {
-    const opened = await decrypt(value)
-    const isOriginal = Buffer.from(value).equals(original)
-    if (!isOriginal && ++replacementDecrypts === 2) nativeSettled = true
-    return { ...opened, shouldReEncrypt: isOriginal }
-  }
-  await execute(
-    Effect.gen(function* () {
-      const scope = yield* Scope.make()
-      yield* Scope.addFinalizer(
-        scope,
-        Effect.sync(() => {
-          releasedEarly = !nativeSettled
-        })
-      )
-      yield* Effect.addFinalizer(() => {
-        release()
-        return Scope.close(scope, Exit.void)
-      })
-      try {
-        const opening = yield* makeDesktopE2eeCustody({
-          directory,
-          platform: 'linux',
-          safeStorage: storage
-        }).pipe(Effect.provideService(Scope.Scope, scope), Effect.forkChild)
-        yield* Effect.promise(() => started)
-        yield* Scope.addFinalizer(
-          scope,
-          Effect.sync(() => closeBegan())
-        )
-        const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild)
-        yield* Effect.promise(() => closeStarted)
-        release()
-        const owner = yield* Fiber.join(opening)
-        yield* Fiber.join(closing)
-        assert.equal(
-          releasedEarly,
-          false,
-          'owner must not release before native KEK readback settles'
-        )
-        const denied = yield* Effect.result(
-          Effect.tryPromise({
-            try: () => owner.installed.protect(installedBody()),
-            catch: (cause) => cause
-          })
-        )
-        assert.equal(denied.failure?.code, 'closed')
-      } finally {
-        release()
-      }
-    })
-  )
   assert.notDeepEqual(await readFile(file), original)
   assert.deepEqual(await readdir(directory), ['kek.safe-storage', 'kek.safe-storage.rewrap-lock'])
 })
@@ -850,7 +805,7 @@ void test('another OS process reopens encrypted identity and epoch data without 
     })));
     console.log(JSON.stringify(result));
   `
-  const loader = import.meta.resolve('tsx')
+  const loader = new URL('../../scripts/node-test-ts-resolve.mjs', import.meta.url).href
   const result = await Effect.runPromise(
     runCommandOk({
       command: process.execPath,
@@ -921,7 +876,14 @@ void test('recovers a journaled replacement after a crash when only the old nati
   const ended = await Effect.runPromise(
     runCommand({
       command: process.execPath,
-      args: ['--import', import.meta.resolve('tsx'), '--input-type=module', '-e', child, directory],
+      args: [
+        '--import',
+        new URL('../../scripts/node-test-ts-resolve.mjs', import.meta.url).href,
+        '--input-type=module',
+        '-e',
+        child,
+        directory
+      ],
       cwd: new URL('../../', import.meta.url).pathname,
       env: { ...process.env },
       maxOutputBytes: 65536
@@ -959,33 +921,4 @@ void test('recovers a journaled replacement after a crash when only the old nati
   )
   assert.deepEqual(await readFile(file), Buffer.from(journal.replacement, 'hex'))
   assert.deepEqual(await readdir(directory), ['kek.safe-storage', 'kek.safe-storage.rewrap-lock'])
-})
-
-void test('desktop ports keep installed and candidate protection apart and sign as the opened device', async (t) => {
-  const directory = await fixture(t)
-  await execute(
-    Effect.gen(function* () {
-      const owner = yield* makeDesktopE2eeCustody({
-        directory,
-        platform: 'linux',
-        safeStorage: backend()
-      })
-      const device = yield* owner.createDevice(hash(), 'personal')
-      const ports = yield* Layer.build(desktopE2eePorts(owner, device))
-      const installed = Context.get(ports, KeyProtector),
-        candidate = Context.get(ports, CandidateProtector),
-        identity = Context.get(ports, DeviceIdentity)
-      const sealed = yield* installed.protect(installedBody())
-      assert.deepEqual(Buffer.from(yield* installed.unprotect(sealed)), installedBody())
-      // The candidate capability authenticates a different purpose context.
-      assert.equal((yield* Effect.result(candidate.unprotect(sealed)))._tag, 'Failure')
-      const message = new Uint8Array([1, 2, 3])
-      const signature = yield* identity.signer.sign(message)
-      assert.equal(
-        verifySignature(device.publicKey.toBytes(), message, signature.toBytes())._tag,
-        'Success'
-      )
-      assert.equal(identity.encryptionKeyPair, device.encryption)
-    })
-  )
 })

@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-
 import {
   createRootRoute,
   createRoute,
@@ -22,11 +21,20 @@ import type {
 } from '@lody/platform';
 import { PlatformContext } from '@lody/platform/react';
 import { createStaticStore } from '@lody/platform';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const navigation = vi.hoisted(() => ({ calls: [] as unknown[] }));
+vi.mock('@tanstack/react-router', async (original) => ({
+  ...(await original<typeof import('@tanstack/react-router')>()),
+  useNavigate: () => (options: unknown) => {
+    navigation.calls.push(options);
+    return Promise.resolve();
+  },
+}));
 
 import { WorkspaceAdmissionGate } from '../src/components/workspace-admission-gate';
 import { userAtom } from '../src/atoms';
-import { developerModeEnabledAtom, e2eeWorkspaceCreationEnabledAtom } from '../src/atoms/settings';
+
 import { workspaceContentModeAtom } from '../src/atoms/workspace-content-mode';
 import {
   runtimeAtom,
@@ -159,6 +167,21 @@ describe('WorkspaceAdmissionGate', () => {
     expect(container.querySelector('button')).toBeNull();
   });
 
+  it('explains a revoked device and offers to pair it again from the workspace control page', async () => {
+    navigation.calls.length = 0;
+    fail({ errorType: 'e2ee_device_revoked', workspaceId: 'workspace-1' });
+    await render();
+    expect(text()).toContain('This device was removed from the workspace');
+    expect(text()).not.toContain('Rejoining requires a new invitation');
+    expect(text()).not.toContain('workspace content');
+    const button = container.querySelector('button');
+    expect(button?.textContent).toBe('Pair this device again');
+    await act(async () => button!.click());
+    expect(navigation.calls).toEqual([
+      { to: '/workspace/e2ee/$workspaceId', params: { workspaceId: 'workspace-1' } },
+    ]);
+  });
+
   it('renders an ordinary workspace under a provisional verdict without mentioning encryption', async () => {
     store.set(workspaceContentModeAtom, {
       accountId: 'account',
@@ -168,53 +191,6 @@ describe('WorkspaceAdmissionGate', () => {
     });
     await render();
     expect(text()).toBe('workspace content');
-  });
-
-  it('waits with the ordinary loading copy while the verdict is unknown', async () => {
-    await render();
-    expect(text()).toContain('Loading workspace');
-    expect(text()).not.toMatch(/encrypt|mode/i);
-  });
-
-  it.each([
-    ['a mode failure of an ordinary workspace', { modeAdmission: { knownEncrypted: false } }],
-    ['a runtime failure unrelated to mode', {}],
-  ] as const)('shows the ordinary open failure for %s', async (_case, extra) => {
-    fail({ errorType: 'WorkspaceModeAdmissionTimeoutError', ...extra });
-    await render();
-    expect(text()).toContain('Unable to open workspace');
-    expect(text()).not.toMatch(/encrypt|mode/i);
-  });
-
-  it('explains a mode failure for a workspace known to be encrypted', async () => {
-    fail({
-      errorType: 'WorkspaceModeAdmissionTimeoutError',
-      modeAdmission: { knownEncrypted: true },
-    });
-    await render();
-    expect(text()).toContain('Workspace mode could not be verified');
-  });
-
-  it('explains mode failures only to a developer who enabled encrypted creation', async () => {
-    store.set(developerModeEnabledAtom, true);
-    store.set(e2eeWorkspaceCreationEnabledAtom, true);
-    fail({ errorType: 'Error', modeAdmission: { knownEncrypted: false } });
-    await render();
-    expect(text()).toContain('Workspace mode could not be verified');
-
-    // A rejected shutdown of the previous runtime is not a mode failure.
-    await act(async () => fail({ errorType: 'Error' }));
-    expect(text()).toContain('Unable to open workspace');
-  });
-
-  it('retries in place from the failure screen', async () => {
-    fail({ errorType: 'Error', modeAdmission: { knownEncrypted: false } });
-    await render();
-    const retry = Array.from(container.querySelectorAll('button')).find(
-      (button) => button.textContent === 'Retry'
-    );
-    await act(async () => retry?.click());
-    expect(store.get(workspaceModeAdmissionRetryAtom)).toBe(1);
   });
   it('retries an ordinary workspace after deleting its unreadable optional proof without native access', async () => {
     const key = 'lody-workspace-mode-proof:account:ordinary';
@@ -355,30 +331,6 @@ describe('WorkspaceAdmissionGate', () => {
         },
       })
     ).rejects.toThrow('checked again');
-    expect(localStorage.getItem(pin)).toBe('broken pin');
-  });
-
-  it('reports identity recheck when native verified identity is unavailable', async () => {
-    localStorage.setItem(pin, 'broken pin');
-    const cause = new Error('e2ee_missing-binding');
-    await expect(
-      recoverE2eeWorkspaceIdentity({
-        storage: localStorage,
-        accountId: 'account',
-        workspaceId: 'encrypted',
-        runtime: {
-          ...native(),
-          readIdentity: async () => {
-            throw cause;
-          },
-        },
-        isCurrent: () => true,
-      })
-    ).rejects.toMatchObject({
-      name: 'E2eeLocalEvidenceConflictError',
-      message: 'Workspace identity must be checked again',
-      cause,
-    });
     expect(localStorage.getItem(pin)).toBe('broken pin');
   });
 

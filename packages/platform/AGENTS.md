@@ -8,15 +8,17 @@ telemetry, or managed-runtime downloads, as routed by the root instructions.
 ## Composition and capabilities
 
 - Settings must represent real platform support: local hides cloud usage and
-  PR-driven auto-archive, and omits machine selection when `remoteMachines` is
+  the legacy PR-driven auto-archive setting, and omits machine selection when `remoteMachines` is
   absent. Gate entries and their background work through capabilities rather
-  than build-kind or environment checks.
+  than build-kind or environment checks. Explicitly granted local Automations may
+  request ordinary Session archive through the local Host authority; this requires
+  no product-cloud port. [Contract](../../apps/cli/src/automations/README.md).
 - Shared packages stay platform-neutral. The public Electron composition
-  selects `local` explicitly; private Web/mobile entries and cloud composition
+  selects `local` explicitly; Web, Capacitor mobile entries and cloud composition
   roots may inject `cloud` without forking those shared packages.
-- The OSS desktop entry is local-only and must not make authenticated product-cloud requests;
+- The default desktop entry is local-only and must not make authenticated product-cloud requests;
   public managed-runtime artifact downloads are the explicit exception.
-- An absent platform selector resolves to `local`; public build scripts must
+- An absent platform selector resolves to `local`; cloud builds require an explicit platform selector and deployment values; local builds must
   not accept or discover staging/production deployment presets.
 - Local CLI, renderer, and Electron-main telemetry is hard-disabled even when
   unrelated PostHog variables exist in the caller's shell.
@@ -33,9 +35,15 @@ telemetry, or managed-runtime downloads, as routed by the root instructions.
   matching account, route, workspace and verified plaintext descriptor may enable
   it; an ordinary provisional runtime or listing is not plaintext proof. Pause
   before switching targets and discard buffered work across that boundary.
+- Encrypted approval overlays on ordinary workspaces hold a private-surface lease
+  through actual DOM removal. Nested surfaces release only their own lease, and
+  a route commit cannot override an outstanding lease.
 - Automatic exceptions in those scopes use a fixed diagnostic vocabulary. Shared
   main/daemon processes cannot infer one workspace mode and always use that
-  vocabulary. Preserve detailed local, user-submitted support reports.
+  vocabulary. Restricted diagnostics retain only allowlisted category/source/runtime
+  fields, consumer-specific operation/stage/status values and bounded numeric versions; grouping uses these fixed fields, never
+  hashes of original messages/stacks. Reprojection must preserve safe diagnostics.
+  Preserve detailed local, user-submitted support reports.
   [SDK buffering rationale](../../.agents/notes/implemented/bug-fix/2026-10-29-workspace-telemetry-privacy.md).
 
 ## Streams token capability
@@ -58,7 +66,7 @@ telemetry, or managed-runtime downloads, as routed by the root instructions.
 - `./host-keys` is host-only and remains unconnected until the crypto and host
   adapters are reviewed. CLI assembly receives machine identity only; never grant
   it personal management operations. No generic private export or arbitrary signing.
-- Credential-confirmed member removal is the explicit retention exception: match the originating identity, drain only that workspace and erase its local content/keys. Ordinary failures never authorize deletion.
+- Credential-confirmed member removal, and credential-confirmed revocation of this device, are the explicit retention exceptions: match the originating identity, drain only that workspace and erase that identity's local content/keys. Device revocation keeps membership and allows re-pairing. Ordinary failures never authorize deletion.
 - Failure, scope close, logout and ordinary cache cleanup must not delete identity
   keys. Preserve uncertain failure reasons and writes. Personal devices never use file protection; machine-only custody may select file protection at first creation under the owner-approved M1 policy, never on reopen.
 - Native fixtures use random UUIDs and isolated test keychains only. Verify exact
@@ -85,9 +93,17 @@ telemetry, or managed-runtime downloads, as routed by the root instructions.
 - Optional `memberProfiles` is a display directory scoped to the live account and
   workspace. Resolve its crypto user IDs through verified ledger members; it cannot
   grant permissions, pin keys, identify the creator, or block ledger availability.
+- Device display profiles are optional, untrusted labels keyed by the original
+  device signing public key. Attach owner names only through that device's verified
+  ledger member. Report only the current host's metadata; missing fields never borrow
+  another device's values. Labels cannot alter admission, keys or revocation targets.
+- Optional `subscribeLedgerHead` belongs to an open control reader. Its values are
+  refresh hints, never verified checkpoints or permission grants; callers fetch
+  and verify original suffixes and unsubscribe when their scope closes. Absence or
+  failure preserves verified reads and manual refresh, without a new polling loop.
 - Account-only machine-policy display reads return opaque ciphertext and untrusted
   metadata. They never replace device-authenticated execution freshness, and a
-  server removal tombstone never substitutes for a verified policy-history pin.
+  server removal tombstone never substitutes for a verified latest-policy pin.
 
 - `e2eeMachineScope` is an explicit single-workspace machine-service composition.
   It has no ordinary Streams/account capabilities or account catalog bootstrap.
@@ -95,4 +111,5 @@ telemetry, or managed-runtime downloads, as routed by the root instructions.
   and the encrypted runtime own access and protected Streams tokens respectively.
 - Optional `runtime.readIdentity` returns only workspace ID/genesis from the expected
   account's retained verified ledger, releasing its temporary read before replying.
-  Missing capability fails closed; never fall back to unleased `status`.
+  Missing capability fails closed; never fall back to unleased `status`. A server
+  answer other than encrypted is admitted only after it reports missing identity.

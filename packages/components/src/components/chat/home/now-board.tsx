@@ -13,11 +13,11 @@ import {
   CircleX,
   GitMerge,
   GitPullRequest,
+  GitPullRequestDraft,
   Hand,
   ChevronDown,
   ChevronUp,
   History,
-  PencilLine,
   type LucideIcon,
 } from 'lucide-react';
 import { flushSync } from 'react-dom';
@@ -27,8 +27,10 @@ import { colors } from '@lody/ui/tokens/colors.stylex';
 import { corner, radius, space, text } from '@lody/ui/tokens/scales.stylex';
 import type { HomeNowItem, HomeNowList, HomeNowModel, HomeNowReason } from '@/lib/home-now';
 import {
+  HOME_NOW_COLUMN,
   layoutHomeNow,
   type HomeNowBlock,
+  type HomeNowColumn,
   type HomeNowListKey,
   type HomeNowTotals,
 } from '@/lib/home-now-layout';
@@ -45,6 +47,8 @@ import {
 } from './tiles';
 
 const styles = stylex.create({
+  focusViewport: { overscrollBehavior: 'contain' },
+  movingScrollbar: { display: { default: 'flex', ':is([data-focus-moving] *)': 'none' } },
   /* The board is two stacked columns, or one spanning both (a lone card). */
   columns: {
     display: 'grid',
@@ -220,6 +224,23 @@ const styles = stylex.create({
   failed: { color: colors.destructive },
   good: { color: colors.success },
   quiet: { color: colors.secondaryLabel },
+  /* Same 14px slot as the other row marks, so titles stay aligned. */
+  unreadSlot: {
+    display: 'inline-flex',
+    flexShrink: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '14px',
+    height: '14px',
+  },
+  /* The 8px unread dot used on session rows. */
+  unreadDot: {
+    width: '8px',
+    height: '8px',
+    borderRadius: radius.full,
+    cornerShape: corner.round,
+    backgroundColor: 'hsl(var(--primary))',
+  },
   title: {
     flex: '1 1 auto',
     minWidth: 0,
@@ -251,8 +272,9 @@ const REASON_GLYPH: Record<HomeNowReason, { glyph: LucideIcon | null; tone: styl
     waiting: { glyph: Hand, tone: styles.waiting },
     working: { glyph: null, tone: styles.quiet },
     ciFailed: { glyph: CircleX, tone: styles.failed },
-    finished: { glyph: CircleCheck, tone: styles.good },
-    draft: { glyph: PencilLine, tone: styles.quiet },
+    // The unread dot is not a lucide glyph; ReasonMark draws it.
+    finished: { glyph: null, tone: styles.quiet },
+    draft: { glyph: GitPullRequestDraft, tone: styles.quiet },
     readyToMerge: { glyph: GitMerge, tone: styles.good },
     openPr: { glyph: GitPullRequest, tone: styles.quiet },
     recent: { glyph: History, tone: styles.quiet },
@@ -269,7 +291,16 @@ function RunningMark({ active = true }: { active?: boolean }) {
   );
 }
 
+function UnreadMark() {
+  return (
+    <span aria-hidden="true" {...stylex.props(styles.unreadSlot)}>
+      <span data-unread-dot="" {...stylex.props(styles.unreadDot)} />
+    </span>
+  );
+}
+
 function ReasonMark({ reason }: { reason: HomeNowReason }) {
+  if (reason === 'finished') return <UnreadMark />;
   const { glyph: Glyph, tone } = REASON_GLYPH[reason];
   if (!Glyph) return <RunningMark />;
   return <Glyph aria-hidden="true" {...stylex.props(styles.glyph, tone)} />;
@@ -301,7 +332,7 @@ function useAgo(nowMs: number) {
 const LIST_TITLES: Record<HomeNowListKey, [key: string, fallback: string]> = {
   attention: ['home.now.attention', 'Needs you'],
   running: ['home.now.running', 'Running'],
-  finished: ['home.now.finished', 'Just finished'],
+  finished: ['home.now.finished', 'Unread'],
   next: ['home.now.next', 'Worth continuing'],
 };
 
@@ -485,9 +516,9 @@ function NowFocus({
       <ScrollArea
         {...stylex.props(styles.focusScroll)}
         viewportRef={rowsRef}
-        viewportClassName="overscroll-contain"
+        viewportXstyle={styles.focusViewport}
         // Hidden while the frame moves (`focus-motion.ts` marks it), so no bar slides with it.
-        scrollbarClassName="[[data-focus-moving]_&]:hidden"
+        scrollbarXstyle={styles.movingScrollbar}
       >
         <ul {...stylex.props(styles.rows, styles.focusRowsFoot)}>
           {list.items.map((item, index) => (
@@ -541,16 +572,18 @@ export function homeNowTotals(model: HomeNowModel): HomeNowTotals {
 /**
  * What the person's agents are doing right now: what needs the person, what is running, what
  * just finished, and what is worth picking back up, beside the plan usage, since running out is
- * something to act on too. Every list keeps its fixed place, and how much each shows is
- * `layoutHomeNow`'s call: a row budget spent by priority, within the rows the window has room
- * for, in two columns with level bottoms. A row opens its session; "Show all" (or the tile
- * itself, while it hides rows) opens its whole list over its column. A pure picture of its props.
+ * something to act on too. Every list keeps its place — running and just finished swap sides
+ * only for a level board (`solveHomeNowColumn`) — and how much each shows is `layoutHomeNow`'s
+ * call: a row budget spent by priority, within the rows the window has room for, in two columns
+ * with level bottoms. A row opens its session; "Show all" (or the tile itself, while it hides
+ * rows) opens its whole list over its column. A pure picture of its props, `column` included.
  */
 export function NowBoard({
   model,
   agentIcon,
   nowMs,
   maxRows,
+  column = HOME_NOW_COLUMN,
   onOpenSession,
   ...usage
 }: UsageProps & {
@@ -560,6 +593,8 @@ export function NowBoard({
   nowMs: number;
   /** The rows one column has room for (`layoutHomeNow`); unlimited when absent. */
   maxRows?: number;
+  /** Which arrangement to speak with (`solveHomeNowColumn`); the level one when absent. */
+  column?: HomeNowColumn;
   onOpenSession?: (sessionId: string) => void;
 }) {
   const { t } = useTranslation();
@@ -652,7 +687,7 @@ export function NowBoard({
     });
   };
 
-  const layout = layoutHomeNow(homeNowTotals(model), usage.usage != null, maxRows);
+  const layout = layoutHomeNow(homeNowTotals(model), usage.usage != null, maxRows, column);
   const block = (item: HomeNowBlock) => {
     switch (item.kind) {
       case 'usage':
@@ -771,8 +806,8 @@ export function NowSummary({ model }: { model: HomeNowModel }) {
     {
       key: 'finished',
       count: model.finished.total,
-      mark: <CircleCheck aria-hidden="true" {...stylex.props(styles.glyph, styles.good)} />,
-      label: t('home.now.finished', 'Just finished'),
+      mark: <UnreadMark />,
+      label: t('home.now.finished', 'Unread'),
     },
   ];
   const quiet = parts.every((part) => part.count === 0);

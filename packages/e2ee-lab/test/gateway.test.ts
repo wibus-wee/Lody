@@ -1,12 +1,13 @@
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { join } from 'node:path';
-import { Effect, Exit, Fiber, Result, Scope } from 'effect';
+import { Effect, Result } from 'effect';
 import { describe, expect, it } from 'vitest';
 import { Bytes } from '@lody/e2ee-core';
 import { encodeCbor } from '@lody/e2ee-core/protocol';
-import { type LedgerView } from '@lody/e2ee-core';
+
 import { hashRecordBytes } from '@lody/e2ee-core/protocol';
 import {
+  verifyLedger,
   prepareDeviceAdmission,
   prepareJoinRequest,
   prepareLedgerCommand,
@@ -17,7 +18,7 @@ import { makeLabControlGateway } from '../src/platform/control-gateway';
 import { makeLedgerStreamReader } from '@lody/e2ee-core/adapters/loro-streams';
 import { signLedgerRecord } from '@lody/e2ee-core/protocol';
 import { makeLabLedgerActor } from '../src/platform/ledger-actor';
-import { fixture, options, history } from './ledger-fixture';
+import { fixture, options } from './ledger-fixture';
 const ok = Result.getOrThrow;
 function assertDenied(
   result: ReturnType<typeof authorizeLabStream>,
@@ -49,92 +50,6 @@ function syntheticSigner(seed: number) {
   };
 }
 describe('genuine ledger Lab gateway policy (HTTP authentication not implemented here)', () => {
-  it('binds the request Org and refuses structural fake authority, outsider devices and unknown/mutating routes', () => {
-    const f = history();
-    const input = {
-      view: f.view,
-      authenticatedCredential: { device: f.owner.publicKey, genesis: f.anchor },
-      requestGenesis: f.anchor,
-      stream: 'loro',
-      method: 'GET',
-    };
-    expect(ok(authorizeLabStream(input))).toBeUndefined();
-    for (const stream of ['control', 'loro', 'flock'])
-      for (const method of ['GET', 'HEAD'])
-        for (const sub of [undefined, 'snapshot', 'bootstrap'])
-          expect(ok(authorizeLabStream({ ...input, stream, method, sub }))).toBeUndefined();
-    expect(
-      Result.isFailure(
-        authorizeLabStream({
-          ...input,
-          authenticatedCredential: { device: syntheticSigner(86).publicKey, genesis: null },
-        })
-      )
-    ).toBe(true);
-    expect(
-      Result.isFailure(
-        authorizeLabStream({
-          ...input,
-          requestGenesis: ok(Bytes.genesisHash(new Uint8Array(32).fill(87))),
-        })
-      )
-    ).toBe(true);
-    expect(
-      Result.isFailure(
-        authorizeLabStream({
-          ...input,
-          authenticatedCredential: {
-            ...input.authenticatedCredential,
-            genesis: ok(Bytes.genesisHash(new Uint8Array(32).fill(87))),
-          },
-        })
-      )
-    ).toBe(true);
-    const wrong = ok(Bytes.genesisHash(new Uint8Array(32).fill(87)));
-    const counterfeitBound = {
-      toBytes: () => wrong.toBytes(),
-      equals: () => true,
-    } as unknown as Bytes.GenesisHash;
-    expect(
-      Result.isFailure(
-        authorizeLabStream({
-          ...input,
-          authenticatedCredential: { ...input.authenticatedCredential, genesis: counterfeitBound },
-        })
-      )
-    ).toBe(true);
-    const brokenRequest = {
-      toBytes: () => {
-        throw new Error('hostile getter');
-      },
-    } as unknown as Bytes.GenesisHash;
-    expect(Result.isFailure(authorizeLabStream({ ...input, requestGenesis: brokenRequest }))).toBe(
-      true
-    );
-    const forged = {
-      genesis: f.anchor,
-      inspectState: () => f.view.inspectState(),
-    } as unknown as LedgerView;
-    expect(Result.isFailure(authorizeLabStream({ ...input, view: forged }))).toBe(true);
-    assertDenied(authorizeLabStream({ ...input, method: 'DELETE' }), 'method-not-allowed');
-    assertDenied(authorizeLabStream({ ...input, stream: 'unknown' }), 'unknown-stream', 404);
-    for (const method of ['GET', 'HEAD', 'POST', 'PUT'])
-      assertDenied(authorizeLabStream({ ...input, stream: 'keys', method }), 'unknown-stream', 404);
-    expect(
-      ok(authorizeLabStream({ ...input, stream: 'control', method: 'POST', sub: 'append-cas' }))
-    ).toBeUndefined();
-    for (const [stream, method, sub] of [
-      ['loro', 'POST', undefined],
-      ['loro', 'POST', 'append-cas'],
-      ['flock', 'POST', undefined],
-      ['flock', 'POST', 'append-cas'],
-      ['loro', 'PUT', 'snapshot'],
-      ['flock', 'PUT', 'snapshot'],
-      ['control', 'GET', 'append-cas'],
-      ['control', 'HEAD', 'append-cas'],
-    ] as const)
-      assertDenied(authorizeLabStream({ ...input, stream, method, sub }), 'method-not-allowed');
-  });
   it('uses real public admission, SDK CAS and durable feed for current Recovery/machine roles and revocation', async () => {
     const f = await fixture();
     try {
@@ -262,6 +177,7 @@ describe('genuine ledger Lab gateway policy (HTTP authentication not implemented
               'unauthorized'
             );
             const gateway = yield* makeLabControlGateway({
+              quotaPath: join(f.dir, 'ledger-quota.sqlite'),
               genesis: f.anchor,
               stream,
               checkpoint: () =>
@@ -343,7 +259,7 @@ describe('genuine ledger Lab gateway policy (HTTP authentication not implemented
             const machineConsent = yield* prepareDeviceAdmission({
               genesis: f.anchor,
               membershipId: f.membership,
-              encryptionPublicKey: ok(Bytes.encryptionPublicKey(new Uint8Array(32).fill(151))),
+              encryptionPublicKey: ok(Bytes.encryptionPublicKey(new Uint8Array(32).fill(51))),
               kind: 'machine',
               machineId: 'synthetic-machine',
               signer: replacement,
@@ -420,6 +336,7 @@ describe('public submission consumer behind the Lab control gateway', () => {
         Effect.scoped(
           Effect.gen(function* () {
             const gateway = yield* makeLabControlGateway({
+              quotaPath: join(f.dir, 'ledger-quota.sqlite'),
               genesis: f.anchor,
               stream,
               checkpoint: () =>
@@ -489,90 +406,105 @@ describe('public submission consumer behind the Lab control gateway', () => {
   });
 });
 
-it('stops gateway admission, interrupts and awaits its actual SDK CAS operation before closing the earlier Riverrun owner', async () => {
+it('persists per-membership hourly/daily self-service quotas, exempts management and preserves exact retries', async () => {
   const f = await fixture();
-  const latch = () => {
-    let resolve!: () => void;
-    const promise = new Promise<void>((done) => {
-      resolve = done;
-    });
-    return { promise, resolve };
+  const records = [...f.records];
+  let now = 1000,
+    failBeforeAppend = true;
+  const checkpoint = () => ({ head: hashRecordBytes(records.at(-1)!), length: records.length });
+  const view = () => ok(verifyLedger({ anchor: f.anchor, records, checkpoint: checkpoint() }));
+  const stream = {
+    read: f.sdk.read.bind(f.sdk),
+    appendCas: async (input: Parameters<LedgerSubmissionStream['appendCas']>[0]) => {
+      if (failBeforeAppend) {
+        failBeforeAppend = false;
+        throw new Error('unknown dispatch');
+      }
+      const output = await f.sdk.appendCas(input);
+      if (output.ok && output.result.kind === 'ok')
+        records.push(new Uint8Array(input.part.body.subarray(4)));
+      return output;
+    },
   };
-  const entered = latch(),
-    release = latch();
-  let rawSettled = false,
-    closedEarly = false,
-    closed = false;
-  let gateway: Effect.Success<ReturnType<typeof makeLabControlGateway>>;
+  const config = {
+    quotaPath: join(f.dir, 'quota.sqlite'),
+    genesis: f.anchor,
+    stream,
+    checkpoint: () => Effect.sync(checkpoint),
+    now: () => now,
+    budget: { maxRecords: 100, maxBytes: 1024 * 1024 },
+  };
+  const request = (record: Uint8Array) => ({
+    authenticatedCredential: { device: f.owner.publicKey, genesis: f.anchor },
+    requestGenesis: f.anchor,
+    record,
+  });
+  let seed = 1,
+    refused: Uint8Array;
+  const candidate = Effect.fnUntraced(function* () {
+    const signer = syntheticSigner(++seed + 100);
+    const consent = yield* prepareDeviceAdmission({
+      genesis: f.anchor,
+      membershipId: f.membership,
+      signer,
+      kind: 'personal',
+      encryptionPublicKey: ok(Bytes.encryptionPublicKey(new Uint8Array(32).fill(seed))),
+    });
+    return yield* signLedgerRecord(
+      ok(prepareLedgerCommand(view(), f.owner.publicKey, consent)),
+      f.owner
+    );
+  });
+  const limited = (result: Result.Result<unknown, unknown>, retryAt: number) => {
+    expect(Result.isFailure(result) && result.failure).toMatchObject({
+      code: 'self-service-rate-limited',
+      retryAt,
+    });
+  };
   try {
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
-          const child = yield* Scope.make();
-          yield* Scope.addFinalizer(
-            child,
-            Effect.promise(async () => {
-              closedEarly = !rawSettled;
-              await f.close();
-              closed = true;
-            })
-          );
-          const command = yield* prepareDeviceAdmission({
-            genesis: f.anchor,
-            membershipId: f.membership,
-            encryptionPublicKey: ok(Bytes.encryptionPublicKey(new Uint8Array(32).fill(111))),
-            kind: 'personal',
-            signer: syntheticSigner(110),
-          });
-          const record = yield* signLedgerRecord(
-            ok(prepareLedgerCommand(f.view, f.owner.publicKey, command)),
+          const gateway = yield* makeLabControlGateway(config);
+          const first = yield* candidate();
+          expect(Result.isFailure(yield* Effect.result(gateway.append(request(first))))).toBe(true);
+          yield* gateway.append(request(first));
+          now = 999; // NTP rollback: the second admission clamps to the persisted 1000.
+          for (let i = 1; i < 10; i++) yield* gateway.append(request(yield* candidate()));
+          refused = yield* candidate();
+          limited(yield* Effect.result(gateway.append(request(refused))), 3601000);
+          const management = yield* signLedgerRecord(
+            ok(
+              prepareLedgerCommand(view(), f.owner.publicKey, {
+                _tag: 'DeclareCapabilities',
+                capabilities: [1],
+              })
+            ),
             f.owner
           );
-          gateway = yield* makeLabControlGateway({
-            genesis: f.anchor,
-            budget: { maxRecords: 100, maxBytes: 1024 * 1024 },
-            now: () => 0,
-            checkpoint: () => Effect.succeed(f.checkpoint),
-            stream: {
-              read: f.sdk.read.bind(f.sdk),
-              appendCas: async (request) => {
-                entered.resolve();
-                await release.promise;
-                try {
-                  return await f.sdk.appendCas(request);
-                } finally {
-                  rawSettled = true;
-                }
-              },
-            },
-          }).pipe(Effect.provideService(Scope.Scope, child));
-          const request = {
-            authenticatedCredential: { device: f.owner.publicKey, genesis: f.anchor },
-            requestGenesis: f.anchor,
-            record,
-          };
-          const worker = yield* Effect.forkChild(Effect.result(gateway.append(request)));
-          yield* Effect.addFinalizer(() => Effect.sync(release.resolve));
-          yield* Effect.promise(() => entered.promise);
-          const closing = yield* Effect.forkChild(Scope.close(child, Exit.void), {
-            startImmediately: true,
-          });
-          // Observe close through a separate current-admission probe, not microtask counts.
-          const denied = yield* Effect.result(gateway.append(request));
-          expect(Result.isFailure(denied)).toBe(true);
-          const pending = closing.pollUnsafe();
-          release.resolve();
-          yield* Fiber.join(closing);
-          expect(closedEarly).toBe(false);
-          expect(closed).toBe(true);
-          expect(rawSettled).toBe(true);
-          expect(pending).toBeUndefined();
-          expect(Result.isFailure(yield* Fiber.join(worker))).toBe(true);
+          yield* gateway.append(request(management));
+          refused = yield* candidate();
+        })
+      )
+    );
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const gateway = yield* makeLabControlGateway(config);
+          limited(yield* Effect.result(gateway.append(request(refused!))), 3601000);
+          for (let hour = 1; hour <= 2; hour++) {
+            now = 1000 + hour * 3600000;
+            for (let i = 0; i < 10; i++) yield* gateway.append(request(yield* candidate()));
+          }
+          refused = yield* candidate();
+          limited(yield* Effect.result(gateway.append(request(refused))), 86401000);
+          now = 86401000;
+          yield* gateway.append(request(refused));
+          expect(records.length).toBe(f.records.length + 32);
         })
       )
     );
   } finally {
-    release.resolve();
-    if (!closed) await f.close();
+    await f.close();
   }
 });

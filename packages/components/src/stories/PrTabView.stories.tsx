@@ -1,3 +1,4 @@
+import * as stylex from '@stylexjs/stylex';
 import type { Meta, StoryObj } from '@storybook/react';
 import { useState } from 'react';
 import type {
@@ -16,6 +17,43 @@ import { VaulDrawerBody } from '@/components/mobile/vaul-drawer-edge-back-zone';
 import { Drawer, DrawerContent, DrawerTitle } from '@/ui/drawer';
 import type { UseGitHubPrDiffResult } from '@/hooks/use-github-pr-diff';
 import type { PrCommitSelection } from '@/lib/github-pr-diff';
+
+const drawerScene = stylex.create({
+  fullPage: { width: '100%', maxWidth: 'none', inset: 0, borderWidth: 0, borderRadius: 0 },
+});
+
+const prStory = stylex.create({
+  back: {
+    marginLeft: 'calc(var(--spacing) * -1)',
+    display: 'inline-flex',
+    height: 'calc(var(--spacing) * 7)',
+    width: 'calc(var(--spacing) * 7)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 'var(--radius-sm)',
+    backgroundColor: {
+      default: null,
+      '@media (hover: hover)': { ':hover': 'hsl(var(--muted) / 1)' },
+    },
+  },
+  phone: {
+    marginInline: 'auto',
+    height: '100vh',
+    width: 390,
+    borderWidth: '1px',
+    borderStyle: 'solid',
+    borderColor: 'hsl(var(--border) / 1)',
+    backgroundColor: 'hsl(var(--background) / 1)',
+    boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)',
+  },
+});
+const storyLayout = stylex.create({
+  frame: {
+    height: '100vh',
+    width: '100%',
+    'background-color': 'hsl(var(--background) / 1)',
+  },
+});
 
 const alice: GitHubUser = {
   login: 'alice',
@@ -398,7 +436,7 @@ const meta = {
   },
   decorators: [
     (Story) => (
-      <div className="h-screen w-full bg-background">
+      <div {...stylex.props(storyLayout.frame)}>
         <Story />
       </div>
     ),
@@ -415,6 +453,49 @@ export const OpenCiPassed: Story = {
     state: 'ready',
     data: baseData,
     ...storyCallbacks,
+  },
+};
+
+export const Stack: Story = {
+  args: {
+    repoFullName: 'loro-dev/lody',
+    prNumber: 42,
+    state: 'ready',
+    data: {
+      ...baseData,
+      pullRequest: {
+        ...basePr,
+        stack: {
+          number: 7,
+          position: 2,
+          size: 3,
+          baseRef: 'main',
+          pullRequests: [
+            {
+              number: 41,
+              title: 'Add the data model',
+              state: 'closed',
+              draft: false,
+              merged: true,
+            },
+            {
+              number: 42,
+              title: 'Add the API endpoints',
+              state: 'open',
+              draft: false,
+              merged: false,
+            },
+            {
+              number: 43,
+              title: 'Build the settings UI',
+              state: 'open',
+              draft: true,
+              merged: false,
+            },
+          ],
+        },
+      },
+    },
   },
 };
 
@@ -694,10 +775,6 @@ export const Merging: Story = {
   },
 };
 
-// -------------------------------------------------------------------------
-// Merge methods — default button label reflects the selected method
-// -------------------------------------------------------------------------
-
 export const MergeMethodMerge: Story = {
   args: {
     repoFullName: 'loro-dev/lody',
@@ -730,10 +807,6 @@ export const MergeMethodRebase: Story = {
     mergeMethod: 'rebase',
   },
 };
-
-// -------------------------------------------------------------------------
-// Conversation content variants
-// -------------------------------------------------------------------------
 
 export const NoComments: Story = {
   args: {
@@ -810,10 +883,6 @@ export const OutdatedReviewThread: Story = {
   },
 };
 
-// -------------------------------------------------------------------------
-// Body & metadata variants
-// -------------------------------------------------------------------------
-
 export const NoBody: Story = {
   args: {
     repoFullName: 'loro-dev/lody',
@@ -856,10 +925,6 @@ export const GhostAuthor: Story = {
   },
 };
 
-// -------------------------------------------------------------------------
-// Interaction / transient states
-// -------------------------------------------------------------------------
-
 export const Refreshing: Story = {
   args: {
     repoFullName: 'loro-dev/lody',
@@ -882,10 +947,6 @@ export const PostingComment: Story = {
   },
 };
 
-// -------------------------------------------------------------------------
-// Mobile full-screen drawer dressing (leadingSlot + narrow viewport)
-// -------------------------------------------------------------------------
-
 export const MobileWithBackButton: Story = {
   args: {
     repoFullName: 'loro-dev/lody',
@@ -894,21 +955,14 @@ export const MobileWithBackButton: Story = {
     data: baseData,
     ...storyCallbacks,
     leadingSlot: (
-      <button
-        type="button"
-        className="-ml-1 inline-flex h-7 w-7 items-center justify-center rounded-sm hover:bg-muted"
-        aria-label="Back"
-      >
+      <button type="button" {...stylex.props(prStory.back)} aria-label="Back">
         <span aria-hidden>←</span>
       </button>
     ),
   },
   decorators: [
     (Story) => (
-      <div
-        className="mx-auto h-screen w-[390px] border border-border bg-background shadow-lg"
-        style={{ maxWidth: '100vw' }}
-      >
+      <div {...stylex.props(prStory.phone)} style={{ maxWidth: '100vw' }}>
         <Story />
       </div>
     ),
@@ -923,10 +977,10 @@ export const MobileNativeKeyboardDrawer: Story = {
       <Drawer direction="right" open repositionInputs>
         <DrawerContent
           nativeKeyboardInset
-          className="w-full! max-w-none! inset-0 border-0 border-l-0! rounded-none"
+          xstyle={drawerScene.fullPage}
           aria-describedby={undefined}
         >
-          <DrawerTitle className="sr-only">Pull request</DrawerTitle>
+          <DrawerTitle visuallyHidden>Pull request</DrawerTitle>
           <VaulDrawerBody topInset="0px">
             <Story />
           </VaulDrawerBody>
@@ -936,10 +990,8 @@ export const MobileNativeKeyboardDrawer: Story = {
   ],
 };
 
-// -------------------------------------------------------------------------
 // Read-only (no callbacks) — useful to confirm the view still renders when
 // the parent hasn't wired any action handlers yet.
-// -------------------------------------------------------------------------
 
 export const ReadOnly: Story = {
   args: {

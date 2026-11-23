@@ -1,3 +1,4 @@
+import { onProductWindowMessage } from './ipc/product-window-ipc-service'
 import { closeDesktopE2eeAccount, resumeDesktopE2eeAccount } from './services/e2ee-account-runtime'
 import { makeApplicationRuntime } from '@lody/shared/node/application-runtime'
 import {
@@ -9,8 +10,9 @@ import { squashProcessFailure } from '@lody/shared/node/process'
 import { Layer } from 'effect'
 import { bindUserShellEnvCacheLegacy } from './services/shell-env'
 import { handleWindowContentReady } from './window-target'
+import { installPowerStateBroadcast } from './power-state-broadcast'
 import { installLocalFileResourceProtocol } from './services/local-file-resource-protocol'
-import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, dialog, safeStorage } from 'electron'
 import { electronApp, optimizer } from '@electron-toolkit/utils'
 import dns from 'node:dns'
 import { writeHeapSnapshot } from 'node:v8'
@@ -32,6 +34,7 @@ import {
 } from './window'
 import {
   getMainWindow,
+  isAppQuitting,
   productWindows,
   setAppQuitting,
   setWindowsTrayAvailable
@@ -40,7 +43,14 @@ import { CliService } from './services/cli-service'
 import { createElectronStorageGuard } from './services/storage-guard-electron'
 import { observeCliStorageWriteFailures } from './services/storage-guard-cli'
 import type { DesktopExecutionHost } from './services/desktop-execution-host'
-import { createDesktopQuitBarrier, waitForQuitRecovery } from './services/desktop-shutdown'
+import {
+  createDesktopQuitBarrier,
+  drainMainProcessQuitResources,
+  finishUnconfirmedDesktopQuit,
+  recordUnconfirmedDesktopQuit,
+  reportPreviousUnconfirmedDesktopQuit,
+  waitForQuitRecovery
+} from './services/desktop-shutdown'
 import { cancelRequestedRelaunch, relaunchIfRequested } from './relaunch-intent'
 import { applyPendingDesktopLocalReset } from './services/local-reset-service'
 import { TerminalRelay } from './services/terminal-relay'
@@ -69,7 +79,7 @@ import { IPC_PUSH_CHANNELS, IPC_SEND_CHANNELS } from '@lody/shared/electron-ipc'
 import { PublicBrowserService } from './services/public-browser-service'
 import { desktopInstallationProfile, isLocalPlatform } from './platform'
 import { mainPlatformKind } from './platform'
-import { getLocalLoroDataPlaneSocketPath } from '@lody/shared/node/local-ipc'
+import { getLocalDaemonRunFilePath, readLocalDaemonRunFile } from '@lody/shared/node/local-ipc'
 import { getLocalTerminalSocketPath } from '@lody/shared/node/local-terminal'
 import {
   getInitialDesktopPath,
@@ -193,6 +203,7 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
     await applyPendingDesktopLocalReset()
     await startDevbarDevframeService()
     recordE2EBootDiagnostic('initializing-services')
+    installPowerStateBroadcast()
     if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(macIcon)
     const appIconService = createElectronAppIconService(macIcon, aquaIcon)
     if (process.platform === 'darwin' && app.isPackaged) {
@@ -249,9 +260,11 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
       })
     }
     let terminalRelay = new TerminalRelay(getLocalTerminalSocketPath(mainPlatformKind))
-    let loroDataPlaneRelay = new LoroDataPlaneRelay(
-      getLocalLoroDataPlaneSocketPath(mainPlatformKind)
-    )
+    let loroDataPlaneRelay = new LoroDataPlaneRelay(() => {
+      const run = readLocalDaemonRunFile(getLocalDaemonRunFilePath(mainPlatformKind))
+      if (!run.token || !run.dataPlaneSocketPath) throw new Error('local_ipc_credentials_missing')
+      return { socketPath: run.dataPlaneSocketPath, token: run.token }
+    })
     loroDataPlaneRelay.setEnabled(cliService.getCliAutoStartEnabled())
 
     const appUpdaterService = new AppUpdaterService({
@@ -345,15 +358,25 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
     recordE2EBootDiagnostic('opening-main-window')
     openMainWindow({ icon, initialPath, hideWindowOnAutoLaunch })
     recordE2EBootDiagnostic('main-window-opened')
+    // Startup notification delivery never gates rendering or a subsequent quit.
+    void reportPreviousUnconfirmedDesktopQuit(app.getPath('userData'), () => {
+      if (isAppQuitting()) return Promise.resolve({ shown: false })
+      return notificationService.showQuitWarning({
+        title: translateAppText('desktop.quitUnconfirmed.title'),
+        body: translateAppText('desktop.quitUnconfirmed.detail')
+      })
+    }).catch(() => console.warn('[Electron] Previous quit warning remains pending'))
     // Warmup is off by default and only enabled from Developer mode. When it is
     // enabled, session-windows primes the spare after an auxiliary request so
     // ordinary single-window sessions never pay an idle renderer cost.
-    ipcMain.on(IPC_SEND_CHANNELS.appWindowReady, (event) => handleWindowWarmReady(event.sender.id))
-    ipcMain.on(IPC_SEND_CHANNELS.appPreparedWindowState, (event, state) => {
+    onProductWindowMessage(IPC_SEND_CHANNELS.appWindowReady, (event) =>
+      handleWindowWarmReady(event.sender.id)
+    )
+    onProductWindowMessage(IPC_SEND_CHANNELS.appPreparedWindowState, (event, state) => {
       if (event.senderFrame === event.sender.mainFrame)
         handlePreparedWindowState(event.sender.id, state)
     })
-    ipcMain.on(IPC_SEND_CHANNELS.appWindowContentReady, (event, target) => {
+    onProductWindowMessage(IPC_SEND_CHANNELS.appWindowContentReady, (event, target) => {
       if (event.senderFrame === event.sender.mainFrame)
         handleWindowContentReady(event.sender.id, target)
     })
@@ -376,10 +399,11 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
       openOrFocusMainWindow({ icon })
     })
 
+    const unconfirmedQuitResources = new Set<string>()
     const beforeQuit = createDesktopQuitBarrier({
       // Every renderer approves unload (closing its window) before anything is
       // torn down, so a Stay answer leaves relays and the CLI running.
-      prepare: closeProductWindowsForQuit,
+      prepare: () => closeProductWindowsForQuit(() => unconfirmedQuitResources.add('renderer')),
       stop: async () => {
         setAppQuitting(true)
         setWindowsTrayAvailable(false)
@@ -389,20 +413,47 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
         loroDataPlaneRelay.destroy()
         appUpdaterService.stop()
         publicBrowserService.destroyAll()
-        const [cliResult, shellResult, e2eeResult] = await Promise.allSettled([
+        const [cliResult, shellResult] = await Promise.allSettled([
           cliService.shutdownForQuit(),
           applicationRuntime.closeLegacy(),
-          closeDesktopE2eeAccount({ quit: true }),
-          flushElectronMainErrorReporting(),
-          stopDevbarDevframeService()
+          drainMainProcessQuitResources(
+            [
+              { name: 'e2ee', close: () => closeDesktopE2eeAccount({ quit: true }) },
+              { name: 'error-reporting', close: flushElectronMainErrorReporting },
+              { name: 'devbar', close: stopDevbarDevframeService }
+            ],
+            15_000,
+            (resource, state) => console.info('[Electron] Quit resource', { resource, state })
+          ).then((unconfirmed) => {
+            for (const resource of unconfirmed) unconfirmedQuitResources.add(resource)
+          })
         ])
-        const failures = [cliResult, shellResult, e2eeResult].flatMap((result) =>
+        const failures = [cliResult, shellResult].flatMap((result) =>
           result.status === 'rejected' ? [result.reason] : []
         )
         if (failures.length > 0)
           throw new AggregateError(failures, 'Desktop resource cleanup failed')
       },
-      quit: () => app.quit(),
+      quit: () => {
+        if (unconfirmedQuitResources.size === 0) {
+          app.quit()
+          return
+        }
+        // Only main-owned work may end at process termination. The CLI and shell
+        // process owners above must first confirm release; never orphan them.
+        cancelRequestedRelaunch()
+        // A second menu/dock Quit while marker I/O is pending must not replace
+        // the nonzero terminal exit.
+        app.on('before-quit', (event) => event.preventDefault())
+        console.error('[Electron] Quit persistence unconfirmed', {
+          resources: [...unconfirmedQuitResources]
+        })
+        // No shutdown UI, including update installation and OS shutdown/logout.
+        void finishUnconfirmedDesktopQuit({
+          record: () => recordUnconfirmedDesktopQuit(app.getPath('userData')),
+          exit: (code) => app.exit(code)
+        })
+      },
       recover: async () => {
         // One bounded owner retry before rebuilding services, never a second live CLI.
         const retried = await waitForQuitRecovery(
@@ -417,9 +468,12 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
         applicationRuntime = createShellRuntime()
         bindUserShellEnvCacheLegacy(applicationRuntime)
         terminalRelay = new TerminalRelay(getLocalTerminalSocketPath(mainPlatformKind))
-        loroDataPlaneRelay = new LoroDataPlaneRelay(
-          getLocalLoroDataPlaneSocketPath(mainPlatformKind)
-        )
+        loroDataPlaneRelay = new LoroDataPlaneRelay(() => {
+          const run = readLocalDaemonRunFile(getLocalDaemonRunFilePath(mainPlatformKind))
+          if (!run.token || !run.dataPlaneSocketPath)
+            throw new Error('local_ipc_credentials_missing')
+          return { socketPath: run.dataPlaneSocketPath, token: run.token }
+        })
         loroDataPlaneRelay.setEnabled(cliService.getCliAutoStartEnabled())
         ipcDeps.terminalRelay = terminalRelay
         ipcDeps.loroDataPlaneRelay = loroDataPlaneRelay
@@ -449,6 +503,7 @@ export function startApplication(executionHost?: DesktopExecutionHost): void {
         queueMicrotask(() => app.quit())
       },
       cancelled: () => {
+        unconfirmedQuitResources.clear()
         resumeDesktopE2eeAccount()
         cancelRequestedRelaunch()
       }

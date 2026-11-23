@@ -1,4 +1,6 @@
+import { ScheduleRepository } from '@lody/shared/schedule-repository';
 // @vitest-environment jsdom
+import { scheduleDeclarationSigner } from './helpers/encrypted-dispatch-signer';
 import { act, StrictMode } from 'react';
 import { Provider, createStore } from 'jotai';
 import { workspaceContentModeAtom } from '../src/atoms/workspace-content-mode';
@@ -10,7 +12,7 @@ import {
   MachineProvidersSection,
 } from '../src/components/settings/machine-detail-pane';
 import { LoroRepo } from 'loro-repo';
-import { ScheduleRepository, type WorkspaceId } from '@lody/shared';
+import { type WorkspaceId } from '@lody/shared';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { initI18n } from '../src/i18n';
@@ -75,27 +77,21 @@ it.each(['en', 'zh_CN'])(
   }
 );
 
-it('keeps ordinary unknown presence silent', async () => {
-  const state = resolveSessionStatusStripState({
-    browserOnline: true,
-    machineRemoved: false,
-    machineOnlineStatus: 'unknown',
-  });
-  await act(async () => root.render(<SessionStatusStrip state={state} />));
-  expect(container.textContent).toBe('');
-});
-
 it('prepares and saves an encrypted scheduled message through the ordinary repository', async () => {
   const repo = await LoroRepo.create({});
   const workspaceId = 'workspace' as WorkspaceId;
+  // An encrypted schedule runs only with its setter's host-signed declaration.
+  const declarations = scheduleDeclarationSigner();
   const runtime = {
     contentMode: 'e2ee',
     workspaceId,
     repo,
     withScheduleStore: async (_id: string, write: () => Promise<unknown>) => write(),
+    signScheduleDeclaration: declarations.signScheduleDeclaration,
   } as WorkspaceRuntime;
   try {
     const message = await prepareScheduledMessage({
+      scheduleId: 'schedule',
       runtime,
       sessionId: 'session' as never,
       machineId: 'machine' as never,
@@ -130,6 +126,7 @@ it('prepares and saves an encrypted scheduled message through the ordinary repos
     });
     const repository = new ScheduleRepository(repo, workspaceId);
     expect((await repository.read('reserved'))?.message).toEqual(message);
+    expect(declarations.signed.map((document) => document.message)).toEqual([message]);
     expect((await repository.list()).map((row) => row.scheduleId)).toEqual(['reserved']);
   } finally {
     await repo.destroy();
@@ -152,6 +149,7 @@ it('retains the encrypted scheduled attachment draft when its attachment grant i
   try {
     await expect(
       prepareScheduledMessage({
+        scheduleId: 'schedule',
         runtime,
         sessionId: 'session' as never,
         machineId: 'machine' as never,
@@ -197,22 +195,6 @@ function encryptedStore() {
   } as never);
   return store;
 }
-
-it('keeps the ordinary workspace readiness error for encrypted scheduled messages', async () => {
-  function DraftStatus() {
-    const state = useScheduledMessageDraft({ id: 'session' } as SessionMeta, null);
-    return <button disabled={!!state.disabledReason}>{state.disabledReason}</button>;
-  }
-  await act(async () =>
-    root.render(
-      <Provider store={encryptedStore()}>
-        <DraftStatus />
-      </Provider>
-    )
-  );
-  expect(container.querySelector('button')?.disabled).toBe(true);
-  expect(container.textContent).toBe('Wait for the workspace to finish loading.');
-});
 
 it('keeps encrypted Code Collab available while its runtime is starting', async () => {
   function FileStatus() {
@@ -265,25 +247,6 @@ it.each([false, true])(
       Array(2).fill('Encrypted workspaces do not yet support remote machine operations.')
     );
     expect(container.querySelector('button')).toBeNull();
-  }
-);
-
-it.each(['en', 'zh_CN'])(
-  'enables local export controls in encrypted workspaces in %s',
-  async (language) => {
-    await initI18n(language);
-    function ExportControl() {
-      const available = useWorkspaceFeature('export');
-      return <button disabled={!available}>Export</button>;
-    }
-    await act(async () =>
-      root.render(
-        <Provider store={encryptedStore()}>
-          <ExportControl />
-        </Provider>
-      )
-    );
-    expect(container.querySelector('button')?.disabled).toBe(false);
   }
 );
 

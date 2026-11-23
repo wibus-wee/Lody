@@ -1,8 +1,11 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { nativeShareState as state, Share } from './stubs/native-share';
 import { runTouchImagePreviewAction } from '../src/lib/image-preview-export';
+import { saveBytesAsFile } from '../src/lib/download-file';
 import { shareFileBytesNatively } from '../src/lib/session-file-native-save';
 
-vi.mock('../src/lib/native-platform', () => ({ isNativeAppShell: () => true }));
+const platform = vi.hoisted(() => ({ native: true }));
+vi.mock('../src/lib/native-platform', () => ({ isNativeAppShell: () => platform.native }));
 
 vi.mock('../src/lib/session-file-upload', () => ({
   buildSessionFileDownloadUrl: () => {
@@ -10,47 +13,17 @@ vi.mock('../src/lib/session-file-upload', () => ({
   },
 }));
 
-const state = vi.hoisted(() => ({
-  files: new Map<string, Buffer>(),
-  received: [] as { name: string; bytes: Buffer }[],
-  failure: null as string | null,
-  failWrite: false,
-  failUri: false,
-}));
+vi.mock('@capacitor/filesystem');
+vi.mock('@capacitor/share');
 
-vi.mock('@capacitor/filesystem', () => ({
-  Directory: { Cache: 'CACHE' },
-  Filesystem: {
-    async writeFile({ path, data }: { path: string; data: string }) {
-      state.files.set(path, Buffer.from(data, 'base64'));
-      if (state.failWrite) throw new Error('Disk full');
-    },
-    async appendFile({ path, data }: { path: string; data: string }) {
-      state.files.set(path, Buffer.concat([state.files.get(path)!, Buffer.from(data, 'base64')]));
-    },
-    async getUri({ path }: { path: string }) {
-      if (state.failUri) throw new Error('URI unavailable');
-      return { uri: `file://${path}` };
-    },
-    async deleteFile({ path }: { path: string }) {
-      state.files.delete(path);
-    },
-  },
-}));
-
-vi.mock('@capacitor/share', () => ({
-  Share: {
-    async share({ files }: { files: string[] }) {
-      const path = files[0].slice('file://'.length);
-      const bytes = state.files.get(path);
-      if (!bytes) throw new Error('Missing staged file');
-      if (state.failure) throw new Error(state.failure);
-      state.received.push({ name: path, bytes });
-    },
-  },
-}));
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
 
 beforeEach(() => {
+  platform.native = true;
   state.files.clear();
   state.received = [];
   state.failure = null;
@@ -81,25 +54,6 @@ it('isolates concurrent exports of the same filename', async () => {
   expect(new Set(state.received.map((file) => file.name)).size).toBe(2);
   expect(state.received.map((file) => [...file.bytes])).toEqual([[1], [2]]);
   expect(state.files.size).toBe(0);
-});
-
-it.each(['Share canceled', 'Share cancelled', 'User cancelled sharing'])(
-  'treats %s as dismissal and cleans up',
-  async (message) => {
-    state.failure = message;
-    await expect(shareFileBytesNatively('package.deb', Uint8Array.of(1))).resolves.toEqual({
-      shared: false,
-    });
-    expect(state.files.size).toBe(0);
-  }
-);
-
-it.each(['write', 'share'])('cleans up and reports a %s failure', async (step) => {
-  state.failWrite = step === 'write';
-  state.failure = step === 'share' ? 'Share failed' : null;
-  await expect(shareFileBytesNatively('package.deb', Uint8Array.of(1))).rejects.toThrow();
-  expect(state.files.size).toBe(0);
-  expect(state.received).toEqual([]);
 });
 
 it.each(['cancel', 'write', 'uri', 'share'])(
@@ -135,3 +89,51 @@ it.each(['save', 'share'] as const)(
     expect(state.files.size).toBe(0);
   }
 );
+
+it('saves generated native bytes and reports share dismissal without a browser fallback', async () => {
+  const bytes = Uint8Array.of(7, 8, 9);
+  await expect(saveBytesAsFile('/workspace/diagram.svg', bytes)).resolves.toEqual({ saved: true });
+  expect([...state.received[0].bytes]).toEqual([...bytes]);
+  expect(state.received[0].name).toMatch(/diagram\.svg$/);
+  state.failure = 'Share canceled';
+  await expect(saveBytesAsFile('diagram.svg', bytes)).resolves.toEqual({ saved: false });
+  expect(state.received).toHaveLength(1);
+  expect(state.files.size).toBe(0);
+});
+
+it('propagates native save failure and cleans staging bytes', async () => {
+  const failure = new Error('Share failed');
+  vi.spyOn(Share, 'share').mockRejectedValueOnce(failure);
+  await expect(saveBytesAsFile('diagram.png', Uint8Array.of(1))).rejects.toBe(failure);
+  expect(state.files.size).toBe(0);
+  expect(state.received).toEqual([]);
+});
+
+it('saves browser bytes with the basename through a download link', async () => {
+  platform.native = false;
+  vi.useFakeTimers();
+  let blob: Blob | undefined;
+  let downloaded: { name: string; href: string } | undefined;
+  const anchor = {
+    href: '',
+    download: '',
+    rel: '',
+    click() {
+      downloaded = { name: this.download, href: this.href };
+    },
+    remove() {},
+  };
+  vi.stubGlobal('document', { createElement: () => anchor, body: { appendChild() {} } });
+  vi.spyOn(URL, 'createObjectURL').mockImplementation((value) => {
+    blob = value as Blob;
+    return 'blob:generated-download';
+  });
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+  await expect(saveBytesAsFile('/workspace/diagram.mmd', Uint8Array.of(4, 5))).resolves.toEqual({
+    saved: true,
+  });
+  expect(downloaded).toEqual({ name: 'diagram.mmd', href: 'blob:generated-download' });
+  expect([...new Uint8Array(await blob!.arrayBuffer())]).toEqual([4, 5]);
+  expect(state.received).toEqual([]);
+  vi.runAllTimers();
+});

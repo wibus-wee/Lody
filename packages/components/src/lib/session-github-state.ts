@@ -5,8 +5,10 @@ import type {
 } from '@lody/shared';
 import {
   getSessionPullRequestLegacyFields,
-  resolveSessionPullRequests,
-  type SessionPullRequestSource,
+  hasWorkspaceChanges,
+  resolveSessionPrimaryPullRequest,
+  resolveSessionPullRequestHistory,
+  type SessionPullRequestView,
   parseGitHubPullRequestUrl,
   resolveProjectGitHubRepo,
 } from '@lody/shared';
@@ -15,6 +17,11 @@ export type SessionGitHubState = {
   /** The session owning the PR, also used for server-side repository identity. */
   sourceSessionId: SessionMeta['id'] | undefined;
   repoFullName: string;
+  /** Shared summary of the described PR; every surface reads the same view. */
+  latestPrView: SessionPullRequestView | null;
+  /** Every associated PR in the described scope: `latestPrView` first, then
+   *  older associations newest first. Never shrinks when a newer PR appears. */
+  pullRequestHistory: SessionPullRequestView[];
   latestPr: SessionPullRequestMeta | null;
   latestPrState: SessionPullRequestStateMeta | null;
   canShowGitHubActions: boolean;
@@ -27,72 +34,28 @@ export type SessionGitHubState = {
    */
   workspaceUnpushed: boolean;
   /**
-   * Whether the session has any changes to base a PR on — uncommitted
-   * (`workspaceDirty`) OR already committed (`diffStats.allChange > 0`). These
-   * two signals come from independent writers (post-turn `git status` vs the
-   * Code Collab file-index scanner), so together they survive one being stale
-   * and, unlike `workspaceDirty` alone, keep "Create PR" available after the
-   * agent commits (clean tree, real commits, still no PR).
+   * Whether the session has changes to base a PR on. Workspace diff totals
+   * include committed and uncommitted changes against the workspace base.
+   * `workspaceDirty` also covers changes without text-line counts and remains
+   * independent of the asynchronously refreshed comparison summary.
    */
   hasChanges: boolean;
 };
 
-export const getLatestPullRequest = (
-  session: SessionPullRequestSource | null | undefined
-): SessionPullRequestMeta | null => {
-  const prList = resolveSessionPullRequests(session);
-  if (!prList.length) {
-    return null;
-  }
-  if (!prList.some((pr) => getSessionPullRequestLegacyFields(pr).reportedAt)) {
-    return prList[prList.length - 1] ?? null;
-  }
-  return prList.toSorted((a, b) => comparePullRequestRecency(a, b))[0] ?? null;
-};
-
-/**
- * The current PR of one repository. A multi-repository Session records PRs of
- * several repositories in one list; its context stage describes the first
- * member, so it must show that repository's PR, never another one's.
- */
-export const getLatestPullRequestForRepository = (
-  session: SessionPullRequestSource | null | undefined,
-  repoFullName: string
-): SessionPullRequestMeta | null => {
-  const target = repoFullName.toLowerCase();
-  const matching = resolveSessionPullRequests(session).filter(
-    (pr) => parseGitHubPullRequestUrl(pr.url)?.repoFullName.toLowerCase() === target
-  );
-  return getLatestPullRequest({ pullRequests: matching });
-};
-
-const comparePullRequestRecency = (
-  left: SessionPullRequestMeta,
-  right: SessionPullRequestMeta
-): number => {
-  const leftReportedAt = getSessionPullRequestLegacyFields(left).reportedAt ?? '';
-  const rightReportedAt = getSessionPullRequestLegacyFields(right).reportedAt ?? '';
-  if (leftReportedAt || rightReportedAt) {
-    return rightReportedAt.localeCompare(leftReportedAt);
-  }
-  return 0;
-};
-
 export const getPullRequestNumber = (
   pr: SessionPullRequestMeta | null | undefined
-): number | null =>
-  typeof getSessionPullRequestLegacyFields(pr).number === 'number' &&
-  Number.isFinite(getSessionPullRequestLegacyFields(pr).number)
-    ? (getSessionPullRequestLegacyFields(pr).number ?? null)
-    : pr?.url
-      ? (parseGitHubPullRequestUrl(pr.url)?.prNumber ?? null)
-      : null;
+): number | null => {
+  const parsed = pr?.url ? parseGitHubPullRequestUrl(pr.url)?.prNumber : undefined;
+  if (parsed !== undefined) return parsed;
+  const legacy = getSessionPullRequestLegacyFields(pr).number;
+  return typeof legacy === 'number' && Number.isFinite(legacy) ? legacy : null;
+};
 
 export const getPullRequestRepoFullName = (
   pr: SessionPullRequestMeta | null | undefined
 ): string | null =>
-  getSessionPullRequestLegacyFields(pr).repository?.trim() ||
-  (pr?.url ? (parseGitHubPullRequestUrl(pr.url)?.repoFullName ?? null) : null);
+  (pr?.url ? parseGitHubPullRequestUrl(pr.url)?.repoFullName : undefined) ??
+  (getSessionPullRequestLegacyFields(pr).repository?.trim() || null);
 
 export const resolveWorkspaceOwnerSession = (
   session: SessionMeta | null | undefined,
@@ -117,38 +80,35 @@ export const getSessionGitHubState = (
     (resolveProjectGitHubRepo(sourceSession?.project) ?? sourceSession?.repoFullName)?.trim() ?? '';
   const repoFullName =
     activeRepository === undefined ? legacyRepoFullName : (activeRepository?.trim() ?? '');
-  const latestPr =
-    sourceSession?.projectRun || activeRepository !== undefined
-      ? repoFullName
-        ? getLatestPullRequestForRepository(sourceSession, repoFullName)
-        : null
-      : getLatestPullRequest(sourceSession);
-  const latestPrState = latestPr?.url
-    ? (sourceSession?.pullRequestState?.[latestPr.url] ?? null)
-    : null;
+  const describedRepository =
+    activeRepository === undefined && !sourceSession?.projectRun ? undefined : repoFullName || null;
+  const latestPrView = resolveSessionPrimaryPullRequest(sourceSession, describedRepository);
+  const pullRequestHistory = resolveSessionPullRequestHistory(sourceSession, describedRepository);
+  const latestPr = latestPrView?.pr ?? null;
+  const latestPrState = latestPrView?.state ?? null;
 
   const workspaceDirty = sourceSession?.workspaceDirty ?? false;
   const workspaceUnpushed = sourceSession?.workspaceUnpushed ?? false;
   const allChange = sourceSession?.diffStats?.allChange;
-  const hasCommittedDiff = allChange ? allChange.add + allChange.del > 0 : false;
-  // `diffStats` is published only when every Member reports a diff, and a
-  // non-Git Member never does. Fall back to the Member rows so committed work
-  // still enables Create PR in a mixed Project group.
-  const memberHasCommittedDiff = sourceSession?.projectRun
-    ? Object.values(sourceSession.projectRun.members).some(
-        (member) => member.diff && member.diff.add + member.diff.del > 0
+  const hasWorkspaceDiff = hasWorkspaceChanges(allChange);
+  // A group total can be unknown while some Members have a complete comparison.
+  const memberHasWorkspaceDiff = sourceSession?.projectRun
+    ? Object.values(sourceSession.projectRun.members).some((member) =>
+        hasWorkspaceChanges(member.diff)
       )
     : false;
 
   return {
     sourceSessionId: sourceSession?.id,
     repoFullName,
+    latestPrView,
+    pullRequestHistory,
     latestPr,
     latestPrState,
     canShowGitHubActions: !!repoFullName,
     hasExistingPr: !!repoFullName && !!latestPr,
     workspaceDirty,
     workspaceUnpushed,
-    hasChanges: workspaceDirty || hasCommittedDiff || memberHasCommittedDiff,
+    hasChanges: workspaceDirty || hasWorkspaceDiff || memberHasWorkspaceDiff,
   };
 };

@@ -1,3 +1,4 @@
+import { readSessionHistoryMetadata } from '@lody/shared/session-data';
 import { toShared } from '@/platform/process-options';
 import { resolveSessionConversationConfig } from '@lody/shared';
 import {
@@ -46,8 +47,18 @@ const FORK_RECOVERY_CONCURRENCY = 4;
 
 type ForkRuntimeConfig = Omit<SessionAcpRuntimeConfigSnapshot, 'acpSessionId' | 'revision'>;
 
+/**
+ * `requestedByUserId` names the account that owns the new Session (display and read
+ * visibility). An encrypted fork also carries the verified signer's execution identity
+ * (the machine owner's account or `e2ee-member:`), which every execution, credential
+ * and access decision uses instead.
+ */
+export type SessionForkInput = SessionForkSpec & { executionRequesterUserId?: string };
+const executionRequester = (spec: SessionForkInput) =>
+  spec.executionRequesterUserId ?? spec.requestedByUserId;
+
 type WorktreeForkPreparedInput = {
-  spec: SessionForkSpec;
+  spec: SessionForkInput;
   source: SessionMeta;
   sourceAcpSessionId: NonNullable<SessionMeta['acpSessionId']>;
   targetDoc: Awaited<ReturnType<LoroDocumentManager['getOrCreateSessionDoc']>>;
@@ -73,10 +84,10 @@ class SessionForkOperationError extends Error {
   }
 }
 
-function rewriteAttachmentNamespace(
-  item: MessageContent,
+function rewriteAttachmentNamespace<T extends MessageContent>(
+  item: T,
   sourceSessionId: SessionId
-): MessageContent {
+): T {
   if (item.type === 'image') {
     return {
       ...item,
@@ -149,6 +160,16 @@ export function cloneHistoryThroughTurn(
   const cloned = selected.map((entry) => ({
     ...entry,
     items: (entry.items ?? []).map((item) => rewriteAttachmentNamespace(item, sourceSessionId)),
+    ...(entry.inputConfig?.inputBlocks
+      ? {
+          inputConfig: {
+            ...entry.inputConfig,
+            inputBlocks: entry.inputConfig.inputBlocks.map((block) =>
+              rewriteAttachmentNamespace(block, sourceSessionId)
+            ),
+          },
+        }
+      : {}),
     fileDiff: [],
     sendStatus: undefined,
     status: entry.role === 'user' ? ('handled' as const) : entry.status,
@@ -177,7 +198,7 @@ export function cloneHistoryThroughTurn(
 export class SessionForkService {
   private readonly inFlight = new Map<
     string,
-    { spec: SessionForkSpec; promise: Promise<SessionForkResponse> }
+    { spec: SessionForkInput; promise: Promise<SessionForkResponse> }
   >();
   /**
    * Operation ids this process is currently driving (accept → background saga).
@@ -201,7 +222,7 @@ export class SessionForkService {
     }
   ) {}
 
-  async fork(spec: SessionForkSpec): Promise<SessionForkResponse> {
+  async fork(spec: SessionForkInput): Promise<SessionForkResponse> {
     const key = spec.targetSessionId;
     const existing = this.inFlight.get(key);
     if (existing) {
@@ -209,6 +230,7 @@ export class SessionForkService {
         existing.spec.sourceSessionId !== spec.sourceSessionId ||
         existing.spec.sourceTurnId !== spec.sourceTurnId ||
         existing.spec.requestedByUserId !== spec.requestedByUserId ||
+        executionRequester(existing.spec) !== executionRequester(spec) ||
         existing.spec.targetContext?.kind !== spec.targetContext?.kind ||
         existing.spec.targetPlacement !== spec.targetPlacement
       ) {
@@ -342,7 +364,7 @@ export class SessionForkService {
       historyBackend:
         targetMeta?.historyBackend ?? marker.historyBackend ?? LEGACY_SESSION_HISTORY_BACKEND,
     });
-    const history = await targetBackend.readHistory();
+    const history = await targetBackend.readHistoryQuery();
     const hasOriginNotice = history.some((entry) =>
       (entry.items ?? []).some(
         (item) => item.type === 'system_notice' && item.name === 'session_fork_origin'
@@ -359,6 +381,7 @@ export class SessionForkService {
       // Genuinely interrupted mid-saga: the process that owned it is gone.
       // Compensate the worktree from the marker payload (no source doc needed),
       // then leave the durable failed receipt for same-target retries to read.
+      const configHistory = await readSessionHistoryMetadata(targetBackend.history);
       await this.deps.sessionManager
         .cleanupForkWorktree({
           workspaceId: this.deps.workspaceId as never,
@@ -367,8 +390,8 @@ export class SessionForkService {
           agentConfigId: marker.cleanup.agentConfigId as never,
           agentCliType: marker.cleanup.cliType,
           agentType: marker.cleanup.agentType as never,
-          memory: resolveSessionConversationConfig(history).memory,
-          mcpServerIds: resolveSessionMcpSelection(history),
+          memory: resolveSessionConversationConfig(configHistory).memory,
+          mcpServerIds: resolveSessionMcpSelection(configHistory),
           project: marker.cleanup.project as ProjectRef,
           sessionId: targetSessionId,
           githubRepo: marker.cleanup.repoFullName,
@@ -448,7 +471,7 @@ export class SessionForkService {
     }
   }
 
-  private async forkInner(spec: SessionForkSpec): Promise<SessionForkResponse> {
+  private async forkInner(spec: SessionForkInput): Promise<SessionForkResponse> {
     const { sourceSessionId, targetSessionId } = spec;
     const sourceDoc = await this.deps.workspaceDocument.getOrCreateSessionDoc(sourceSessionId);
     const source = await sourceDoc.getMetaState();
@@ -479,7 +502,7 @@ export class SessionForkService {
     }
     const reusedUser = this.deps.sessionManager
       .getSession(sourceSessionId)
-      ?.getGitIdentityForUser?.(spec.requestedByUserId);
+      ?.getGitIdentityForUser?.(executionRequester(spec));
 
     const targetRoomId = getSessionRoomId(targetSessionId);
     const worktreeFork = spec.targetContext?.kind === 'new-worktree';
@@ -495,7 +518,7 @@ export class SessionForkService {
         this.deps.workspaceDocument.repo.getDocMeta(targetRoomId),
         sourceBackend.captureForkSnapshot(),
         this.deps.workspaceDocument.getAgentConfigById(source.agentConfigId, source.machineId),
-        reusedUser ?? this.deps.userResolver.resolve(spec.requestedByUserId),
+        reusedUser ?? this.deps.userResolver.resolve(executionRequester(spec)),
         sourceDoc.getDocState(),
       ]);
     if (worktreeFork) {
@@ -748,7 +771,7 @@ export class SessionForkService {
           ...(targetRepoFullName ? { repoFullName: targetRepoFullName } : {}),
           ...(branch ? { branch } : {}),
           ...(targetWorkdir ? { workdir: targetWorkdir } : {}),
-          requesterUserId: spec.requestedByUserId,
+          requesterUserId: executionRequester(spec),
           agentConfigId: source.agentConfigId,
           cliType: source.cliType,
           agentType: source.agentType,
@@ -864,7 +887,7 @@ export class SessionForkService {
         await this.deps.sessionManager.createSession(
           {
             workspaceId: this.deps.workspaceId as never,
-            requesterUserId: spec.requestedByUserId,
+            requesterUserId: executionRequester(spec),
             machineId: source.machineId,
             agentConfigId: source.agentConfigId,
             agentCliType: source.cliType,
@@ -1006,7 +1029,7 @@ export class SessionForkService {
     const targetProject = targetMeta.project;
     const config = {
       workspaceId: this.deps.workspaceId as never,
-      requesterUserId: spec.requestedByUserId,
+      requesterUserId: executionRequester(spec),
       machineId: source.machineId,
       agentConfigId: source.agentConfigId,
       agentCliType: source.cliType,

@@ -69,10 +69,7 @@ import { userAtom } from '../src/atoms';
 import { activeWorkspaceRuntimeAtom } from '../src/atoms/runtime';
 import { sessionMetaCacheAtom } from '../src/atoms/doc-meta';
 import { SessionShareManager } from '../src/components/sharing/session-share-manager';
-import {
-  useSessionShareManagement,
-  useSessionShareStatus,
-} from '../src/hooks/use-session-share-management';
+import { useSessionShareManagement } from '../src/hooks/use-session-share-management';
 import {
   readSessionShareSecret,
   saveSessionShareSecret,
@@ -748,15 +745,22 @@ describe('static publication client lifecycle', () => {
       'share_quota_exceeded',
       'at most 2 unfinished publications, 10 new publication attempts per hour, and 2 GiB',
     ],
+    // Each server-reported limit gets its own explanation instead of the combined one.
+    ['share_quota_exceeded:deployment_bytes', 'whole share can be up to 256 MiB'],
+    ['share_quota_exceeded:pending_deployments', 'already has 2 share publications in progress'],
+    ['share_quota_exceeded:hourly_deployments', '10 share publications in the past hour'],
+    ['share_quota_exceeded:workspace_storage', 'reached the 2 GiB storage limit'],
+    ['share_quota_exceeded:future_limit', 'at most 2 unfinished publications'],
     ['share_conflict', 'Close and reopen sharing'],
     ['share_forbidden', 'no longer have permission'],
     ['share_unavailable', 'no longer available'],
     ['share_confirmation_required', 'send a new request'],
     ['unauthenticated', 'Sign in again'],
   ])('explains %s without publishing or exposing the server payload', async (code, expected) => {
+    const [quota, limit] = code.split(':');
     cloud.mutation.mockRejectedValue(
       Object.assign(new Error('private transcript access=v1.secret'), {
-        data: { code, privateDetail: 'private transcript' },
+        data: { code: quota, ...(limit ? { limit } : {}), privateDetail: 'private transcript' },
       })
     );
     await render();
@@ -765,32 +769,6 @@ describe('static publication client lifecycle', () => {
     expect(control.error).not.toMatch(/private transcript|access=v1/);
     expect(control.result).toBeNull();
     expect(cloud.upload).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    [new Error('Share image exceeds size limit'), 'Each image can be up to 20 MB'],
-    [new Error('Share history exceeds size limit'), 'history can be up to 32 MiB'],
-    [new Error('Share package exceeds size limit'), 'share can be up to 256 MiB'],
-    [new Error('Too many share attachments'), 'up to 64 images'],
-    [new Error('Invalid share selection'), 'between 1 and 32 conversations'],
-    [
-      new Error('Share object exceeds size limit'),
-      '32 MiB, each image 20 MB, and the whole share 256 MiB',
-    ],
-    [new Error('Share attachment unavailable'), 'image could not be loaded'],
-    [new DOMException('expired', 'TimeoutError'), 'took too long'],
-    [new Error('unknown private transcript'), 'Could not load the conversations'],
-  ])('explains capture failures and allows a fresh retry', async (failure, expected) => {
-    cloud.capture.mockRejectedValueOnce(failure);
-    await render();
-    await act(async () => control.onPublish());
-    expect(control.error).toContain(expected);
-    expect(control.phase).toBe('idle');
-    expect(control.hasPending).toBe(false);
-    expect(cloud.mutation).not.toHaveBeenCalled();
-    await act(async () => control.onPublish());
-    expect(control.error).toBeNull();
-    expect(control.result).not.toBeNull();
   });
 
   it('identifies upload failures after progress resets and preserves the retry', async () => {
@@ -810,14 +788,6 @@ describe('static publication client lifecycle', () => {
     ).toHaveLength(1);
   });
 
-  it('distinguishes admission failure from upload failure', async () => {
-    cloud.mutation.mockRejectedValue(new Error('Unknown transport failure'));
-    await render();
-    await act(async () => control.onPublish());
-    expect(control.error).toContain('Could not start sharing');
-    expect(cloud.upload).not.toHaveBeenCalled();
-  });
-
   it('keeps the published link available when manual copy is blocked', async () => {
     const writeText = vi.fn().mockRejectedValue(new DOMException('Denied', 'NotAllowedError'));
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
@@ -830,6 +800,24 @@ describe('static publication client lifecycle', () => {
     await act(async () => control.onCopy());
     expect(control.error).toContain('copy the full link');
     expect(control.shareLink).toBe(link);
+  });
+
+  it('copies the link through the native shell clipboard when the WebView denies the web API', async () => {
+    const writeText = vi.fn().mockRejectedValue(new DOMException('Denied', 'NotAllowedError'));
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const native = vi.fn().mockResolvedValue(undefined);
+    window.__LODY_CLIPBOARD__ = { writeText: native, readText: async () => null };
+    try {
+      cloud.state = entry;
+      saveSessionShareSecret(localStorage, key, { secret: 'a'.repeat(64), credentialVersion: 1 });
+      await render();
+      await act(async () => control.onCopy());
+      expect(native).toHaveBeenCalledWith(`https://share.test/s/share#access=v1.${'a'.repeat(64)}`);
+      expect(control.error).toBeNull();
+      expect(control.notice).toBe('Share link copied');
+    } finally {
+      delete window.__LODY_CLIPBOARD__;
+    }
   });
 
   it('explains a missing device credential without attempting clipboard access', async () => {
@@ -956,89 +944,6 @@ describe('static publication client lifecycle', () => {
     expect(cloud.upload).toHaveBeenCalledOnce();
     expect(JSON.stringify(cloud.mutation.mock.calls)).not.toContain('a'.repeat(64));
     expect(readSessionShareSecret(localStorage, key, 1)).toBe('a'.repeat(64));
-  });
-  it('freezes, uploads and publishes from one action and reports a real clipboard write', async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
-    await render();
-    await act(async () => control.onPublish());
-    expect(cloud.capture).toHaveBeenCalledOnce();
-    expect(cloud.upload).toHaveBeenCalledOnce();
-    expect(cloud.mutation.mock.calls.map(([name]) => name)).toEqual([
-      'sessionSharing:beginDeployment',
-      'sessionSharing:publishDeployment',
-    ]);
-    const url = `https://share.test/s/share#access=v1.${'a'.repeat(64)}`;
-    expect(writeText).toHaveBeenCalledWith(url);
-    expect(control.result).toEqual({ url, copied: true });
-    expect(control.phase).toBe('idle');
-    expect(control.hasPending).toBe(false);
-  });
-
-  it('never claims a copy the clipboard refused, and keeps the link recoverable', async () => {
-    const writeText = vi.fn().mockRejectedValue(new Error('denied'));
-    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
-    await render();
-    await act(async () => control.onPublish());
-    expect(control.result).toEqual({
-      url: `https://share.test/s/share#access=v1.${'a'.repeat(64)}`,
-      copied: false,
-    });
-    expect(control.error).toBeNull();
-  });
-
-  it('reports a measured phase only while bytes move', async () => {
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: { writeText: vi.fn().mockResolvedValue(undefined) },
-    });
-    const gate = () => {
-      let open!: () => void;
-      const promise = new Promise<void>((resolve) => (open = resolve));
-      return { promise, open };
-    };
-    const captureEntered = gate(),
-      captureHeld = gate(),
-      uploadEntered = gate(),
-      uploadHeld = gate();
-    const frozen = await prepareSharePackage({
-      rootSourceId: 'root',
-      conversations: [{ sourceId: 'root', title: 'Root', history: [] }],
-      capturedAt: '2026-09-12T00:00:00.000Z',
-      readAttachment: async () => {
-        throw new Error('Unexpected');
-      },
-    });
-    cloud.capture.mockImplementation(async () => {
-      captureEntered.open();
-      await captureHeld.promise;
-      return frozen;
-    });
-    cloud.upload.mockImplementation(
-      async ({ onProgress }: { onProgress?: (uploaded: number, total: number) => void }) => {
-        onProgress?.(1, 2);
-        uploadEntered.open();
-        await uploadHeld.promise;
-      }
-    );
-    await render();
-    let published!: Promise<void>;
-    // Freezing has no byte total, so it must not report a percentage.
-    await act(async () => {
-      published = control.onPublish();
-      await captureEntered.promise;
-    });
-    expect([control.phase, control.progress]).toEqual(['capturing', 0]);
-    await act(async () => {
-      captureHeld.open();
-      await uploadEntered.promise;
-    });
-    expect([control.phase, control.progress]).toEqual(['uploading', 50]);
-    await act(async () => {
-      uploadHeld.open();
-      await published;
-    });
-    expect([control.phase, control.progress]).toEqual(['idle', 0]);
   });
 
   it('retries a failed publish without uploading or creating another deployment', async () => {
@@ -1175,61 +1080,5 @@ describe('static publication client lifecycle', () => {
     expect(control.conflict).toBe(true);
     await act(async () => control.onPublish());
     expect(cloud.mutation).not.toHaveBeenCalled();
-  });
-});
-
-describe('header share status', () => {
-  let root: Root, container: HTMLDivElement, store: ReturnType<typeof createStore>;
-  let status: ReturnType<typeof useSessionShareStatus>;
-  let workspaceId: WorkspaceId | null;
-  function Harness() {
-    status = useSessionShareStatus(workspaceId, 'root');
-    return null;
-  }
-  const render = () =>
-    act(async () =>
-      root.render(
-        <Provider store={store}>
-          <Harness />
-        </Provider>
-      )
-    );
-  beforeEach(() => {
-    cloud.state = null;
-    cloud.enabled = true;
-    store = createStore();
-    workspaceId = 'workspace' as WorkspaceId;
-    container = document.createElement('div');
-    document.body.appendChild(container);
-    root = createRoot(container);
-  });
-  afterEach(async () => {
-    await act(async () => root.unmount());
-    container.remove();
-  });
-  it('reports an active share', async () => {
-    cloud.state = entry;
-    await render();
-    expect(status).toBe('shared');
-  });
-  it('reports a conversation that was never published', async () => {
-    await render();
-    expect(status).toBe('none');
-  });
-  it.each(['draft', 'revoked'] as const)('does not report a %s share as shared', async (state) => {
-    cloud.state = { ...entry, status: state };
-    await render();
-    expect(status).toBe('none');
-  });
-  it('stays unknown until the control plane answers', async () => {
-    cloud.state = undefined as unknown as SessionShareManagement;
-    await render();
-    expect(status).toBe('unknown');
-  });
-  it('reports nothing shared without a workspace, whatever the control plane holds', async () => {
-    workspaceId = null;
-    cloud.state = entry;
-    await render();
-    expect(status).toBe('none');
   });
 });

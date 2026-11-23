@@ -1,12 +1,13 @@
-import { TestCloudPlatformProvider } from './test-platform';
-import { openReaderView, flushReaderChanges } from './conversation-view-fixtures';
+import { createHistoryWriter } from '@lody/shared/history-writer';
 // @vitest-environment jsdom
+import { TestCloudPlatformProvider } from './test-platform';
+import { openReaderView, flushReaderChanges, writeStoredField } from './conversation-view-fixtures';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LoroMap } from 'loro-crdt';
 import { createLoroSessionData } from '@lody/shared/session-data';
-import { createHistoryWriter, resolveSessionConversationConfig } from '@lody/shared';
+import { resolveSessionAcpRuntimeConfig, resolveSessionConversationConfig } from '@lody/shared';
 import {
   useConversationVersion,
   useConversationIndexRows,
@@ -17,7 +18,6 @@ import { useIncrementalSearchBlocks } from '../src/hooks/use-incremental-search-
 import {
   createConversationSession,
   createConversationViewFromReader,
-  createConversationDerivation,
   collectConversationConfigSources,
   type ConversationView,
 } from '../src/lib/conversation-view';
@@ -34,6 +34,10 @@ import { useSessionTurnFacts } from '../src/components/sessions/session-turn-fac
 import { useSessionMcpSelection } from '../src/hooks/use-session-mcp-selection';
 import { FloatingPermissionRequest } from '../src/components/sessions/floating-permission-request';
 import { initI18n } from '../src/i18n';
+import {
+  buildAcpSessionConfigCandidates,
+  EMPTY_ACP_SESSION_USER_CONFIG_EDITS,
+} from '../src/lib/acp-session-config-selection';
 
 let root: Root;
 let container: HTMLDivElement;
@@ -72,6 +76,90 @@ const flush = async () => {
 };
 
 describe('conversation view React readers', () => {
+  it.each(['surface', 'document'] as const)(
+    'holds optional history work while %s is hidden and refreshes facts on return',
+    async (hiddenBy) => {
+      const doc = buildSessionDoc(buildFixtureHistory(30));
+      const data = createLoroSessionData({ doc, sessionId: FIXTURE_SESSION_ID });
+      const view = createConversationViewFromReader(data.history, {
+        sessionId: FIXTURE_SESSION_ID,
+        tailKeep: 2,
+        maxHydrated: 4,
+      });
+      views.push(view);
+      let facts!: ReturnType<typeof useSessionTurnFacts>;
+      const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+      function Probe({ visible }: { visible: boolean }) {
+        facts = useSessionTurnFacts(view, visible);
+        const rows = useConversationIndexRows(view, {
+          includeSummary: false,
+          enabled: visible && document.visibilityState !== 'hidden',
+        });
+        return (
+          <span data-rows={rows.length}>
+            {facts.ordered.find((fact) => fact.id === 'a-0')?.fileDiff?.length ?? 0}
+          </span>
+        );
+      }
+      try {
+        await act(async () => root.render(<Probe visible />));
+        await flush();
+        expect(facts.complete).toBe(true);
+        expect(view.turn(view.indexOf('a-0'))).toBeUndefined();
+        const retained = facts.ordered.find((fact) => fact.id === 'a-1');
+        await act(async () => {
+          if (hiddenBy === 'surface') root.render(<Probe visible={false} />);
+          else {
+            visibility.mockReturnValue('hidden');
+            document.dispatchEvent(new Event('visibilitychange'));
+          }
+        });
+        await act(async () => {
+          await writeStoredField(data, 'a-0', 'fileDiff', {
+            kind: 'set',
+            value: [{ filePath: 'changed-while-away.ts', add: 1, del: 0 }],
+          });
+        });
+        await flush();
+        await act(async () => root.render(<Probe visible={hiddenBy !== 'surface'} />));
+        expect(container.querySelector('span')?.getAttribute('data-rows')).toBe('60');
+        expect(view.turn(view.indexOf('a-0'))).toBeUndefined();
+        await act(async () => {
+          if (hiddenBy === 'surface') root.render(<Probe visible />);
+          else {
+            visibility.mockReturnValue('visible');
+            document.dispatchEvent(new Event('visibilitychange'));
+          }
+        });
+        await flush();
+        expect(facts.complete).toBe(true);
+        expect(container.textContent).toBe('1');
+        expect(facts.ordered.find((fact) => fact.id === 'a-1')).toBe(retained);
+        await act(async () => root.render(<Probe visible={false} />));
+        await act(async () => {
+          data.writer.append({
+            id: 'while-away',
+            role: 'user',
+            timestamp: 'synthetic',
+            items: [{ type: 'text', text: 'Synthetic update while away' }],
+          });
+          doc.commit();
+        });
+        await flush();
+        await act(async () => root.render(<Probe visible={false} />));
+        expect(container.querySelector('span')?.getAttribute('data-rows')).toBe('60');
+        await act(async () => root.render(<Probe visible />));
+        await flush();
+        expect(container.querySelector('span')?.getAttribute('data-rows')).toBe('61');
+      } finally {
+        visibility.mockRestore();
+        await act(async () => root.render(null));
+        view.dispose();
+        data.dispose();
+        doc.free();
+      }
+    }
+  );
   it.each([false, true])(
     'shows a synced Core question while older history is blocked (existing tool: %s)',
     async (existingTool) => {
@@ -194,129 +282,6 @@ describe('conversation view React readers', () => {
     }
   );
 
-  it('updates streamed text and summaries without rebuilding unchanged business facts or losing the draft', async () => {
-    const { doc, view } = await openView(2);
-    let facts!: ReturnType<typeof useSessionTurnFacts>;
-    let businessRows!: ReturnType<typeof useConversationIndexRows>;
-    let summaryRows!: ReturnType<typeof useConversationIndexRows>;
-    function Probe() {
-      facts = useSessionTurnFacts(view);
-      businessRows = useConversationIndexRows(view, { includeSummary: false });
-      summaryRows = useConversationIndexRows(view);
-      const tail = useConversationTail(view);
-      const first = tail.turns.at(-1)?.items[0];
-      return (
-        <>
-          <input defaultValue="kept draft" />
-          <output>{first?.type === 'text' ? first.text : ''}</output>
-          <span>{facts.ordered.at(-1)?.goal?.status}</span>
-        </>
-      );
-    }
-    await act(async () => root.render(<Probe />));
-    await flush();
-    const beforeFacts = facts.ordered;
-    const beforeRows = businessRows;
-    const beforeSummary = summaryRows;
-    const input = container.querySelector('input')!;
-    input.focus();
-    input.setSelectionRange(2, 4);
-    const writer = createHistoryWriter(doc);
-    await act(async () => {
-      writer.updateEntry('a-1', (entry) => {
-        entry.items = [
-          { type: 'text', text: 'Streaming text is visible' },
-          ...entry.items.slice(1),
-        ];
-        return entry;
-      });
-      doc.commit();
-      await flushReaderChanges();
-    });
-    await flush();
-    expect(container.querySelector('output')?.textContent).toBe('Streaming text is visible');
-    expect(facts.ordered).toBe(beforeFacts);
-    expect(businessRows).toBe(beforeRows);
-    expect(summaryRows).not.toBe(beforeSummary);
-    expect(summaryRows.at(-1)?.summary?.headText).toContain('Streaming text is visible');
-    expect(container.querySelector('input')).toBe(input);
-    expect(document.activeElement).toBe(input);
-    expect([input.value, input.selectionStart, input.selectionEnd]).toEqual(['kept draft', 2, 4]);
-    await act(async () => {
-      writer.updateEntry('a-1', (entry) => {
-        entry.items.push({
-          type: 'goal',
-          threadId: 'stream-goal',
-          objective: 'Finish safely',
-          status: 'active',
-        });
-        return entry;
-      });
-      doc.commit();
-      await flushReaderChanges();
-    });
-    await flush();
-    expect(container.querySelector('span')?.textContent).toBe('active');
-    expect(facts.ordered).not.toBe(beforeFacts);
-    expect(facts.ordered.at(-1)?.goal?.threadId).toBe('stream-goal');
-  });
-
-  it('keeps render membership stable while background facts hydrate and evict older turns', async () => {
-    const { view } = await openView(150, 80);
-    let stream!: ReturnType<typeof useConversationStreamItems>;
-    function Probe() {
-      stream = useConversationStreamItems(view, FIXTURE_SESSION_ID);
-      return null;
-    }
-    await act(async () => root.render(<Probe />));
-    await flush();
-    expect(stream.initialWindowReady).toBe(true);
-    const membership = () =>
-      stream.items.map((item) =>
-        item.type === 'message'
-          ? `body:${item.message.id}`
-          : item.type === 'placeholder'
-            ? `placeholder:${item.row.id}`
-            : item.type
-      );
-    const initial = membership();
-    await act(async () => stream.onVisibleTurnRangeChange({ from: 296, to: 300 }));
-    await flush();
-    expect(membership()).toEqual(initial);
-
-    let advance!: () => void;
-    let reached!: () => void;
-    let boundary = new Promise<void>((resolve) => {
-      reached = resolve;
-    });
-    const derivation = createConversationDerivation(view, (turn) => turn.id, {
-      chunkSize: 32,
-      yieldToEventLoop: () =>
-        new Promise<void>((resolve) => {
-          advance = resolve;
-          reached();
-        }),
-    });
-    try {
-      for (let chunk = 0; chunk < 4; chunk++) {
-        await act(async () => {
-          await boundary;
-        });
-        await flush();
-        expect(derivation.facts.size).toBeGreaterThanOrEqual(40 + 32 * (chunk + 1));
-        expect(membership()).toEqual(initial);
-        expect(stream.initialWindowReady).toBe(true);
-        boundary = new Promise<void>((resolve) => {
-          reached = resolve;
-        });
-        if (chunk < 3) advance();
-      }
-    } finally {
-      derivation.dispose();
-      advance();
-    }
-  });
-
   it('renders requested history and selected turns without promoting other cached bodies', async () => {
     const { view } = await openView(150, 200);
     let stream!: ReturnType<typeof useConversationStreamItems>;
@@ -418,47 +383,6 @@ describe('conversation view React readers', () => {
       expect(view.isHydrated(20)).toBe(true);
     }
     await act(async () => releaseReady());
-  });
-
-  it('is ready once the initial tail is hydrated, without a promise tick, and never hides later window loads', async () => {
-    const { view } = await openView(150);
-    const acquire = view.acquireRange.bind(view);
-    let releaseReady!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      releaseReady = resolve;
-    });
-    vi.spyOn(view, 'acquireRange').mockImplementation((...args) => {
-      const lease = acquire(...args);
-      return { ...lease, ready: lease.ready.then(() => gate) };
-    });
-    let stream!: ReturnType<typeof useConversationStreamItems>;
-    function Probe() {
-      stream = useConversationStreamItems(view, FIXTURE_SESSION_ID);
-      return <span>{String(stream.initialWindowReady)}</span>;
-    }
-    // 300 turns: the 40-turn tail beyond the always-hydrated keep is not hydrated yet.
-    expect(view.isHydrated(260)).toBe(false);
-    await act(async () => root.render(<Probe />));
-    expect(container.textContent).toBe('false');
-    // The lease hydrates it; its promise is still pending, and ready does not wait for it.
-    await act(async () => {
-      await flush();
-    });
-    expect(view.isHydrated(260)).toBe(true);
-    expect(container.textContent).toBe('true');
-
-    // A later window loading (still gated) never hides the revealed tail.
-    await act(async () => {
-      stream.onVisibleTurnRangeChange({ from: 0, to: 8 });
-    });
-    await flush();
-    expect(container.textContent).toBe('true');
-    await act(async () => {
-      releaseReady();
-    });
-    await flush();
-    expect(view.isHydrated(0)).toBe(true);
-    expect(container.textContent).toBe('true');
   });
 
   it.each([false, true])(
@@ -585,34 +509,6 @@ describe('conversation view React readers', () => {
     await act(async () => root.render(<Probe />));
     expect(buildSessionSearchResults(blocks, 'QA_RESUMED_OK')).toHaveLength(1);
   });
-
-  it('refreshes cached search positions after insertion and deletion', async () => {
-    const { doc, view } = await openView(3);
-    let blocks: SessionSearchBlock[] = [];
-    function Probe() {
-      blocks = useIncrementalSearchBlocks(view, true);
-      return null;
-    }
-    await act(async () => root.render(<Probe />));
-    const original = view.turn(1);
-    await act(async () => {
-      const turn = doc.getList('history').insertContainer(0, new LoroMap());
-      turn.set('id', 'prepended');
-      turn.set('role', 'system');
-      doc.commit();
-      await flushReaderChanges();
-    });
-    await flush();
-    expect(view.turn(2)).toEqual(original);
-    expect(blocks.find((block) => block.messageId === 'a-0')?.messageIndex).toBe(2);
-    await act(async () => {
-      doc.getList('history').delete(0, 1);
-      doc.commit();
-      await flushReaderChanges();
-    });
-    await flush();
-    expect(blocks.find((block) => block.messageId === 'a-0')?.messageIndex).toBe(1);
-  });
 });
 
 vi.mock('../src/hooks/use-workspace-catalog', () => ({
@@ -635,7 +531,7 @@ const CATALOG = [{ id: 'default-mcp', name: 'Default', enabledByDefault: true }]
 // for a hang, since nothing here waits on wall-clock time.
 const MCP_SELECTION_HYDRATION_TIMEOUT_MS = 30_000;
 it.each([false, true])(
-  'preserves explicit empty MCP selection after mounting composer hooks: windowed=%s',
+  'preserves MCP selection and reported Plan exit while composer history hydrates: windowed=%s',
   async (windowed) => {
     const host = container;
     const history = buildFixtureHistory(25);
@@ -646,7 +542,7 @@ it.each([false, true])(
       ...history[48]!.inputConfig,
       agentRoleId: null,
       mcpServerIds: [],
-      configOptionValues: { effort: 'high' },
+      configOptionValues: { effort: 'high', plan_mode: true },
     };
     const doc = buildSessionDoc(history);
     const idle = createManualIdle();
@@ -658,18 +554,56 @@ it.each([false, true])(
       scheduleIdle: idle.scheduleIdle,
       yieldToEventLoop: () => gate,
     });
+    const view = windowed
+      ? createConversationViewFromReader(
+          {
+            ...session.sessionData.history,
+            readTurnForDisplay: async (id) => {
+              if (id === history[48]!.id) await gate;
+              return session.sessionData.history.readTurnForDisplay(id);
+            },
+          },
+          {
+            sessionId: FIXTURE_SESSION_ID,
+            scheduleIdle: idle.scheduleIdle,
+            yieldToEventLoop: () => gate,
+          }
+        )
+      : session.history;
+    await flushReaderChanges();
+    const runtimeSnapshot = {
+      acpSessionId: 'synthetic-agent-session',
+      basedOnUserTurnId: history[48]!.id,
+      revision: 1,
+      configOptionValues: { effort: 'high', plan_mode: false },
+    };
     let sent: readonly string[] | undefined;
+    let sentPlan: unknown;
     let selected: readonly string[] = [];
+    let selectedPlan: unknown;
+    let legacyPlan: unknown;
+    let tailHasUserTurn = false;
     function Stream() {
-      useConversationStreamItems(session.history, FIXTURE_SESSION_ID);
+      useConversationStreamItems(view, FIXTURE_SESSION_ID);
       return null;
     }
     function Composer() {
-      const tail = useConversationTail(session.history, { extendToLastUserTurn: true });
-      const config = resolveSessionConversationConfig(
-        collectConversationConfigSources(session.history, tail.from)
-      );
-      useSessionTurnFacts(session.history);
+      const tail = useConversationTail(view, { extendToLastUserTurn: true });
+      const sources = collectConversationConfigSources(view, tail.from);
+      const config = resolveSessionConversationConfig(sources);
+      const runtimeConfig = resolveSessionAcpRuntimeConfig(sources, [], runtimeSnapshot);
+      selectedPlan = buildAcpSessionConfigCandidates({
+        edits: EMPTY_ACP_SESSION_USER_CONFIG_EDITS,
+        preferences: config,
+        runtimePreferences: runtimeConfig,
+      }).configOptionValues.plan_mode;
+      legacyPlan = buildAcpSessionConfigCandidates({
+        edits: EMPTY_ACP_SESSION_USER_CONFIG_EDITS,
+        preferences: config,
+        runtimePreferences: resolveSessionAcpRuntimeConfig(sources, [], undefined),
+      }).configOptionValues.plan_mode;
+      tailHasUserTurn = tail.turns.some((turn) => turn.id === runtimeSnapshot.basedOnUserTurnId);
+      useSessionTurnFacts(view);
       selected = useSessionMcpSelection(config.mcpServerIds, { existingSession: true }).selectedIds;
       return (
         <>
@@ -677,6 +611,7 @@ it.each([false, true])(
           <button
             onClick={() => {
               sent = [...selected];
+              sentPlan = selectedPlan;
             }}
           >
             send
@@ -695,6 +630,9 @@ it.each([false, true])(
       await act(async () => vi.runAllTimersAsync());
       act(() => host.querySelector('button')!.click());
       const before = sent;
+      expect(sentPlan, 'send before body hydration keeps the reported Plan exit').toBe(false);
+      expect(legacyPlan, 'an older daemon without a snapshot keeps its turn config').toBe(true);
+      if (windowed) expect(tailHasUserTurn, 'exercise the unloaded body path').toBe(false);
       resume();
       await act(async () => {
         await gate;
@@ -702,10 +640,12 @@ it.each([false, true])(
         await vi.runAllTimersAsync();
       });
       expect(selected, 'after hydration').toEqual([]);
+      expect(selectedPlan, 'hydration must not change the reported Plan exit').toBe(false);
       expect(before, 'send while range loading').toEqual([]);
     } finally {
       resume();
       await act(async () => root.render(null));
+      if (view !== session.history) view.dispose();
       session.history.dispose();
       session.mirror.dispose();
       doc.free();

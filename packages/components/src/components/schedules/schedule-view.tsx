@@ -1,4 +1,12 @@
-import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type ComponentPropsWithRef,
+  type Ref,
+} from 'react';
 import * as stylex from '@stylexjs/stylex';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle } from 'lucide-react';
@@ -21,6 +29,7 @@ import { PropertyRow, scheduleCardProps } from './schedule-property-row';
 import { FieldIssueMark } from './schedule-field-issue-mark';
 import type { ScheduleSaveIssue } from './schedule-save-blockers';
 import { ScheduleRecurrenceEditor } from './schedule-recurrence-editor';
+import type { ComposerInputElement } from '@/ui/mention/composer-input';
 
 const WIDE = '@media (min-width: 40rem)';
 const DARK =
@@ -74,9 +83,9 @@ const styles = stylex.create({
       },
     },
     transitionProperty:
-      'color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to',
-    transitionDuration: 'var(--tw-duration, var(--default-transition-duration))',
-    transitionTimingFunction: 'var(--tw-ease, var(--default-transition-timing-function))',
+      'color, background-color, border-color, outline-color, text-decoration-color, fill, stroke',
+    transitionDuration: 'var(--default-transition-duration)',
+    transitionTimingFunction: 'var(--default-transition-timing-function)',
   },
   titleRow: {
     display: 'flex',
@@ -104,8 +113,7 @@ const styles = stylex.create({
     },
     boxShadow: {
       default: null,
-      ':focus-visible':
-        'var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000), var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), 0 0 #0000',
+      ':focus-visible': 'none',
     },
   },
   separator: {
@@ -155,8 +163,7 @@ const styles = stylex.create({
     },
     boxShadow: {
       default: null,
-      ':focus-visible':
-        'var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000), var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), 0 0 #0000',
+      ':focus-visible': 'none',
     },
   },
   promptIssueSpace: { paddingRight: 'calc(var(--spacing) * 6)' },
@@ -276,6 +283,26 @@ export {
   type ScheduleRowContext,
 } from './schedule-list';
 
+export type SchedulePromptProps = Omit<
+  ComponentPropsWithRef<'textarea'>,
+  'value' | 'onChange' | 'ref'
+> & {
+  /** The plain textarea or the mention editor, whichever renders the prompt. */
+  ref?: Ref<ComposerInputElement>;
+  value: string;
+  onValueChange: (value: string) => void;
+};
+
+function PlainSchedulePrompt({ onValueChange, ref, ...props }: SchedulePromptProps) {
+  return (
+    <textarea
+      {...props}
+      ref={ref as Ref<HTMLTextAreaElement>}
+      onChange={(event) => onValueChange(event.target.value)}
+    />
+  );
+}
+
 export type ScheduleFormValue = {
   title: string;
   prompt: string;
@@ -316,6 +343,7 @@ export function ScheduleForm({
   agentBar,
   contextBar,
   contextNote,
+  renderPrompt,
   destination,
   issues = [],
   saving,
@@ -328,6 +356,8 @@ export function ScheduleForm({
   onSave,
 }: {
   initial: ScheduleFormValue;
+  /** Connected hosts supply the shared mention editor without coupling the view to catalogs. */
+  renderPrompt?: (props: SchedulePromptProps) => ReactNode;
   /** IANA zone of the machine that runs the schedule. */
   timeZone?: string;
   /** That machine's name, for "Next runs … (MacBook Pro time)". */
@@ -359,7 +389,7 @@ export function ScheduleForm({
   const [value, setValue] = useState(initial);
   const [attempted, setAttempted] = useState(revealIssues);
   const titleRef = useRef<HTMLInputElement>(null);
-  const promptRef = useRef<HTMLTextAreaElement>(null);
+  const promptRef = useRef<ComposerInputElement>(null);
   const [mode, setMode] = useState<TriggerMode>(
     initial.trigger.kind === 'manual' ? 'manual' : 'timed'
   );
@@ -441,27 +471,23 @@ export function ScheduleForm({
             </div>
             <div {...stylex.props(styles.separator)} />
             <div {...stylex.props(styles.promptWrap)}>
-              {/* A bare field inside the composer-style box, like the title
-                  input: the box is the edge, so this is not a styled Textarea. */}
-              <textarea
-                ref={promptRef}
-                required
-                rows={4}
-                aria-label={t('schedules.prompt', 'What should the Agent do?')}
-                aria-invalid={attempted && promptMissing ? true : undefined}
-                placeholder={t(
+              {(renderPrompt ?? ((props) => <PlainSchedulePrompt {...props} />))({
+                ref: promptRef,
+                required: true,
+                rows: 4,
+                'aria-label': t('schedules.prompt', 'What should the Agent do?'),
+                'aria-invalid': attempted && promptMissing ? true : undefined,
+                placeholder: t(
                   'schedules.promptPlaceholder',
                   'What should the agent do on every run? For example: review yesterday’s commits and summarise anything that looks risky.'
-                )}
-                // Grows with its text from 4 lines to half the window, then
-                // scrolls; no resize handle. `field-sizing` is CSS-only (Chromium).
-                {...stylex.props(
+                ),
+                ...stylex.props(
                   styles.prompt,
                   attempted && promptMissing && styles.promptIssueSpace
-                )}
-                value={value.prompt}
-                onChange={(event) => setValue({ ...value, prompt: event.target.value })}
-              />
+                ),
+                value: value.prompt,
+                onValueChange: (prompt) => setValue((current) => ({ ...current, prompt })),
+              })}
               {attempted && promptMissing ? (
                 // Floats in the corner so it never narrows the text.
                 <FieldIssueMark

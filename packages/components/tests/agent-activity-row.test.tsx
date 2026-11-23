@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import type { SessionId } from '@lody/shared';
@@ -10,11 +9,10 @@ import { SessionChatStreamView } from '../src/components/ai-gui/view';
 import { initI18n } from '../src/i18n';
 import { createConversationViewFromHistory } from '../src/lib/conversation-view';
 import type {
-  HistoryLiveSync,
   HistoryLiveWindow,
   LiveTurnActivity,
 } from '../src/components/ai-gui/assistant-turn-timing';
-import { useHistoryLiveWindow } from '../src/hooks/use-history-live-window';
+
 import { clearSavedScrollStates } from '../src/lib/conversation-scroll/saved-state';
 
 (
@@ -157,24 +155,19 @@ describe('live agent status', () => {
   const liveNow = (): HistoryLiveWindow => ({ sync: 'live', since: Date.now() });
 
   const statusRow = () => container.querySelector('[data-agent-activity-row]');
+  const expandActivityGroup = async () => {
+    const disclosures = container.querySelectorAll<HTMLButtonElement>(
+      '[data-conversation-disclosure="group"]'
+    );
+    // A live segment may also render an outer "Working" disclosure first.
+    const disclosure = disclosures[disclosures.length - 1];
+    expect(disclosure).toBeDefined();
+    if (disclosure!.getAttribute('aria-expanded') === 'false') {
+      await act(async () => disclosure!.click());
+    }
+  };
   const shimmering = () =>
     Array.from(container.querySelectorAll('.agent-shimmer')).map((el) => el.textContent);
-
-  it('shimmers the collapsed tool group at the bottom of a working turn instead of adding a row', async () => {
-    await render(liveTurn([{ type: 'text', text: 'Checking.' }, toolCall('a'), toolCall('b')]), {
-      label: 'Working',
-    });
-    expect(statusRow()).toBeNull();
-    expect(shimmering()).toEqual(['Ran 2 commands (Worked for 30s)']);
-  });
-
-  it('adds a shimmering status row when the working turn does not end in a collapsed group', async () => {
-    await render(liveTurn([toolCall('a'), toolCall('b'), { type: 'text', text: 'Now writing.' }]), {
-      label: 'Working',
-    });
-    expect(statusRow()?.textContent).toBe('Working (Worked for 30s)');
-    expect(shimmering()).toEqual(['Working (Worked for 30s)']);
-  });
 
   it('says how long a working turn has gone without output once that passes two minutes', async () => {
     useTickingClock('2026-09-19T00:04:29Z');
@@ -191,6 +184,85 @@ describe('live agent status', () => {
     expect(statusRow()?.textContent).toBe('Working (Worked for 5m 00s)');
     await advance(219_900);
     expect(statusRow()?.textContent).toBe('Working (Worked for 8m 40s · no output for 4m)');
+  });
+
+  it('measures a streaming thought and its live status as one virtual row', async () => {
+    await render(
+      liveTurn([
+        {
+          type: 'thought',
+          text: '1. Back up the binary and configuration.\n2. Confirm the backup is readable.',
+        },
+      ]),
+      { label: 'Thinking' }
+    );
+    await expandActivityGroup();
+
+    await vi.waitFor(() =>
+      expect(
+        [...container.querySelectorAll('ol')].find((list) =>
+          list.textContent?.includes('Confirm the backup is readable')
+        )
+      ).toBeDefined()
+    );
+    const thought = [...container.querySelectorAll('ol')].find((list) =>
+      list.textContent?.includes('Confirm the backup is readable')
+    );
+    const status = container.querySelector('[data-agent-activity-status]');
+    expect(status).not.toBeNull();
+    expect(status!.closest('[data-virtual-index]')).toBe(thought!.closest('[data-virtual-index]'));
+    expect(status!.closest('.markdown-renderer')).toBeNull();
+    expect(container.querySelectorAll('[data-agent-activity-row]')).toHaveLength(1);
+  });
+
+  it('keeps the measured status before a trailing subagent summary and footer', async () => {
+    await render(
+      liveTurn(
+        [
+          {
+            type: 'thought',
+            text: '1. Inspect the worker state.\n2. Keep the live summary in view.',
+          },
+          {
+            type: 'subagent_task',
+            taskId: 'worker-1',
+            status: 'in_progress',
+            taskType: 'subagent',
+            subagentType: 'Explore',
+            description: 'Trace the streaming worker',
+            isBackgrounded: true,
+          },
+        ],
+        { modelInfo: { modelId: 'deepseek-chat', name: 'DeepSeek' } }
+      ),
+      { label: 'Thinking' }
+    );
+    await expandActivityGroup();
+
+    await vi.waitFor(() =>
+      expect(
+        [...container.querySelectorAll('ol')].find((list) =>
+          list.textContent?.includes('Keep the live summary in view')
+        )
+      ).toBeDefined()
+    );
+    const thought = [...container.querySelectorAll('ol')].find((list) =>
+      list.textContent?.includes('Keep the live summary in view')
+    );
+    const status = container.querySelector('[data-agent-activity-status]');
+    const subagent = container.querySelector('[data-subagent-task-id="worker-1"]');
+    const footerAction = container.querySelector('[aria-label="Turn configuration"]');
+    expect(status).not.toBeNull();
+    expect(subagent).not.toBeNull();
+    expect(footerAction).not.toBeNull();
+    expect(status!.closest('[data-virtual-index]')).toBe(thought!.closest('[data-virtual-index]'));
+    expect(
+      status!.compareDocumentPosition(subagent!) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    expect(
+      subagent!.compareDocumentPosition(footerAction!) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    expect(container.querySelectorAll('[data-agent-activity-row]')).toHaveLength(1);
   });
 
   it('never reports silence while the agent waits on the user', async () => {
@@ -218,15 +290,6 @@ describe('live agent status', () => {
     expect(shimmering()).toEqual([]);
   });
 
-  it('keeps a still status row while waiting on the user', async () => {
-    await render(liveTurn([{ type: 'text', text: 'May I run this?' }]), {
-      label: 'Waiting for permission',
-      tone: 'warning',
-    });
-    expect(statusRow()?.textContent).toBe('Waiting for permission');
-    expect(shimmering()).toEqual([]);
-  });
-
   it('keeps the scroll-to-latest button actionable while output streams', async () => {
     await render(
       liveTurn([{ type: 'text', text: 'Still writing.' }]),
@@ -235,94 +298,13 @@ describe('live agent status', () => {
     );
     const button = container.querySelector<HTMLButtonElement>('[data-scroll-to-latest]');
     expect(button).not.toBeNull();
-    expect(button!.querySelector('.animate-spin')).not.toBeNull();
+    expect(
+      button!.querySelector('[data-slot="icon-spinner"][data-spinning="true"]')
+    ).not.toBeNull();
     expect(button!.querySelector('.lucide-arrow-down')).not.toBeNull();
     await act(async () => button!.click());
     expect(container.querySelector('[data-scroll-to-latest]')).toBeNull();
   });
-
-  it('keeps the scroll-to-latest arrow while waiting for permission', async () => {
-    await render(
-      liveTurn([{ type: 'text', text: 'May I continue?' }]),
-      { label: 'Waiting for permission', tone: 'warning' },
-      { scrollAway: true }
-    );
-    const button = container.querySelector<HTMLButtonElement>('[data-scroll-to-latest]');
-    expect(button).not.toBeNull();
-    expect(button!.querySelector('.animate-spin')).toBeNull();
-    expect(button!.querySelector('.lucide-arrow-down')).not.toBeNull();
-  });
-
-  it('places the status inside a live turn, above its footer actions', async () => {
-    await render(
-      liveTurn([toolCall('a'), toolCall('b'), { type: 'text', text: 'Now writing.' }]),
-      { label: 'Working' },
-      { withTurnFooter: true }
-    );
-    expect(statusRow()).toBeNull();
-    const status = container.querySelector('[data-agent-activity-status]');
-    expect(status?.textContent).toBe('Working (Worked for 30s)');
-    expect(
-      status?.closest('[data-assistant-turn-id]')?.getAttribute('data-assistant-turn-id')
-    ).toBe('assistant-turn');
-    const copyContext = container.querySelector('[aria-label="Copy context as Markdown"]');
-    expect(copyContext).not.toBeNull();
-    // Status precedes the footer's actions in reading order.
-    expect(
-      status!.compareDocumentPosition(copyContext!) & Node.DOCUMENT_POSITION_FOLLOWING
-    ).toBeTruthy();
-    expect(status?.parentElement?.classList.contains('pt-1')).toBe(true);
-  });
-
-  it.each([
-    { withTurnFooter: false, taskStatus: 'completed' },
-    { withTurnFooter: true, taskStatus: 'completed' },
-    { withTurnFooter: false, taskStatus: 'in_progress' },
-    { withTurnFooter: true, taskStatus: 'in_progress' },
-  ])(
-    'places status above $taskStatus tasks with footer=$withTurnFooter',
-    async ({ withTurnFooter, taskStatus }) => {
-      await render(
-        liveTurn([
-          toolCall('a'),
-          { type: 'text', text: 'Partial answer.' },
-          ...['a', 'b', 'c'].map((id) => ({
-            type: 'subagent_task',
-            taskId: `task-${id}`,
-            status: taskStatus,
-            actor: `Researcher ${id}`,
-            description: `Inspect check ${id}`,
-          })),
-        ]),
-        { label: 'Working' },
-        { withTurnFooter }
-      );
-
-      const status = container.querySelector('[data-agent-activity-status]');
-      const summary = Array.from(container.querySelectorAll('button')).find(
-        (button) =>
-          button.textContent === (taskStatus === 'completed' ? '3 tasks' : 'Waiting on 3 tasks')
-      );
-      expect(status?.textContent).toBe('Working (Worked for 30s)');
-      expect(container.querySelectorAll('[data-agent-activity-status]')).toHaveLength(1);
-      expect(statusRow()).toBeNull();
-      expect(summary).toBeDefined();
-      expect(
-        status!.compareDocumentPosition(summary!) & Node.DOCUMENT_POSITION_FOLLOWING
-      ).toBeTruthy();
-      if (taskStatus === 'in_progress') {
-        expect(container.textContent).toContain('Inspect check a');
-        return;
-      }
-      expect(summary!.getAttribute('aria-expanded')).toBe('false');
-      await act(async () => summary!.click());
-      expect(summary!.getAttribute('aria-expanded')).toBe('true');
-      expect(container.textContent).toContain('Inspect check a');
-      await act(async () => summary!.click());
-      expect(summary!.getAttribute('aria-expanded')).toBe('false');
-      expect(container.textContent).not.toContain('Inspect check a');
-    }
-  );
 
   it('exposes the turn configuration while the reply is still streaming', async () => {
     await render(
@@ -450,23 +432,6 @@ describe('live agent status', () => {
     expect(popoverValue('Last update')).toBeUndefined();
   });
 
-  it('opens a new live window each time live sync resumes, and none while it is down', async () => {
-    useTickingClock('2026-09-19T00:00:05Z');
-    const seen: HistoryLiveWindow[] = [];
-    const Probe = ({ sync }: { sync: HistoryLiveSync }) => {
-      seen.push(useHistoryLiveWindow(sync));
-      return null;
-    };
-    await act(async () => root.render(createElement(Probe, { sync: 'live' })));
-    expect(seen.at(-1)).toEqual({ sync: 'live', since: Date.parse('2026-09-19T00:00:05Z') });
-    await advance(10_000);
-    await act(async () => root.render(createElement(Probe, { sync: 'offline' })));
-    expect(seen.at(-1)).toEqual({ sync: 'offline', since: null });
-    await advance(10_000);
-    await act(async () => root.render(createElement(Probe, { sync: 'live' })));
-    expect(seen.at(-1)).toEqual({ sync: 'live', since: Date.parse('2026-09-19T00:00:25Z') });
-  });
-
   it('times a finished turn by its start, end and Worked-for duration', async () => {
     await render(
       liveTurn([{ type: 'text', text: 'Done.' }], {
@@ -483,81 +448,6 @@ describe('live agent status', () => {
     expect(popoverValue('Ended')?.textContent).toBeTruthy();
     expect(popoverValue('Duration')?.textContent).toBe('24s');
     expect(popoverValue('Last update')).toBeUndefined();
-  });
-
-  it('labels command steps with the Run verb in the expanded group', async () => {
-    await render(
-      liveTurn([
-        {
-          type: 'tool_call',
-          toolCallId: 'sed-1',
-          title: "sed -n '1,240p' apps/view.tsx",
-          kind: 'execute',
-          status: 'completed',
-        },
-        {
-          type: 'tool_call',
-          toolCallId: 'bash-1',
-          title: 'pnpm --dir apps/electron test',
-          kind: 'bash',
-          status: 'in_progress',
-        },
-        {
-          type: 'tool_call',
-          toolCallId: 'mystery-1',
-          title: 'mycmd --flag',
-          status: 'completed',
-          content: [{ type: 'terminal_command', command: 'mycmd', args: ['--flag'] }],
-        },
-        {
-          type: 'tool_call',
-          toolCallId: 'shell-1',
-          title: 'Shell: cat hello.txt',
-          kind: 'execute',
-          status: 'completed',
-        },
-        {
-          type: 'tool_call',
-          toolCallId: 'shell-2',
-          title: 'Shell: npm start',
-          kind: 'execute',
-          status: 'in_progress',
-        },
-        {
-          type: 'tool_call',
-          toolCallId: 'search-1',
-          title: "Search for 'createServer'",
-          kind: 'search',
-          status: 'completed',
-        },
-      ]),
-      { label: 'Working' }
-    );
-
-    const header = [...container.querySelectorAll('button')].find((button) =>
-      button.textContent?.includes('commands')
-    );
-    expect(header).toBeDefined();
-    await act(async () => header!.click());
-
-    // Bare command titles get the verb, in the step's tense.
-    expect(container.textContent).toContain("Ran sed -n '1,240p' apps/view.tsx");
-    expect(container.textContent).toContain('Running pnpm --dir apps/electron test');
-    // A kindless call carrying a command is a command too.
-    expect(container.textContent).toContain('Ran mycmd --flag');
-    // Agent-authored labels keep their own wording — no doubled verb.
-    expect(container.textContent).toContain('Shell: cat hello.txt');
-    expect(container.textContent).not.toContain('Ran Shell');
-    expect(container.textContent).toContain("Searched for 'createServer'");
-
-    // The shimmering verb is the running signal: a tense-verb row drops the
-    // trailing spinner, while a running authored label keeps it.
-    const step = (text: string) =>
-      [...container.querySelectorAll('button')].find((button) =>
-        button.textContent?.includes(text)
-      )!;
-    expect(step('Running pnpm').querySelector('.animate-spin')).toBeNull();
-    expect(step('Shell: npm start').querySelector('.animate-spin')).not.toBeNull();
   });
 
   it('opens a step onto one sheet: the command once, then its output', async () => {

@@ -1,3 +1,4 @@
+import type { PushRegistration } from './push-notifications';
 import {
   defineCloudAction,
   defineCloudMutation,
@@ -56,6 +57,8 @@ export type WorkspaceJoinLinkPreview =
     };
 
 export interface WorkspaceJoinOwnerState {
+  /** Optional roster change marker; older servers omit it. Not a permission grant. */
+  membershipVersion?: string;
   activeLink: null | { id: string; token: string; expiresAt: number };
   pendingRequests: Array<{
     id: string;
@@ -90,8 +93,17 @@ export interface SharingReviewReconcileResult extends SharingReviewState {
 }
 
 function capabilityForOperation(name: string): PlatformCapability {
-  if (name.startsWith('e2eeWorkspaces:') || name.startsWith('e2eeMembers:'))
+  if (
+    name.startsWith('e2eeWorkspaces:') ||
+    name.startsWith('e2eeMembers:') ||
+    // Personal device pairing relays: account-scoped, never on local composition.
+    name.startsWith('e2eeAccountPairing:') ||
+    name.startsWith('e2eeAutomaticPairing:') ||
+    name.startsWith('e2eeJoinMailbox:')
+  )
     return 'multiWorkspace';
+  if (name.startsWith('workspaceMembers:')) return 'teamSharing';
+  if (name.startsWith('e2eeMachineSharing:')) return 'teamSharing';
   if (name.startsWith('promptShortcuts:')) return 'cloudAccount';
   if (name.startsWith('billing:') || name.startsWith('referrals:')) return 'billing';
   if (name.startsWith('usage:')) return 'usageAnalytics';
@@ -103,6 +115,8 @@ function capabilityForOperation(name: string): PlatformCapability {
   if (name.startsWith('machineCredentials:') || name.startsWith('machinePairing:')) {
     return 'remoteMachines';
   }
+  if (name === 'machines:listSessionAccess' || name === 'machines:setSessionReadSharedWithTeam')
+    return 'teamSharing';
   if (name === 'machines:setMachineSharedWithTeam') return 'teamSharing';
   if (name.startsWith('machines:')) return 'remoteMachines';
   if (name.startsWith('localProjects:') || name.startsWith('sessionSharing:')) return 'teamSharing';
@@ -139,6 +153,29 @@ const action = <Reference extends FunctionReference<'action'>>(
  * public cloud client contract, never from generated server API declarations.
  */
 export const cloudOperations = {
+  e2eeMachineSharing: {
+    listVersions: query<ConvexApi['e2eeMachineSharing']['listVersions']>(
+      'e2eeMachineSharing:listVersions'
+    ),
+  },
+  /** Account-wide pairing relay for portable hosts. Opaque bytes; hosts verify every tag. */
+  e2eeAccountPairing: {
+    submit: mutation<ConvexApi['e2eeAccountPairing']['submit']>('e2eeAccountPairing:submit'),
+    pending: query<ConvexApi['e2eeAccountPairing']['pending']>('e2eeAccountPairing:pending'),
+    read: query<ConvexApi['e2eeAccountPairing']['read']>('e2eeAccountPairing:read'),
+    decline: mutation<ConvexApi['e2eeAccountPairing']['decline']>('e2eeAccountPairing:decline'),
+    publish: mutation<ConvexApi['e2eeAccountPairing']['publish']>('e2eeAccountPairing:publish'),
+    claim: query<ConvexApi['e2eeAccountPairing']['claim']>('e2eeAccountPairing:claim'),
+  },
+  /** Per-workspace personal join mailbox, for a portable `PersonalHostRemote`. */
+  e2eeJoinMailbox: {
+    begin: mutation<ConvexApi['e2eeJoinMailbox']['begin']>('e2eeJoinMailbox:begin'),
+    status: query<ConvexApi['e2eeJoinMailbox']['status']>('e2eeJoinMailbox:status'),
+    readRequest: query<ConvexApi['e2eeJoinMailbox']['readRequest']>('e2eeJoinMailbox:readRequest'),
+    cancel: mutation<ConvexApi['e2eeJoinMailbox']['cancel']>('e2eeJoinMailbox:cancel'),
+    publish: mutation<ConvexApi['e2eeJoinMailbox']['publish']>('e2eeJoinMailbox:publish'),
+    claim: query<ConvexApi['e2eeJoinMailbox']['claim']>('e2eeJoinMailbox:claim'),
+  },
   e2eeMembers: {
     workspaces: query<ConvexApi['e2eeMembers']['workspaces']>('e2eeMembers:workspaces'),
     preview: definePublicCloudQuery<
@@ -146,15 +183,32 @@ export const cloudOperations = {
       import('@lody/cloud-api').E2eeMemberReplies['preview']
     >('teamSharing', 'e2eeMembers:preview'),
   },
+  e2eeAutomaticPairing: {
+    pending: query<ConvexApi['e2eeAutomaticPairing']['pending']>('e2eeAutomaticPairing:pending'),
+    read: query<ConvexApi['e2eeAutomaticPairing']['read']>('e2eeAutomaticPairing:read'),
+    exchange: mutation<ConvexApi['e2eeAutomaticPairing']['exchange']>(
+      'e2eeAutomaticPairing:exchange'
+    ),
+  },
   e2eeWorkspaces: {
+    reportDeviceProfile: mutation<ConvexApi['e2eeWorkspaces']['reportDeviceProfile']>(
+      'e2eeWorkspaces:reportDeviceProfile'
+    ),
+    ledgerHead: query<ConvexApi['e2eeWorkspaces']['ledgerHead']>('e2eeWorkspaces:ledgerHead'),
     memberProfiles: query<ConvexApi['e2eeWorkspaces']['memberProfiles']>(
       'e2eeWorkspaces:memberProfiles'
     ),
     create: action<ConvexApi['e2eeWorkspaces']['create']>('e2eeWorkspaces:create'),
+    deleteWorkspace: action<ConvexApi['e2eeWorkspaces']['deleteWorkspace']>(
+      'e2eeWorkspaces:deleteWorkspace'
+    ),
     describe: query<ConvexApi['e2eeWorkspaces']['describe']>('e2eeWorkspaces:describe'),
     history: action<ConvexApi['e2eeWorkspaces']['history']>('e2eeWorkspaces:history'),
   },
   promptShortcuts: {
+    getStreamTokenV2: action<ConvexApi['promptShortcuts']['getStreamTokenV2']>(
+      'promptShortcuts:getStreamTokenV2'
+    ),
     stageDocument: mutation<ConvexApi['promptShortcuts']['stageDocument']>(
       'promptShortcuts:stageDocument'
     ),
@@ -199,6 +253,7 @@ export const cloudOperations = {
       ConvexApi['activity']['recordMyWorkspaceDailyActiveUser']
     >('activity:recordMyWorkspaceDailyActiveUser'),
   },
+  workspaceMembers: { list: query<ConvexApi['workspaceMembers']['list']>('workspaceMembers:list') },
   auth: {
     transferWorkspaceOwnership: mutation<ConvexApi['auth']['transferWorkspaceOwnership']>(
       'auth:transferWorkspaceOwnership'
@@ -216,6 +271,24 @@ export const cloudOperations = {
     ),
     isWorkspaceSlugAvailable: query<ConvexApi['auth']['isWorkspaceSlugAvailable']>(
       'auth:isWorkspaceSlugAvailable'
+    ),
+  },
+  pushSubscriptions: {
+    configuration: defineCloudQuery<Record<string, never>, { selfHostedEnabled: boolean }>(
+      'cloudAccount',
+      'pushSubscriptions:configuration'
+    ),
+    register: defineCloudMutation<PushRegistration, null>(
+      'cloudAccount',
+      'pushSubscriptions:register'
+    ),
+    unregister: defineCloudMutation<{ installationId: string }, null>(
+      'cloudAccount',
+      'pushSubscriptions:unregister'
+    ),
+    sendTest: defineCloudMutation<Record<string, never>, { subscriptions: number }>(
+      'cloudAccount',
+      'pushSubscriptions:sendTest'
     ),
   },
   inbox: {
@@ -319,6 +392,9 @@ export const cloudOperations = {
     setSubscriptionCancelAtPeriodEnd: action<
       ConvexApi['billing']['setSubscriptionCancelAtPeriodEnd']
     >('billing:setSubscriptionCancelAtPeriodEnd'),
+    getSubscriptionPaymentStatus: action<ConvexApi['billing']['getSubscriptionPaymentStatus']>(
+      'billing:getSubscriptionPaymentStatus'
+    ),
     setSubscriptionInterval: action<ConvexApi['billing']['setSubscriptionInterval']>(
       'billing:setSubscriptionInterval'
     ),
@@ -395,6 +471,12 @@ export const cloudOperations = {
     ),
   },
   machines: {
+    listSessionAccess: query<ConvexApi['machines']['listSessionAccess']>(
+      'machines:listSessionAccess'
+    ),
+    setSessionReadSharedWithTeam: mutation<ConvexApi['machines']['setSessionReadSharedWithTeam']>(
+      'machines:setSessionReadSharedWithTeam'
+    ),
     listVisibleMachines: query<ConvexApi['machines']['listVisibleMachines']>(
       'machines:listVisibleMachines'
     ),

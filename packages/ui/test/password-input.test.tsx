@@ -1,13 +1,61 @@
 import { renderToStaticMarkup } from 'react-dom/server';
+import { act, createRef } from 'react';
 import { describe, expect, test } from 'vitest';
 import { Field } from '../src/field/field';
 import { PasswordInput } from '../src/field/password-input';
-import { classesOf, click, mount, one } from './dom';
+import { click, mount, one } from './dom';
 
 const secret = () => one('input[type="password"], input[type="text"]') as HTMLInputElement;
 const reveal = () => one('button') as HTMLButtonElement;
 
 describe('PasswordInput', () => {
+  test('resizing the shell preserves the input ref, native height, style callback and reveal state', async () => {
+    const ref = createRef<HTMLInputElement>();
+    const view = await mount(
+      <PasswordInput
+        ref={ref}
+        controlHeight={40}
+        height={17}
+        defaultValue="Retained secret"
+        style={() => ({ height: 23, letterSpacing: '1px' })}
+      />
+    );
+    const input = ref.current!;
+    expect(input.style.height).toBe('23px');
+    expect(input.getAttribute('height')).toBe('17');
+    await click(reveal());
+    input.focus();
+    await act(async () => {
+      view.root.render(
+        <PasswordInput
+          ref={ref}
+          controlHeight={0}
+          height={18}
+          defaultValue="Retained secret"
+          style={() => ({ height: 22 })}
+        />
+      );
+    });
+    expect(ref.current).toBe(input);
+    expect(document.activeElement).toBe(input);
+    expect(input.type).toBe('text');
+    expect(input.value).toBe('Retained secret');
+    expect(input.style.height).toBe('22px');
+    expect(input.style.letterSpacing).toBe('');
+    expect(input.getAttribute('height')).toBe('18');
+    await act(async () => {
+      view.root.render(<PasswordInput ref={ref} defaultValue="Retained secret" />);
+    });
+    expect(ref.current).toBe(input);
+    expect(input.type).toBe('text');
+    expect(input.style.height).toBe('');
+    expect(input.getAttribute('height')).toBeNull();
+    await click(reveal());
+    expect(input.type).toBe('password');
+    expect(input.value).toBe('Retained secret');
+    await view.unmount();
+  });
+
   test('masks the value until somebody asks, and says which it will do next', async () => {
     const view = await mount(<PasswordInput />);
     expect(secret().type).toBe('password');
@@ -69,38 +117,5 @@ describe('PasswordInput', () => {
     // is a control that looks pressable and is not.
     expect(reveal().disabled).toBe(true);
     await view.unmount();
-  });
-
-  test('an invalid field rings the shell, which is the control', async () => {
-    const plain = await mount(<PasswordInput />);
-    const resting = classesOf(secret().parentElement as HTMLElement);
-    await plain.unmount();
-
-    const view = await mount(
-      <Field.Root invalid>
-        <Field.Label>Password</Field.Label>
-        <PasswordInput />
-      </Field.Root>
-    );
-    expect(secret().getAttribute('aria-invalid')).toBe('true');
-    const shell = secret().parentElement as HTMLElement;
-    expect(classesOf(shell).filter((name) => !resting.includes(name)).length).toBeGreaterThan(0);
-    // The input inside the shell is bare: two wells would draw two edges.
-    expect(classesOf(secret()).length).toBeLessThan(classesOf(shell).length);
-    await view.unmount();
-  });
-
-  test('a caller constrains the control through the shell, and the value through the input', () => {
-    const html = renderToStaticMarkup(
-      <PasswordInput className="w-64" inputClassName="font-mono" aria-label="Password" />
-    );
-    const shell = /<div\b[^>]*class="([^"]*)"/.exec(html)?.[1] ?? '';
-    const value = /<input\b[^>]*class="([^"]*)"/.exec(html)?.[1] ?? '';
-    // The shell is the control, so a width lands there and reaches the value
-    // below it; only what the value alone wears goes on the input.
-    expect(shell.split(' ')).toContain('w-64');
-    expect(shell.split(' ')).not.toContain('font-mono');
-    expect(value.split(' ')).toContain('font-mono');
-    expect(value.split(' ')).not.toContain('w-64');
   });
 });

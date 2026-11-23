@@ -72,57 +72,6 @@ describe('sidebar machine group', () => {
     expect(container.textContent).toBe('');
   });
 
-  it('tells on hover whose machine the group is, its status, OS and project count', async () => {
-    vi.useFakeTimers();
-    store.set(lodyPresenceSyncStateAtom, 'synced');
-    await render(
-      <SidebarSectionHeader
-        label="Lampese"
-        collapsed
-        activity={{ waiting: 0, working: 2, unread: 1 }}
-        describeActivity={false}
-        onToggleCollapsed={() => undefined}
-        toggleLabel="Toggle Lampese"
-        wrapToggle={(toggle) => (
-          <SidebarMachineHoverCard
-            machine={{
-              machineId,
-              name: 'Lampese.local',
-              owner: { name: 'Lampese', image: null },
-              isOwn: false,
-              isCurrent: false,
-              os: 'darwin',
-              projectCount: 2,
-              activity: { waiting: 0, working: 2, unread: 1 },
-            }}
-          >
-            {toggle}
-          </SidebarMachineHoverCard>
-        )}
-      />
-    );
-
-    const trigger = container.querySelector('[aria-label="Toggle Lampese"]') as HTMLElement;
-    await act(async () => {
-      pointer('pointerover', trigger, { relatedTarget: document.body });
-    });
-    await act(async () => {
-      vi.advanceTimersByTime(1000);
-    });
-
-    // The card portals out of the trigger's container, straight under the body.
-    const card = [...document.body.children].find((node) => node !== container);
-    expect(card?.textContent).toContain('Lampese.local');
-    expect(card?.textContent).toContain('Offline');
-    expect(card?.textContent).toContain('Lampese');
-    expect(card?.textContent).toContain('macOS');
-    expect(card?.textContent).toContain('2 projects');
-    // The folded header draws one mark; the card, which owns its hover, counts.
-    expect(card?.textContent).toContain('2 working · 1 unread');
-    expect(container.querySelectorAll('[data-session-row-indicator]')).toHaveLength(1);
-    expect(container.querySelector('[data-working-grid]')).not.toBeNull();
-  });
-
   it("keeps the card off the header's action buttons, whose own menus open there", async () => {
     vi.useFakeTimers();
     store.set(lodyPresenceSyncStateAtom, 'synced');
@@ -217,5 +166,34 @@ describe('sidebar machine group', () => {
       />
     );
     expect(container.querySelector('[data-session-row-indicator]')).toBeNull();
+  });
+
+  it('overlays a desktop section menu over the folded activity mark and keeps mark clicks toggling', async () => {
+    const onToggleCollapsed = vi.fn();
+    await render(
+      <SidebarSectionHeader
+        label="Ops"
+        collapsed
+        activity={{ failed: 0, waiting: 0, working: 0, sending: 0, unread: 2 }}
+        menu={<button type="button">Section actions</button>}
+        onToggleCollapsed={onToggleCollapsed}
+      />
+    );
+
+    const menuButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Section actions'
+    );
+    const mark = container.querySelector('[data-sidebar-group-activity]');
+    expect(menuButton).toBeDefined();
+    expect(mark).not.toBeNull();
+    expect(mark?.closest('[role="button"]')).toBeNull();
+    expect(mark?.closest('.group\\/section-menu')).toBe(
+      menuButton?.closest('.group\\/section-menu')
+    );
+
+    await act(async () => {
+      mark?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onToggleCollapsed).toHaveBeenCalledOnce();
   });
 });

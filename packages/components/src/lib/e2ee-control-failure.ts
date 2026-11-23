@@ -18,6 +18,9 @@ import {
 export type E2eeControlFailureKind =
   | 'approval-required'
   | 'local-identity'
+  | 'custody-locked'
+  | 'custody-indeterminate'
+  | 'custody-unavailable'
   | 'network'
   | 'auth'
   | 'server'
@@ -26,6 +29,18 @@ export type E2eeControlFailureKind =
   | 'identity-conflict'
   | 'progress-conflict'
   | 'local-corrupt';
+
+/** Content-free custody guidance shared by opening and pairing surfaces. */
+export const custodyFailureMessages = {
+  'custody-locked': 'e2ee.custody.locked.help',
+  'custody-indeterminate': 'e2ee.custody.indeterminate.help',
+  'custody-unavailable': 'e2ee.custody.unavailable.help',
+} as const;
+export function custodyFailureMessage(kind: E2eeControlFailureKind): string | undefined {
+  return kind in custodyFailureMessages
+    ? custodyFailureMessages[kind as keyof typeof custodyFailureMessages]
+    : undefined;
+}
 
 /** Project only the portable host's single typed failure, never a mixed cleanup cause. */
 export function personalHostFailureCode(error: unknown): string | undefined {
@@ -50,6 +65,8 @@ const identityConflicts = new Set([
 
 const stickyCorruption = new Set(['Invalid genesis pin', 'Invalid encrypted evidence']);
 
+/** Backend codes that mean "temporarily unavailable", never "records disagree". */
+const transientServerCodes = new Set(['e2ee_ledger_unavailable']);
 function serverCode(error: unknown): string | null {
   if (typeof error !== 'object' || error === null || !('data' in error)) return null;
   const data = (error as { data?: unknown }).data;
@@ -61,18 +78,65 @@ function serverCode(error: unknown): string | null {
     : null;
 }
 
-/** Classify a control-page failure. Unknown errors are treated as transport failures. */
+/** A portable host's typed failure says what failed; only `network` and `closed` are
+ * availability. Anything else shown as "offline" would hide a real error. */
+const portableKinds: Partial<Record<string, E2eeControlFailureKind>> = {
+  // Data handed to the host (normally a server reply) failed its strict validation.
+  'invalid-input': 'server',
+  corrupt: 'local-identity',
+  storage: 'local-identity',
+  'protection-unavailable': 'local-identity',
+  'restart-required': 'local-identity',
+  unsupported: 'upgrade',
+  unauthorized: 'auth',
+  'scope-mismatch': 'auth',
+  revoked: 'approval-required',
+};
+
+/** Classify a control-page failure. Unknown untyped errors are treated as transport
+ * failures; typed portable-host failures keep their own kind. */
 export function classifyE2eeControlFailure(error: unknown): E2eeControlFailure {
+  // Inspect only a direct typed custody failure. A mixed close/operation Cause
+  // retains its owner and cannot be flattened into a recoverable display hint.
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    '_tag' in error &&
+    error._tag === 'ClientCustodyError' &&
+    'reason' in error
+  ) {
+    const reason = error.reason;
+    if (reason === 'identity-lost') return { kind: 'approval-required', code: reason };
+    if (reason === 'corrupt') return { kind: 'custody-indeterminate', code: reason };
+    if (reason === 'locked' || reason === 'indeterminate' || reason === 'unavailable')
+      return { kind: `custody-${reason}`, code: reason };
+  }
   const portable = personalHostFailureCode(error);
+  if (portable === 'history-conflict') return { kind: 'progress-conflict', code: portable };
   if (portable === 'identity-lost' || portable === 'approval-required')
     return { kind: 'approval-required', code: portable };
+  const portableKind = portable === undefined ? undefined : portableKinds[portable];
+  if (portableKind)
+    return {
+      kind: portableKind,
+      code: portableKind === 'local-identity' ? `e2ee_${portable}` : portable!,
+    };
   const message = error instanceof Error ? error.message : '';
+  // Main erased only this device's identity; the member pairs a new device key.
+  if (/\be2ee_device_revoked$/.test(message))
+    return { kind: 'approval-required', code: 'device-revoked' };
+  // The desktop holds no identity binding for this workspace: it never joined (the
+  // workspace was created or joined on another device). Like a portable host's
+  // `approval-required`, the next step is approval from another device; there is
+  // no local original to restore or archive.
+  if (/\be2ee_missing-binding\b/.test(message))
+    return { kind: 'approval-required', code: 'missing-binding' };
   if (message.includes('e2ee_local-evidence-conflict'))
     return { kind: 'progress-conflict', code: 'local-evidence-conflict' };
   if (message.includes('e2ee_genesis_conflict') || message.includes('e2ee_conflict'))
     return { kind: 'identity-conflict', code: 'pin-mismatch' };
   const local =
-    /\be2ee_(permissions|identity-lost|corrupt|missing-binding|rewrap-failed|custody_unavailable|identity-busy|local-history-recovery-required|trusted-pin-unavailable|restart-required)\b/.exec(
+    /\be2ee_(permissions|identity-lost|corrupt|rewrap-failed|custody_unavailable|identity-busy|local-history-recovery-required|trusted-pin-unavailable|restart-required)\b/.exec(
       message
     );
   if (local) return { kind: 'local-identity', code: `e2ee_${local[1]}` };
@@ -107,9 +171,11 @@ export function classifyE2eeControlFailure(error: unknown): E2eeControlFailure {
     return { kind: 'mode', code: 'not-encrypted' };
   if (error instanceof Error && error.message === 'e2ee_workspace_mode_unavailable')
     return { kind: 'mode', code: error.message };
-  if (error instanceof Error && error.message.startsWith('e2ee_'))
-    return { kind: 'server', code: error.message };
-  const code = serverCode(error);
+  // The backend's ledger storage being briefly unreachable is an availability problem,
+  // not records that failed verification: it clears on its own and a refresh retries.
+  const code =
+    error instanceof Error && error.message.startsWith('e2ee_') ? error.message : serverCode(error);
+  if (code && transientServerCodes.has(code)) return { kind: 'network', code };
   if (code) return { kind: 'server', code };
   return { kind: 'network', code: error instanceof Error ? error.name : typeof error };
 }

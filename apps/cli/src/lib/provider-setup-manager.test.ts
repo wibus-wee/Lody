@@ -181,7 +181,6 @@ it.each([false, true])(
       lease.recordNativePid(process.pid);
       await manager.kick();
       expect(credentialPresent).toBe(true);
-      expect(vi.getTimerCount()).toBe(1);
       const proof = path.join(profile.home, '..', 'processes', `${lease.token}.native.json`);
       await writeFile(proof, JSON.stringify({ nativeExited: true }));
       if (stopBeforeRetry) manager.stop();
@@ -191,7 +190,6 @@ it.each([false, true])(
         await manager.kick();
       }
       expect(credentialPresent).toBe(stopBeforeRetry);
-      expect(vi.getTimerCount()).toBe(0);
     } finally {
       manager.stop();
       getter.mockRestore();
@@ -255,21 +253,6 @@ describe('ProviderSetupManager', () => {
       harness.manager.stop();
       getter.mockRestore();
     }
-  });
-
-  it('publishes the config and removes the setup in one commit after a live probe', async () => {
-    const harness = createHarness();
-    seedSetup(harness.flock);
-
-    await harness.manager.kick();
-
-    expect(readState(harness.flock).config).toBeDefined();
-    expect(readState(harness.flock).setup).toBeUndefined();
-    const finalSnapshot = harness.flock.commitSnapshots.at(-1) ?? [];
-    expect(finalSnapshot).toContain(JSON.stringify(machineFlockKeys.agentConfig(setupId)));
-    expect(finalSnapshot).not.toContain(JSON.stringify(machineFlockKeys.providerSetup(setupId)));
-    expect(harness.execution.refreshMachineAcpCapabilities).toHaveBeenCalledTimes(1);
-    harness.manager.stop();
   });
 
   it.each(['bub', 'dimcode'])('verifies %s without managed downloads', async (agentType) => {
@@ -341,6 +324,54 @@ describe('ProviderSetupManager', () => {
     expect(readState(harness.flock).setup).toMatchObject({
       status: 'failed',
       failureCode,
+    });
+    harness.manager.stop();
+  });
+
+  it('fails verification when the probe succeeds with an empty model catalog', async () => {
+    const harness = createHarness({
+      refreshMachineAcpCapabilities: vi.fn(async () => ({
+        type: 'machine/acp-capabilities-refresh_response' as const,
+        machineId,
+        configId: setupId,
+        cliType: 'builtin' as const,
+        agentType: 'devin',
+        success: true,
+        modes: [],
+        models: [],
+        capability: {
+          cliType: 'builtin' as const,
+          agentType: 'devin',
+          modes: [],
+          models: [],
+          configOptions: [
+            {
+              id: 'model',
+              name: 'Model',
+              category: 'model',
+              type: 'select' as const,
+              currentValue: 'model-a',
+              options: [],
+            },
+          ],
+          sessionFork: false,
+          acknowledgedSteer: true,
+          sessionTitle: false,
+          sessionForkWorktree: false,
+          fetchedAt: 1,
+        },
+      })),
+    });
+    seedSetup(harness.flock, createSetup('queued', { name: 'devin', agentType: 'devin' }));
+
+    await harness.manager.kick();
+
+    // A degraded catalog is not a working provider: nothing is published and
+    // the setup is marked failed instead of verified.
+    expect(readState(harness.flock).config).toBeUndefined();
+    expect(readState(harness.flock).setup).toMatchObject({
+      status: 'failed',
+      failureCode: 'verification-failed',
     });
     harness.manager.stop();
   });

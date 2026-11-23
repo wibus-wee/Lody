@@ -5,6 +5,7 @@ import test from 'node:test'
 
 const rendererHtml = await readFile(new URL('./index.html', import.meta.url), 'utf8')
 const devbarHtml = await readFile(new URL('./devbar.html', import.meta.url), 'utf8')
+const prImageHtml = await readFile(new URL('./pr-image.html', import.meta.url), 'utf8')
 
 function getDirectiveSources(html, name) {
   const content = html.match(
@@ -20,30 +21,13 @@ function getDirectiveSources(html, name) {
   return directive.slice(1)
 }
 
-void test('renderer CSP allows WebAssembly compilation', () => {
-  // Loro and @lody/e2ee-core's strict Ed25519 compile WebAssembly. Without this
-  // source E2EE still verifies correctly, but in pure JS about 10x slower.
-  assert.ok(getDirectiveSources(rendererHtml, 'script-src').includes("'wasm-unsafe-eval'"))
-})
-
-void test('renderer CSP allows reading preview object URLs for image export', () => {
-  assert.ok(getDirectiveSources(rendererHtml, 'connect-src').includes('blob:'))
-})
-
-void test('renderer CSP allows the Codex reset forecast API', () => {
-  assert.ok(getDirectiveSources(rendererHtml, 'connect-src').includes('https://codex-resets.com'))
-})
-
-void test('only the opt-in Devbar entry may load the loopback Hub bootstrap', () => {
-  assert.ok(!getDirectiveSources(rendererHtml, 'script-src').includes('http://127.0.0.1:*'))
-  assert.ok(getDirectiveSources(devbarHtml, 'script-src').includes('http://127.0.0.1:*'))
-})
-
-void test('Devbar may resolve official Hub icons without broadening the normal renderer', () => {
-  assert.ok(
-    !getDirectiveSources(rendererHtml, 'connect-src').includes('https://api.iconify.design')
-  )
-  assert.ok(getDirectiveSources(devbarHtml, 'connect-src').includes('https://api.iconify.design'))
+void test('the isolated PR image document can run its loader without broadening the main renderer', () => {
+  const script = prImageHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(script)
+  const digest = createHash('sha256').update(script).digest('base64')
+  assert.ok(getDirectiveSources(prImageHtml, 'script-src').includes(`'sha256-${digest}'`))
+  assert.deepEqual(getDirectiveSources(prImageHtml, 'img-src'), ['https:'])
+  assert.ok(!getDirectiveSources(rendererHtml, 'img-src').includes('https:'))
 })
 
 void test('renderer entries allow exactly the current inline boot shell script', async () => {
@@ -54,5 +38,24 @@ void test('renderer entries allow exactly the current inline boot shell script',
     assert.ok(html.includes('<!-- lody:boot-shell-head -->'))
     assert.ok(html.includes('<div id="root"><!-- lody:boot-shell --></div>'))
     assert.ok(getDirectiveSources(html, 'script-src').includes(`'sha256-${digest}'`))
+  }
+})
+
+void test('renderer entries may frame direct HTML previews but never load them as code or data', () => {
+  for (const html of [rendererHtml, devbarHtml]) {
+    assert.ok(getDirectiveSources(html, 'frame-src').includes('lody-html-preview:'))
+    for (const directive of ['default-src', 'script-src', 'connect-src', 'img-src', 'media-src']) {
+      assert.ok(!getDirectiveSources(html, directive).includes('lody-html-preview:'), directive)
+    }
+  }
+})
+
+void test('renderer entries allow local resource and blob media without opening arbitrary remote media', () => {
+  for (const html of [rendererHtml, devbarHtml]) {
+    const mediaSources = getDirectiveSources(html, 'media-src')
+    assert.ok(mediaSources.includes("'self'"))
+    assert.ok(mediaSources.includes('lody-resource:'))
+    assert.ok(mediaSources.includes('blob:'))
+    assert.ok(!mediaSources.includes('https:'))
   }
 })

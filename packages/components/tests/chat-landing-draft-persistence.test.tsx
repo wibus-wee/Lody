@@ -13,7 +13,13 @@ import { createSessionSendResources } from '../src/lib/session-send-resources';
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-import { buildChatLandingDraftKey } from '../src/atoms/chat-landing-draft';
+import {
+  buildChatLandingDraftKey,
+  buildChatLandingSurfaceDraftKey,
+  chatLandingDraftSessionIdAtomFamily,
+  chatLandingPendingFilesAtomFamily,
+  chatLandingPendingImagesAtomFamily,
+} from '../src/atoms/chat-landing-draft';
 import { chatLandingSessionStateAtomFamily } from '../src/atoms/local-storage-cache';
 import { useChatLandingDraftSession } from '../src/hooks/use-chat-landing-draft-session';
 import {
@@ -61,7 +67,7 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('@/lib/toast', () => ({ toast: { error: vi.fn() } }));
 
-vi.mock('@posthog/react', () => ({ usePostHog: () => null }));
+vi.mock('@/lib/posthog-context', () => ({ usePostHog: () => null }));
 
 vi.mock('../src/lib/posthog-analytics', () => ({ capturePostHogEvent: vi.fn() }));
 
@@ -318,21 +324,6 @@ describe('chat landing draft persistence', () => {
     expect(readHarness().sessionId).toBe(reservedSessionId);
   });
 
-  it('revokes a preview URL when the user removes that image', () => {
-    mountLanding(WORKSPACE_A_KEY);
-    act(() => {
-      readHarness().addImages([pngFile('shot.png')]);
-    });
-    const [item] = readHarness().imageItems;
-
-    act(() => {
-      readHarness().removeImage(item!.id);
-    });
-
-    expect(revokedUrls).toEqual([item!.previewUrl]);
-    expect(readHarness().imageItems).toEqual([]);
-  });
-
   it('keeps images and files as nonblocking local drafts across navigation', () => {
     mountLanding(WORKSPACE_A_KEY);
     act(() => {
@@ -364,6 +355,41 @@ describe('chat landing draft persistence', () => {
     expect(readHarness().imageItems).toEqual([]);
     expect(readHarness().fileItems).toEqual([]);
     expect(resources.getActiveCount()).toBe(0);
+  });
+
+  it("keeps the Convert-to-task dialog's draft apart from the page draft", () => {
+    // The anonymous owner is the case a plain suffix-free key would collide on.
+    for (const owner of ['user-1', null]) {
+      expect(buildChatLandingSurfaceDraftKey(owner, 'today-convert', 'workspace-a')).not.toBe(
+        buildChatLandingDraftKey(owner, 'workspace-a')
+      );
+    }
+    const surfaceKey = buildChatLandingSurfaceDraftKey('user-1', 'today-convert', 'workspace-a');
+    mountLanding(WORKSPACE_A_KEY);
+    act(() => {
+      readHarness().setPrompt('page draft');
+      readHarness().addImages([pngFile('page.png')]);
+    });
+    const page = readHarness();
+    unmountLanding();
+
+    mountLanding(surfaceKey);
+    expect(readHarness().prompt).toBe('');
+    expect(readHarness().imageItems).toEqual([]);
+    act(() => {
+      readHarness().setPrompt('dialog draft');
+      readHarness().addImages([pngFile('dialog.png')]);
+      readHarness().addFiles([textFile('dialog.txt')]);
+    });
+    expect(readHarness().sessionId).not.toBe(page.sessionId);
+    act(() => readHarness().clearDraft());
+    unmountLanding();
+
+    expect(store.get(chatLandingSessionStateAtomFamily(WORKSPACE_A_KEY)).prompt).toBe('page draft');
+    expect(store.get(chatLandingDraftSessionIdAtomFamily(WORKSPACE_A_KEY))).toBe(page.sessionId);
+    expect(store.get(chatLandingPendingImagesAtomFamily(WORKSPACE_A_KEY))).toHaveLength(1);
+    expect(store.get(chatLandingPendingFilesAtomFamily(WORKSPACE_A_KEY))).toEqual([]);
+    expect(revokedUrls).not.toContain(page.imageItems[0]!.previewUrl);
   });
 
   it('keeps drafts in different workspaces apart', () => {
@@ -407,7 +433,14 @@ it('retains encrypted attachment drafts and the reserved identity after storage 
   const reserved = before.sessionId!;
   await expect(
     acceptSessionUserTurn(
-      { contentMode: 'e2ee', repo: { getDocMeta: async () => { throw new Error('Workspace storage unavailable'); } } } as unknown as WorkspaceRuntime,
+      {
+        contentMode: 'e2ee',
+        repo: {
+          getDocMeta: async () => {
+            throw new Error('Workspace storage unavailable');
+          },
+        },
+      } as unknown as WorkspaceRuntime,
       reserved,
       {} as never,
       { kind: 'dispatch' },

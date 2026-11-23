@@ -1,3 +1,6 @@
+import { mkdtemp, writeFile, rm, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { withHistoryPort } from '../../tests/history-port-fixture';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LoroDoc, LoroMap } from 'loro-crdt';
@@ -13,6 +16,7 @@ import {
   type SessionTurnInputConfig,
 } from '@lody/shared';
 import type { ReplaceEditableTailInput } from '@lody/shared/session-data';
+import { turnExecutionDigest } from '@lody/shared/e2ee-execution-intent';
 import { SessionEditAndResendService } from './session-edit-and-resend-service';
 import { SessionExecutionService } from './session-execution-service';
 import { createSessionBackend } from './session-backend';
@@ -88,6 +92,13 @@ function createHarness(
     /** A compensation whose follow-up step rejects after restoring the range. */
     rollbackError?: Error;
     history?: SessionHistoryInput[];
+    /** Encrypted workspace: the machine's own input signer. */
+    signMachineInput?: (input: {
+      sessionId: string;
+      targetMachineId: string;
+      userTurnId: string;
+      inputConfig: unknown;
+    }) => Promise<string | undefined>;
   } = {}
 ) {
   const events: string[] = [];
@@ -135,7 +146,9 @@ function createHarness(
     getMetaState: vi.fn(async () => meta),
     getHistory: vi.fn(realDoc.sessionData.history.readAll.bind(realDoc.sessionData.history)),
     sessionData: {
+      ...realDoc.sessionData,
       commands: {
+        ...realDoc.sessionData.commands,
         replaceEditableTail: vi.fn(async (input: ReplaceEditableTailInput) => {
           events.push('history');
           await options.beforeReplace?.(realDoc);
@@ -207,6 +220,10 @@ function createHarness(
     workspaceDocument: {
       repo,
       getOrCreateSessionDoc: vi.fn(async () => sessionDoc),
+      isEncryptedWorkspace: () => options.signMachineInput !== undefined,
+      signMachineInput: async (
+        input: Parameters<NonNullable<typeof options.signMachineInput>>[0]
+      ) => await options.signMachineInput?.(input),
       persistPendingChanges: vi.fn(async (reason: string) => {
         events.push(reason.endsWith('rollback') ? 'persist-rollback' : 'persist');
         if (options.persistError && reason.endsWith('commit')) {
@@ -235,12 +252,17 @@ function createHarness(
     getHistory: () => loro.getList('history').toJSON() as SessionHistoryInput[],
     logger,
     realDoc,
+    sessionDoc,
     meta,
     readStoredMeta: () => storedMeta,
     repo,
     service,
   });
 }
+
+/** A well-formed 131-character record standing in for a signature over `digest`. */
+const fakeIntentRecord = (digest: string | undefined) =>
+  digest ? digest.repeat(3).slice(0, 131) : undefined;
 
 const spec = {
   sessionId,
@@ -318,6 +340,45 @@ describe('SessionEditAndResendService', () => {
         lastHandledUserMsgId: 'user-1',
       })
     );
+  });
+
+  it('signs the encrypted replacement over exactly the input its start will run', async () => {
+    const signed: unknown[] = [];
+    const harness = createHarness({
+      active: true,
+      signMachineInput: async (input) => {
+        signed.push(input);
+        return fakeIntentRecord(turnExecutionDigest(input));
+      },
+    });
+
+    const result = await harness.service.editAndResend(spec);
+    expect(result, JSON.stringify(result)).toMatchObject({ success: true });
+    const stored = harness.sessionData.history.readAll().at(-1);
+    expect(signed).toEqual([
+      expect.objectContaining({
+        sessionId,
+        targetMachineId: machineId,
+        userTurnId: spec.replacementUserTurnId,
+      }),
+    ]);
+    // The start recomputes this digest from the stored row; it must match what was signed.
+    expect(stored).toMatchObject({
+      id: spec.replacementUserTurnId,
+      e2eeIntent: fakeIntentRecord(turnExecutionDigest({ inputConfig: stored?.inputConfig })),
+    });
+  });
+
+  it('refuses an encrypted replacement it cannot sign without touching history', async () => {
+    const harness = createHarness({ signMachineInput: async () => undefined });
+    const before = harness.sessionData.history.readAll().map((entry) => entry.id);
+
+    expect(await harness.service.editAndResend(spec)).toMatchObject({
+      success: false,
+      error: { message: 'e2ee_signature_unavailable' },
+    });
+    expect(harness.sessionData.history.readAll().map((entry) => entry.id)).toEqual(before);
+    expect(harness.repo.upsertDocMeta).not.toHaveBeenCalled();
   });
 
   it('edits and resends while retaining an inert legacy auto-review pointer', async () => {
@@ -579,3 +640,103 @@ describe('SessionEditAndResendService', () => {
     }
   );
 });
+
+it('normalizes inherited input configuration before edit-and-resend', async () => {
+  const history = historyFixture();
+  history[2]!.inputConfig = {
+    ...history[2]!.inputConfig,
+    modelId: '  model-1  ',
+    chainDepth: 'legacy-invalid',
+  } as unknown as SessionTurnInputConfig;
+  const harness = createHarness({ history });
+  expect(await harness.service.editAndResend(spec)).toMatchObject({ success: true });
+  expect(harness.getHistory().at(-1)?.inputConfig).toMatchObject({ modelId: 'model-1' });
+  expect(harness.getHistory().at(-1)?.inputConfig?.chainDepth).toBeUndefined();
+});
+
+it.each([false, true])(
+  'reports a stale user turn when the selected input changes (superseded=%s)',
+  async (superseded) => {
+    const harness = createHarness();
+    const writer = harness.sessionDoc.sessionData.writer;
+    const read = writer.readSelected.bind(writer);
+    const peer: SessionHistoryInput = {
+      id: 'peer-latest-user',
+      role: 'user',
+      userId: 'peer',
+      timestamp: '2026-08-03T00:00:04.000Z',
+      status: 'pending',
+      read: false,
+      items: [{ type: 'text', text: 'Concurrent input' }],
+      fileDiff: [],
+    };
+    vi.spyOn(writer, 'readSelected').mockImplementationOnce((...args) => {
+      harness.realDoc.sessionData.writer.append(peer);
+      if (superseded)
+        throw Object.assign(new Error('History selection changed'), { code: 'superseded' });
+      return read(...args);
+    });
+    const closing = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    harness.agentClient.closeDetachedSession.mockImplementationOnce(async () => {
+      closing.resolve();
+      await release.promise;
+      return true;
+    });
+    const pending = harness.service.editAndResend(spec);
+    try {
+      await closing.promise;
+      expect(harness.executionService.getExecutionSnapshot().hasRewriteBarrier).toBe(true);
+      release.resolve();
+      expect(await pending).toMatchObject({ success: false, error: { code: 'STALE_USER_TURN' } });
+      expect(harness.executionService.getExecutionSnapshot().hasRewriteBarrier).toBe(false);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect(harness.getHistory().map((row) => row.id)).toEqual([
+      ...historyFixture().map((row) => row.id),
+      peer.id,
+    ]);
+    expect(harness.readStoredMeta()).toEqual(harness.meta);
+    expect(harness.agentClient.closeDetachedSession).toHaveBeenCalledWith('acp-new');
+  }
+);
+
+it.each([false, true])(
+  'preserves direct local attachments on resend even when source is missing: %s',
+  async (missing) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'resend-local-'));
+    try {
+      const source = path.join(root, 'input.txt');
+      await writeFile(source, 'synthetic');
+      const attachment = {
+        type: 'local_attachment' as const,
+        machineId,
+        path: source,
+        kind: 'file' as const,
+        fileName: 'input.txt',
+        mimeType: 'text/plain',
+        sizeBytes: 9,
+      };
+      const history = historyFixture();
+      history[2]!.items = [attachment];
+      const harness = createHarness({
+        history,
+      });
+      if (missing) await unlink(source);
+      const result = await harness.service.editAndResend({
+        ...spec,
+        inputConfig: { ...spec.inputConfig, inputBlocks: [attachment] },
+      });
+      expect(result.success).toBe(true);
+      const replacement = (await harness.realDoc.sessionData.history.readAll()).find(
+        (entry) => entry.id === 'user-3'
+      )!;
+      expect(replacement.items).toEqual([attachment]);
+      expect(replacement.inputConfig?.inputBlocks).toEqual([attachment]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+);

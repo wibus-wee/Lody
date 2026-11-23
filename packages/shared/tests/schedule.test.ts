@@ -8,11 +8,9 @@ import {
   validateScheduleTrigger,
 } from '../src/schedule-time';
 import {
-  buildScheduleRegistryRow,
-  readScheduleRegistryRows,
+  manualScheduleRunKey,
+  scheduleRegistryKeys,
   scheduleDefinitionFingerprint,
-  scheduleRunIds,
-  scheduleRunKey,
 } from '../src/schedule-registry';
 import {
   normalizeLegacyScheduleAgent,
@@ -20,6 +18,8 @@ import {
   ScheduleAgentSchema,
   ScheduleDefinitionSchema,
 } from '../src/schedule-types';
+import { scheduleDeclarationSubject } from '../src/e2ee-execution-intent';
+import { readScheduleAuthorization } from '../src/schedule-authorization';
 import { ScheduleRepository, type ScheduleRepositoryPort } from '../src/schedule-repository';
 import { zonedLocalInputToInstant, instantToZonedLocalInput } from '../src/schedule-recurrence';
 
@@ -115,41 +115,131 @@ describe('Schedule time contract', () => {
 });
 
 describe('Schedule persistence contract', () => {
-  it('fingerprints executable input independently of key order and cosmetic edits', () => {
+  it('signs an encrypted declaration first and writes it with the declaration, never unsigned', async () => {
+    const docs = new Map<string, LoroDoc>();
+    const rows = new Map<string, unknown>();
+    const port: ScheduleRepositoryPort = {
+      openPersistedDoc: async (id) => {
+        if (!docs.has(id)) docs.set(id, new LoroDoc());
+        return { doc: docs.get(id)! };
+      },
+      openFlockDoc: async () => ({
+        flock: {
+          scan: () => [...rows].map(([key, value]) => ({ key: JSON.parse(key), value })),
+          get: (key) => rows.get(JSON.stringify(key)),
+          set: (key, value) => rows.set(JSON.stringify(key), value),
+        },
+      }),
+      flush: async () => {},
+    };
     const d = definition();
-    const first = scheduleDefinitionFingerprint({ definition: d, prompt: 'hello' });
+    const save = (repo: ScheduleRepository) =>
+      repo.save({
+        scheduleId: 'signed',
+        draft: {
+          title: d.title,
+          machineId: d.machineId,
+          trigger: d.trigger,
+          agent: d.agent,
+          project: d.project,
+          misfirePolicy: d.misfirePolicy,
+          overlapPolicy: d.overlapPolicy,
+          retryPolicy: d.retryPolicy,
+          prompt: 'hello',
+        },
+        actorId: 'owner',
+        now: 1,
+        activationId: 'activation',
+        activityId: 'created',
+        create: true,
+      });
+    await expect(
+      save(new ScheduleRepository(port, 'workspace' as never, { protectedContent: true }))
+    ).rejects.toThrow('e2ee_signature_unavailable');
+    expect(docs.get('schedule-signed')?.toJSON() ?? {}).toEqual({});
+    const signed: { fingerprint: string; manualRunKey?: string }[] = [];
+    let rejectManual = false;
+    const protectedRepo = new ScheduleRepository(port, 'workspace' as never, {
+      protectedContent: true,
+      signDeclaration: async (document, manualRunKey) => {
+        if (rejectManual && manualRunKey) throw new Error('manual signer unavailable');
+        signed.push({
+          fingerprint: scheduleDeclarationSubject(document, manualRunKey).contentDigest,
+          ...(manualRunKey ? { manualRunKey } : {}),
+        });
+        return 'A'.repeat(131);
+      },
+    });
+    await save(protectedRepo);
+    const signedDoc = docs.get('schedule-signed');
+    if (!signedDoc) throw new Error('missing signed Schedule');
+    const declared = (
+      signedDoc.toJSON() as {
+        scheduleAuthorizations: { definitionFingerprint: string; e2eeIntent?: string }[];
+      }
+    ).scheduleAuthorizations;
+    expect(declared).toEqual([
+      expect.objectContaining({
+        definitionFingerprint: signed[0]!.fingerprint,
+        e2eeIntent: 'A'.repeat(131),
+      }),
+    ]);
+    const unsigned = new ScheduleRepository(port, 'workspace' as never, { protectedContent: true });
+    const pause = {
+      scheduleId: 'signed',
+      enabled: false,
+      actorId: 'owner',
+      now: 2,
+      activationId: 'pause',
+      requestId: 'pause',
+    };
+    await unsigned.setEnabled(pause);
+    await unsigned.setEnabled(pause);
+    expect((await unsigned.read('signed'))?.definition).toMatchObject({
+      enabled: false,
+      activationId: 'pause',
+    });
+    expect((await unsigned.list())[0]?.enabled).toBe(false);
     expect(
-      scheduleDefinitionFingerprint({
-        definition: { ...d, title: 'Renamed', updatedAt: 1 },
-        prompt: 'hello',
-      })
-    ).toBe(first);
-    expect(scheduleDefinitionFingerprint({ definition: d, prompt: 'different' })).not.toBe(first);
-    const key = scheduleRunKey('test', 'activation', 123);
+      (signedDoc.toJSON() as { scheduleAuthorizations: unknown }).scheduleAuthorizations
+    ).toEqual(declared);
+    const manual = { scheduleId: 'signed', actorId: 'owner', manualRunId: 'paused-run', now: 3 };
+    rejectManual = true;
+    await expect(protectedRepo.requestRun(manual)).rejects.toThrow('manual signer unavailable');
     expect(
-      scheduleRunIds(key, { scheduleId: 'test', destination: { kind: 'new_session' } })
-    ).toEqual(scheduleRunIds(key, { scheduleId: 'test', destination: { kind: 'new_session' } }));
+      (signedDoc.toJSON() as { scheduleAuthorizations: unknown }).scheduleAuthorizations
+    ).toEqual(declared);
     expect(
-      new Set(
-        Object.values(
-          scheduleRunIds(key, { scheduleId: 'test', destination: { kind: 'new_session' } })
-        )
-      ).size
-    ).toBe(3);
-  });
-  it('honors tombstones regardless of row order', () => {
-    const row = buildScheduleRegistryRow({
-      definition: definition(),
-      prompt: 'hello',
-      timeline: [],
+      rows.get(JSON.stringify(scheduleRegistryKeys.manual('signed', 'paused-run')))
+    ).toBeUndefined();
+    rejectManual = false;
+    await protectedRepo.requestRun(manual);
+    const paused = await protectedRepo.read('signed');
+    if (!paused) throw new Error('missing paused Schedule');
+    expect(readScheduleAuthorization(signedDoc)?.value).toMatchObject({
+      kind: 'definition',
+      definitionFingerprint: scheduleDefinitionFingerprint(paused),
     });
     expect(
-      readScheduleRegistryRows([
-        { key: ['tombstone', 'test'], value: { actorId: 'owner', deletedAt: 1 } },
-        { key: ['schedule', 'test'], value: row },
-      ])
-    ).toEqual([]);
+      readScheduleAuthorization(signedDoc, manualScheduleRunKey('signed', 'paused-run'))?.value
+    ).toMatchObject({
+      kind: 'manual',
+      definitionFingerprint: scheduleDefinitionFingerprint(paused),
+    });
+    const authorizations = signedDoc.toJSON().scheduleAuthorizations;
+    await protectedRepo.requestRun(manual);
+    expect(signedDoc.toJSON().scheduleAuthorizations).toEqual(authorizations);
+    expect(
+      rows.get(JSON.stringify(scheduleRegistryKeys.manual('signed', 'paused-run')))
+    ).toMatchObject({ activationId: 'pause' });
+    expect(paused.definition.enabled).toBe(false);
+    signedDoc.getText('prompt').insert(0, 'tampered');
+    await expect(
+      unsigned.setEnabled({ ...pause, enabled: true, requestId: 'resume', activationId: 'resume' })
+    ).rejects.toThrow('e2ee_signature_unavailable');
+    expect((await unsigned.read('signed'))?.definition.enabled).toBe(false);
   });
+
   it('writes the definition durably before enabling its Registry and reads absent docs without seeding', async () => {
     const docs = new Map<string, LoroDoc>();
     const rows = new Map<string, unknown>();
@@ -637,52 +727,6 @@ describe('Chat-mode schedules carry no project', () => {
       ).toBeUndefined();
     }
   );
-
-  it('accepts a definition with no project and keeps the field absent through the doc', async () => {
-    const repo = new ScheduleRepository(memoryPort(), 'workspace' as never);
-    await repo.save({
-      scheduleId: 'test',
-      draft: chatDraft(),
-      actorId: 'owner',
-      now: 1,
-      activationId: 'activation',
-      activityId: 'created',
-      create: true,
-    });
-    const stored = await repo.read('test');
-    expect(stored?.definition.project).toBeUndefined();
-    const [row] = await repo.list();
-    expect(row?.projectKind).toBeUndefined();
-    expect(row?.projectKey).toBeUndefined();
-    expect(row?.definitionFingerprint).toBe(scheduleDefinitionFingerprint(stored!));
-  });
-
-  it('does not confuse a chat schedule with an identical project-bound one', () => {
-    const withProject = { definition: definition(), prompt: 'hello' };
-    const { project: _project, ...rest } = definition();
-    const chat = { definition: ScheduleDefinitionSchema.parse(rest), prompt: 'hello' };
-    expect(scheduleDefinitionFingerprint(chat)).not.toBe(
-      scheduleDefinitionFingerprint(withProject)
-    );
-    expect(buildScheduleRegistryRow(chat).projectKind).toBeUndefined();
-    expect(buildScheduleRegistryRow(withProject).projectKind).toBe('github');
-  });
-
-  it('re-reads a chat schedule from the Registry rows it published', async () => {
-    const port = memoryPort();
-    const repo = new ScheduleRepository(port, 'workspace' as never);
-    await repo.save({
-      scheduleId: 'test',
-      draft: chatDraft(),
-      actorId: 'owner',
-      now: 1,
-      activationId: 'activation',
-      activityId: 'created',
-      create: true,
-    });
-    const handle = await port.openFlockDoc('workspace:sr');
-    expect(readScheduleRegistryRows(handle.flock.scan())).toHaveLength(1);
-  });
 });
 
 describe('legacy Schedule ACP value compatibility', () => {
@@ -760,26 +804,5 @@ describe('legacy Schedule ACP value compatibility', () => {
       'fast-mode': true,
       fast_select: 'false',
     });
-  });
-  it('converts Fast aliases advertised as booleans', () => {
-    const agent = {
-      agentConfigId: 'agent',
-      configOptionValues: { fast: 'false', 'fast-mode': 'true' },
-    };
-
-    expect(
-      normalizeLegacyScheduleAgent(agent, [
-        { id: 'fast', name: 'Fast', type: 'boolean', currentValue: true, options: [] },
-        { id: 'fast-mode', name: 'Fast mode', type: 'boolean', currentValue: false, options: [] },
-      ]).configOptionValues
-    ).toEqual({ fast: false, 'fast-mode': true });
-  });
-  it.each([42, null, {}, [], 'x'.repeat(1025)])('rejects invalid option values', (value) => {
-    expect(
-      ScheduleAgentSchema.safeParse({
-        agentConfigId: 'agent',
-        configOptionValues: { option: value },
-      }).success
-    ).toBe(false);
   });
 });

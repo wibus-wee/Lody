@@ -1,3 +1,8 @@
+import { createHistoryWriter } from '@lody/shared/history-writer';
+import {
+  runWithDaemonWorkspace,
+  runWithEncryptedCommandAccess,
+} from '../lib/session-command-environment';
 import { Console } from 'node:console';
 import { Writable } from 'node:stream';
 import * as commandRuntime from '@/lib/command-runtime';
@@ -9,7 +14,6 @@ import { z } from 'zod';
 import { getSessionCancelProtocolFields } from './session';
 import { CURRENT_MACHINE_PROTOCOL_CAPABILITIES } from '@lody/shared';
 import { LoroDoc } from 'loro-crdt';
-import { createHistoryWriter } from '@lody/shared';
 import { createLoroSessionData } from '@lody/shared/session-data';
 import { appendUserPromptHistory } from './session';
 import { prepareSessionInput } from './session';
@@ -18,9 +22,9 @@ import os from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { LoroRepo, RepoSyncError, RepoTransportError } from 'loro-repo';
+import { LoroRepo } from 'loro-repo';
 import { FlockSyncTimeoutError } from '@/lib/loro/timeout-utils';
-import { FlockSyncUnavailableError } from '@/lib/loro/flock-sync-errors';
+
 import {
   getMachineFlockDocId,
   getWorkspaceFlockDocId,
@@ -41,67 +45,48 @@ import {
   type SessionMeta,
   type WorkspaceId,
 } from '@lody/shared';
-import {
-  localProjectsLegacy,
-  createLocalProjectBranchSelector,
-} from '@lody/shared/node/local-project';
+import { createLocalProjectBranchSelector } from '@lody/shared/node/local-project';
 
 import type { MachineAccessCheckResult } from '@/lib/workspace';
 import {
   type MachineAccessReaders,
   MachineFlockReadUnavailableError,
   readAgentAcpCapability,
-  applyAgentRunConfigSelection,
   runSessionOperationWithSyncedMetadata,
+  assertSessionManagementAccess,
   assertSupportedParentDepth,
   confirmDispatchSyncedBestEffort,
   filterAuthorizedMachineMetas,
   filterAuthorizedLocalProjectCandidates,
-  filterCompatibleInheritedTurnConfig,
   filterCompatibleTurnConfigOptionValues,
   filterSessionMetas,
-  hasNonPositionalPromptSource,
-  normalizeCliValue,
-  rollbackPendingSessionCreate,
-  renderSessionTranscript,
   renderAssistantTurnCompletion,
   deriveSessionLiveStatus,
-  ensureSessionCreateWorkspaceMetaFresh,
-  resolveCreateAgentSelector,
   resolveEffectiveSessionCreateDispatchConfig,
-  parseCliMcpServerIds,
   resolveCreateCurrentSessionId,
   resolveOpenedBySessionRelation,
   resolveSessionCreateOwnerUserId,
   selectDefaultAgentConfigForCreate,
   readDelegatedMachineAccess,
+  readSessionMachineAccess,
   resolveSessionRequester,
   sendSessionChatResult,
   ensureTargetMachineNotOffline,
   MachineOfflineError,
   readSessionLiveStatusesMany,
   resolveSessionCommandRequesterUserId,
-  resolveChatArgs,
-  resolveRenameArgs,
-  resolvePromptCandidate,
   resolveTurnDispatchConfigFromInputConfig,
   resolveTurnDispatchDefaultsFromHistory,
   resolveEffectiveSessionChatDispatchConfig,
   resolveLocalProjectBranchForCreate,
   resolveLocalProjectCreateGitContext,
   resolveLocalProjectRefOrThrow,
-  selectLocalProjectsBySelector,
   selectTargetMachineForCreate,
-  shouldReadStdinForChatArgResolution,
   shouldWaitForSessionCompletion,
-  selectSessionTranscriptEntries,
-  selectWorkspaceSummary,
   sortSessionMetas,
   toSessionTranscriptEntries,
   updateSessionActivityTimestamps,
   updateSessionActivityTimestampsBestEffort,
-  validateTurnConfigOptionValues,
-  validateTurnModeAndModel,
   withBuiltinDefaultTurnMode,
 } from './session';
 
@@ -178,33 +163,6 @@ const createAcpCapability = (): AcpCapabilityCacheEntry => ({
 });
 
 describe('session command helpers', () => {
-  it('uses one hard Meta read across request validation and accepted create materialization', async () => {
-    const syncMetaOrThrow = vi.fn(async () => undefined);
-    const manager = { syncMetaOrThrow };
-    const workspaceId = 'workspace-id' as WorkspaceId;
-
-    await ensureSessionCreateWorkspaceMetaFresh({
-      manager,
-      workspaceId,
-      prewriteSatisfied: false,
-    });
-    await ensureSessionCreateWorkspaceMetaFresh({
-      manager,
-      workspaceId,
-      prewriteSatisfied: true,
-    });
-
-    expect(syncMetaOrThrow).toHaveBeenCalledTimes(1);
-    expect(syncMetaOrThrow).toHaveBeenCalledWith({
-      reason: 'session.create:workspace-id:prewrite',
-    });
-  });
-
-  it('normalizes blank CLI values to undefined', () => {
-    expect(normalizeCliValue('   ')).toBeUndefined();
-    expect(normalizeCliValue(' value ')).toBe('value');
-  });
-
   it('records both the root Session and exact child Tab that opened a Session', () => {
     expect(
       resolveOpenedBySessionRelation(
@@ -282,45 +240,9 @@ describe('session command helpers', () => {
     ).toEqual({ modeId: 'default' });
   });
 
-  it('picks prompt candidates by explicit precedence', () => {
-    expect(
-      resolvePromptCandidate({
-        prompt: 'from-prompt',
-        promptFileContent: 'from-file',
-        positionalPrompt: 'from-position',
-        stdinText: 'from-stdin',
-      })
-    ).toBe('from-prompt');
-
-    expect(
-      resolvePromptCandidate({
-        promptFileContent: 'from-file',
-        positionalPrompt: 'from-position',
-        stdinText: 'from-stdin',
-      })
-    ).toBe('from-file');
-  });
-
-  it('selects workspaces by explicit selector or the only candidate', () => {
-    const workspaces = [
-      { id: 'ws-1', slug: 'alpha', name: 'Alpha', role: 'member' },
-      { id: 'ws-2', slug: 'beta', name: 'Beta', role: 'member' },
-    ];
-
-    expect(selectWorkspaceSummary(workspaces, 'beta')).toEqual(workspaces[1]);
-    expect(
-      selectWorkspaceSummary([{ id: 'ws-3', slug: null, name: 'Solo', role: 'owner' }])
-    ).toEqual({
-      id: 'ws-3',
-      slug: null,
-      name: 'Solo',
-      role: 'owner',
-    });
-  });
-
   it('throws when workspace selection is ambiguous', () => {
     expect(() =>
-      selectWorkspaceSummary([
+      commandRuntime.selectWorkspaceSummary([
         { id: 'ws-1', slug: 'alpha', name: 'Alpha', role: 'member' },
         { id: 'ws-2', slug: 'beta', name: 'Beta', role: 'member' },
       ])
@@ -466,343 +388,6 @@ describe('session command helpers', () => {
       state: 'waiting',
       source: 'machine',
     });
-  });
-
-  it('validates ACP config option ids, types, and select values before dispatch', () => {
-    const capability = createAcpCapability();
-    expect(() =>
-      validateTurnConfigOptionValues({ approval_policy: 'never', web_search: true }, capability)
-    ).not.toThrow();
-    expect(() => validateTurnConfigOptionValues({ unknown: true }, capability)).toThrow(
-      /Unknown ACP config option/
-    );
-    expect(() => validateTurnConfigOptionValues({ approval_policy: false }, capability)).toThrow(
-      /expects a select value/
-    );
-    expect(() =>
-      validateTurnConfigOptionValues({ approval_policy: 'invalid' }, capability)
-    ).toThrow(/Allowed values/);
-    expect(() => validateTurnConfigOptionValues({ web_search: 'true' }, capability)).toThrow(
-      /expects a boolean value/
-    );
-  });
-
-  it('resolves a semantic run config selection against the target agent capabilities', () => {
-    const capability: AcpCapabilityCacheEntry = {
-      ...createAcpCapability(),
-      configOptions: [
-        ...(createAcpCapability().configOptions ?? []),
-        {
-          id: 'reasoning_effort',
-          name: 'Reasoning effort',
-          category: 'thought_level',
-          type: 'select',
-          currentValue: 'medium',
-          options: [{ value: 'high', name: 'High' }],
-        },
-      ],
-    };
-
-    expect(
-      applyAgentRunConfigSelection(
-        {
-          configOptionValues: { approval_policy: 'never' },
-          runConfig: { modelId: 'model-a', reasoningEffort: 'high' },
-        },
-        capability
-      ).config
-    ).toEqual({
-      modelId: 'model-a',
-      configOptionValues: { approval_policy: 'never', reasoning_effort: 'high' },
-    });
-
-    // No selection: the config passes through untouched, capability or not.
-    expect(applyAgentRunConfigSelection({ modeId: 'default' }, undefined).config).toEqual({
-      modeId: 'default',
-    });
-
-    expect(() =>
-      applyAgentRunConfigSelection({ runConfig: { fastMode: true } }, capability)
-    ).toThrow(/does not offer a fast mode option/);
-  });
-
-  it('validates effort against the selected model and skips the probed-model snapshot check', () => {
-    const capability: AcpCapabilityCacheEntry = {
-      ...createAcpCapability(),
-      configOptions: [
-        {
-          id: 'model',
-          name: 'Model',
-          category: 'model',
-          type: 'select',
-          currentValue: 'model-a',
-          options: [
-            { value: 'model-a', name: 'Model A' },
-            { value: 'model-b', name: 'Model B' },
-          ],
-        },
-        {
-          id: 'reasoning_effort',
-          name: 'Reasoning effort',
-          category: 'thought_level',
-          type: 'select',
-          // Snapshot taken while model-a was current.
-          currentValue: 'medium',
-          options: [{ value: 'medium', name: 'Medium' }],
-        },
-      ],
-      models: [],
-      modelReasoningEfforts: { 'model-a': ['medium'], 'model-b': ['medium', 'xhigh'] },
-    };
-
-    const requested = applyAgentRunConfigSelection(
-      { runConfig: { modelId: 'model-b', reasoningEffort: 'xhigh' } },
-      capability
-    );
-
-    expect(requested.config.configOptionValues).toEqual({ reasoning_effort: 'xhigh' });
-    expect(requested.validatedConfigIds.has('reasoning_effort')).toBe(true);
-    // `xhigh` is absent from the probed model's option list, so the snapshot
-    // check must skip it rather than reject a value valid for model-b.
-    expect(() =>
-      validateTurnConfigOptionValues(
-        requested.config.configOptionValues,
-        capability,
-        requested.validatedConfigIds
-      )
-    ).not.toThrow();
-    expect(() =>
-      validateTurnConfigOptionValues(requested.config.configOptionValues, capability)
-    ).toThrow(/Allowed values/);
-  });
-
-  it('drops inherited ACP config options that are no longer compatible', () => {
-    expect(
-      filterCompatibleTurnConfigOptionValues(
-        { approval_policy: 'never', web_search: 'true', removed: false },
-        createAcpCapability()
-      )
-    ).toEqual({ approval_policy: 'never' });
-  });
-
-  it('validates explicit mode and model selectors against agent capabilities', () => {
-    const capability = createAcpCapability();
-    expect(() =>
-      validateTurnModeAndModel({ modeId: 'default', modelId: 'model-a' }, capability)
-    ).not.toThrow();
-    expect(() => validateTurnModeAndModel({ modeId: 'plan' }, capability)).toThrow(
-      'Unsupported ACP mode'
-    );
-    expect(() => validateTurnModeAndModel({ modelId: 'model-b' }, capability)).toThrow(
-      'Unsupported ACP model'
-    );
-    expect(() => validateTurnModeAndModel({ modeId: 'default' }, undefined)).toThrow(
-      'Unsupported ACP mode'
-    );
-  });
-
-  it('drops incompatible inherited mode and model selectors', () => {
-    expect(
-      filterCompatibleInheritedTurnConfig(
-        {
-          modeId: 'plan',
-          modelId: 'model-a',
-          configOptionValues: { approval_policy: 'never' },
-        },
-        createAcpCapability()
-      )
-    ).toEqual({
-      modelId: 'model-a',
-      configOptionValues: { approval_policy: 'never' },
-    });
-  });
-
-  it('filters inherited effort and Fast using the inherited model rather than the probe', () => {
-    const capability: AcpCapabilityCacheEntry = {
-      ...createAcpCapability(),
-      models: [{ modelId: 'model-b', name: 'Model B' }],
-      modelReasoningEfforts: { 'model-a': ['high'], 'model-b': ['xhigh'] },
-      declaredModelControls: { 'model-a': { fastMode: false }, 'model-b': { fastMode: true } },
-      configOptions: [
-        {
-          id: 'model',
-          name: 'Model',
-          category: 'model',
-          type: 'select',
-          currentValue: 'model-a',
-          options: [
-            { value: 'model-a', name: 'A' },
-            { value: 'model-b', name: 'B' },
-          ],
-        },
-        {
-          id: 'reasoning_effort',
-          name: 'Effort',
-          category: 'thought_level',
-          type: 'select',
-          currentValue: 'high',
-          options: [{ value: 'high', name: 'High' }],
-        },
-      ],
-    };
-    const inherited = {
-      modelId: 'model-b',
-      configOptionValues: { reasoning_effort: 'xhigh', fast: true, removed_option: true },
-    };
-    expect(filterCompatibleInheritedTurnConfig(inherited, capability)).toEqual({
-      modelId: 'model-b',
-      configOptionValues: { reasoning_effort: 'xhigh', fast: true },
-    });
-    expect(
-      filterCompatibleInheritedTurnConfig(
-        { ...inherited, configOptionValues: { reasoning_effort: 'high', fast: true } },
-        capability
-      )
-    ).toEqual({
-      modelId: 'model-b',
-      configOptionValues: { fast: true },
-    });
-    expect(
-      filterCompatibleInheritedTurnConfig(inherited, {
-        ...capability,
-        declaredModelControls: { 'model-b': { fastMode: false } },
-      })
-    ).toEqual({ modelId: 'model-b', configOptionValues: { reasoning_effort: 'xhigh' } });
-  });
-
-  it('accepts mode and model selectors advertised as ACP config options', () => {
-    const capability: AcpCapabilityCacheEntry = {
-      ...createAcpCapability(),
-      modes: [],
-      models: [],
-      configOptions: [
-        {
-          id: 'mode',
-          name: 'Mode',
-          category: 'mode',
-          type: 'select',
-          currentValue: 'plan',
-          options: [{ value: 'plan', name: 'Plan' }],
-        },
-        {
-          id: 'model',
-          name: 'Model',
-          category: 'model',
-          type: 'select',
-          currentValue: 'model-b',
-          options: [{ value: 'model-b', name: 'Model B' }],
-        },
-      ],
-    };
-    expect(() =>
-      validateTurnModeAndModel({ modeId: 'plan', modelId: 'model-b' }, capability)
-    ).not.toThrow();
-  });
-
-  it('sorts sessions with invalid createdAt timestamps deterministically', () => {
-    const sessions = [
-      createSessionMeta({
-        id: 'z-session',
-        createdAt: 'not-a-date',
-      }),
-      createSessionMeta({
-        id: 'a-session',
-        createdAt: 'still-not-a-date',
-      }),
-    ];
-
-    expect(sortSessionMetas(sessions).map((session) => session.id)).toEqual([
-      'z-session',
-      'a-session',
-    ]);
-  });
-
-  it('resolves rename args from explicit title, positional title, and env fallback', () => {
-    expect(
-      resolveRenameArgs({
-        sessionIdArg: 'session-1',
-        titleArg: 'Renamed from positional',
-      })
-    ).toEqual({
-      sessionId: 'session-1',
-      title: 'Renamed from positional',
-    });
-
-    expect(
-      resolveRenameArgs({
-        sessionIdArg: 'session-1',
-        optionTitle: 'Renamed from option',
-      })
-    ).toEqual({
-      sessionId: 'session-1',
-      title: 'Renamed from option',
-    });
-
-    expect(
-      resolveRenameArgs({
-        optionTitle: 'Renamed using env fallback',
-        envSessionId: 'session-from-env',
-      })
-    ).toEqual({
-      sessionId: 'session-from-env',
-      title: 'Renamed using env fallback',
-    });
-  });
-
-  it('rejects rename args when the title is missing', () => {
-    expect(() =>
-      resolveRenameArgs({
-        sessionIdArg: 'session-1',
-      })
-    ).toThrow(/Missing title/);
-
-    expect(() =>
-      resolveRenameArgs({
-        sessionIdArg: 'session-2',
-        envSessionId: 'session-from-env',
-      })
-    ).toThrow(/Missing title/);
-  });
-
-  it('resolves chat args from explicit session id or env fallback', () => {
-    expect(
-      resolveChatArgs({
-        sessionIdArg: 'session-1',
-        promptArg: 'prompt from second positional',
-      })
-    ).toEqual({
-      sessionId: 'session-1',
-      positionalPrompt: 'prompt from second positional',
-    });
-
-    expect(
-      resolveChatArgs({
-        sessionIdArg: 'prompt from first positional',
-        envSessionId: 'session-from-env',
-      })
-    ).toEqual({
-      sessionId: 'session-from-env',
-      positionalPrompt: 'prompt from first positional',
-    });
-
-    expect(
-      resolveChatArgs({
-        sessionIdArg: 'session-explicit',
-        envSessionId: 'session-from-env',
-        hasNonPositionalPromptSource: true,
-      })
-    ).toEqual({
-      sessionId: 'session-explicit',
-    });
-  });
-
-  it('resolves --agent as a create alias for --agent-config', () => {
-    expect(resolveCreateAgentSelector({ agent: 'Codex' })).toBe('Codex');
-    expect(resolveCreateAgentSelector({ agentConfig: 'cfg-1' })).toBe('cfg-1');
-    expect(resolveCreateAgentSelector({ agent: 'cfg-1', agentConfig: 'cfg-1' })).toBe('cfg-1');
-    expect(() => resolveCreateAgentSelector({ agent: 'cfg-1', agentConfig: 'cfg-2' })).toThrow(
-      /either --agent or --agent-config/
-    );
   });
 
   it('uses the same default agent config rules for create and create_options', () => {
@@ -1013,6 +598,79 @@ describe('session command helpers', () => {
     // An inherited Fast value is dropped rather than sent to a model without it.
     expect(
       filterCompatibleTurnConfigOptionValues({ fast: true, effort: 'default' }, capability, 'haiku')
+    ).toBeUndefined();
+  });
+
+  it('validates and filters Codex ultrafast speed tiers per target model', () => {
+    const capability: AcpCapabilityCacheEntry = {
+      cliType: 'builtin',
+      agentType: 'codex',
+      modes: [{ id: 'agent', name: 'Agent' }],
+      models: [
+        { modelId: 'gpt-6.2-sol', name: '6.2 Sol' },
+        { modelId: 'gpt-6.2-astra', name: '6.2 Astra' },
+      ],
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'gpt-6.2-astra',
+          options: [
+            { value: 'gpt-6.2-sol', name: '6.2 Sol' },
+            { value: 'gpt-6.2-astra', name: '6.2 Astra' },
+          ],
+        },
+        {
+          id: 'fast-mode',
+          name: 'Fast mode',
+          category: 'model_config',
+          type: 'boolean',
+          currentValue: false,
+          options: [],
+        },
+      ],
+      declaredModelControls: {
+        'gpt-6.2-sol': { fastMode: true, speedTiers: ['fast', 'ultrafast'] },
+        'gpt-6.2-astra': { fastMode: true },
+      },
+      fetchedAt: 1,
+    };
+    const target = createSessionMeta({ agentType: 'codex' });
+    expect(() =>
+      resolveEffectiveSessionChatDispatchConfig({
+        dispatchConfig: {
+          modelId: 'gpt-6.2-sol',
+          configOptionValues: { 'fast-mode': 'ultrafast' },
+        },
+        target,
+        capability,
+      })
+    ).not.toThrow();
+    expect(() =>
+      resolveEffectiveSessionChatDispatchConfig({
+        dispatchConfig: {
+          modelId: 'gpt-6.2-astra',
+          configOptionValues: { 'fast-mode': 'ultrafast' },
+        },
+        target,
+        capability,
+      })
+    ).toThrow(/Invalid speed tier for model gpt-6.2-astra: ultrafast/);
+    expect(
+      filterCompatibleTurnConfigOptionValues(
+        { 'fast-mode': 'ultrafast' },
+        capability,
+        'gpt-6.2-sol'
+      )
+    ).toEqual({ 'fast-mode': 'ultrafast' });
+    expect(
+      filterCompatibleTurnConfigOptionValues(
+        { 'fast-mode': 'ultrafast' },
+        capability,
+        'gpt-6.2-astra'
+      )
     ).toBeUndefined();
   });
 
@@ -1247,6 +905,53 @@ describe('session command helpers', () => {
     });
   });
 
+  it('validates options against the target model’s own observed list (LodyAI/Lody#1215)', () => {
+    const thoughtLevel = (values: string[]) => ({
+      id: 'thought_level',
+      name: 'Thinking',
+      category: 'thought_level',
+      type: 'select' as const,
+      currentValue: values[0] ?? '',
+      options: values.map((value) => ({ value, name: value })),
+    });
+    // Probed on swe-2-high, whose ladder lacks `low`.
+    const capability: AcpCapabilityCacheEntry = {
+      ...createAcpCapability(),
+      agentType: 'devin',
+      models: [],
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'swe-2-high',
+          options: [
+            { value: 'swe-2-high', name: 'SWE 2' },
+            { value: 'fusion', name: 'Fusion' },
+          ],
+        },
+        thoughtLevel(['medium', 'high', 'max']),
+      ],
+    };
+    const resolve = (cache: AcpCapabilityCacheEntry, effort: string) =>
+      resolveEffectiveSessionChatDispatchConfig({
+        dispatchConfig: { modelId: 'fusion', configOptionValues: { thought_level: effort } },
+        target: createSessionMeta(),
+        capability: cache,
+      });
+
+    // Unknown target model: dispatched for the agent to decide, as before.
+    expect(resolve(capability, 'low').configOptionValues).toEqual({ thought_level: 'low' });
+    const observed = {
+      ...capability,
+      observedModelConfigOptions: { fusion: [thoughtLevel(['low', 'medium', 'xhigh', 'max'])] },
+    };
+    expect(resolve(observed, 'low').configOptionValues).toEqual({ thought_level: 'low' });
+    // Once the agent has answered for the target model, its list decides.
+    expect(() => resolve(observed, 'high')).toThrow('Invalid reasoning effort for model fusion');
+  });
+
   it('lets explicit selector config options replace inherited top-level selectors', () => {
     const capability: AcpCapabilityCacheEntry = {
       ...createAcpCapability(),
@@ -1392,64 +1097,6 @@ describe('session command helpers', () => {
     ).toThrow(/Nested child sessions are not supported.*root-session/);
   });
 
-  it('treats stdin as a prompt source only when it actually has content', () => {
-    expect(hasNonPositionalPromptSource({ stdinText: undefined })).toBe(false);
-    expect(hasNonPositionalPromptSource({ stdinText: 'prompt from stdin' })).toBe(true);
-    expect(hasNonPositionalPromptSource({ promptFile: '-' })).toBe(true);
-  });
-
-  it('only pre-reads stdin for chat arg resolution when env fallback is ambiguous', () => {
-    expect(
-      shouldReadStdinForChatArgResolution({
-        sessionIdArg: 'session-1',
-        envSessionId: 'session-from-env',
-        prompt: 'prompt from option',
-        stdinIsTty: false,
-      })
-    ).toBe(false);
-
-    expect(
-      shouldReadStdinForChatArgResolution({
-        sessionIdArg: 'session-1',
-        envSessionId: 'session-from-env',
-        stdinIsTty: false,
-      })
-    ).toBe(true);
-
-    expect(
-      shouldReadStdinForChatArgResolution({
-        sessionIdArg: 'session-1',
-        envSessionId: 'session-from-env',
-        stdinIsTty: true,
-      })
-    ).toBe(false);
-  });
-
-  it('swallows rollback cleanup failures so the original create error can propagate', async () => {
-    const deleteDoc = vi.fn(async () => {
-      throw new Error('delete failed');
-    });
-    const cleanSessionDoc = vi.fn(async () => {
-      throw new Error('clean failed');
-    });
-    const warn = vi.fn();
-
-    await expect(
-      rollbackPendingSessionCreate(
-        {
-          repo: { deleteDoc },
-          cleanSessionDoc,
-        },
-        'session-1',
-        { warn }
-      )
-    ).resolves.toBeUndefined();
-
-    expect(deleteDoc).toHaveBeenCalledWith('session-session-1');
-    expect(cleanSessionDoc).toHaveBeenCalledWith('session-1', { preserveStatus: true });
-    expect(warn).toHaveBeenCalledTimes(2);
-  });
-
   it('does not throw when the dispatch doc sync is not confirmed, and skips meta sync', async () => {
     const waitUntilSynced = vi.fn(async () => false);
     const waitUntilMetaSynced = vi.fn(async () => true);
@@ -1490,47 +1137,6 @@ describe('session command helpers', () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
-  it('confirms workspace meta after the dispatch doc sync succeeds, without warning', async () => {
-    const waitUntilSynced = vi.fn(async () => true);
-    const waitUntilMetaSynced = vi.fn(async () => true);
-    const warn = vi.fn();
-
-    await expect(
-      confirmDispatchSyncedBestEffort({
-        manager: { waitUntilMetaSynced },
-        sessionDoc: { waitUntilSynced },
-        reason: 'session.create:session-1',
-        logger: { warn },
-      })
-    ).resolves.toBeUndefined();
-
-    expect(waitUntilMetaSynced).toHaveBeenCalledTimes(1);
-    expect(warn).not.toHaveBeenCalled();
-  });
-
-  it('does not start workspace meta confirmation before dispatch doc confirmation settles', async () => {
-    let resolveDocSync!: (synced: boolean) => void;
-    const waitUntilSynced = vi.fn(
-      async () =>
-        await new Promise<boolean>((resolve) => {
-          resolveDocSync = resolve;
-        })
-    );
-    const waitUntilMetaSynced = vi.fn(async () => true);
-
-    const confirmation = confirmDispatchSyncedBestEffort({
-      manager: { waitUntilMetaSynced },
-      sessionDoc: { waitUntilSynced },
-      reason: 'session.create:session-1',
-    });
-    await Promise.resolve();
-    expect(waitUntilMetaSynced).not.toHaveBeenCalled();
-
-    resolveDocSync(true);
-    await confirmation;
-    expect(waitUntilMetaSynced).toHaveBeenCalledTimes(1);
-  });
-
   it('does not throw when workspace meta sync is not confirmed', async () => {
     const waitUntilSynced = vi.fn(async () => true);
     const waitUntilMetaSynced = vi.fn(async () => false);
@@ -1547,6 +1153,55 @@ describe('session command helpers', () => {
 
     expect(warn).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['archive', 'restore', 'delete'] as const)(
+    'requires editing authority before CLI %s writes or cleanup',
+    async (operation) => {
+      const repo = await LoroRepo.create({});
+      const id = 'read-only-target' as SessionId;
+      const meta = createSessionMeta({
+        id,
+        isArchived: operation !== 'archive',
+        title: 'Original',
+      });
+      await repo.upsertDocMeta(getSessionRoomId(id), meta);
+      const manager = {
+        repo,
+        syncMetaOrThrow: async () => {},
+        waitUntilMetaSynced: async () => true,
+        cleanSessionDoc: async () => {},
+      } as unknown as Parameters<typeof runSessionOperationWithSyncedMetadata>[0];
+      const auth = { token: 'synthetic', userId: 'reader', machineId: 'caller' } as Parameters<
+        typeof assertSessionManagementAccess
+      >[0]['auth'];
+      const workspace = { id: 'workspace' } as Parameters<
+        typeof assertSessionManagementAccess
+      >[0]['workspace'];
+      let canEdit = false;
+      const run = () =>
+        runWithEncryptedCommandAccess(
+          async () => (canEdit ? { allowed: true } : { allowed: false, reason: 'not_visible' }),
+          () =>
+            runSessionOperationWithSyncedMetadata(manager, id, operation, (targetId) =>
+              assertSessionManagementAccess({ auth, workspace, manager, sessionId: targetId })
+            )
+        );
+      try {
+        await expect(run()).rejects.toMatchObject({
+          code: 'SESSION_MANAGEMENT_DENIED',
+          retryable: false,
+        });
+        expect((await repo.getDocMeta(getSessionRoomId(id)))?.meta).toEqual(meta);
+        canEdit = true;
+        await run();
+        const entry = await repo.getDocMeta(getSessionRoomId(id));
+        if (operation === 'delete') expect(isLoroRepoDocDeleted(entry)).toBe(true);
+        else expect(entry?.meta.isArchived).toBe(operation === 'archive');
+      } finally {
+        await repo.destroy();
+      }
+    }
+  );
 
   it.each(['archive', 'restore', 'delete'] as const)(
     'synchronizes the %s snapshot and changes only the selected containment tree',
@@ -1598,7 +1253,12 @@ describe('session command helpers', () => {
             cleaned.push(id);
           },
         } as unknown as Parameters<typeof runSessionOperationWithSyncedMetadata>[0];
-        const result = runSessionOperationWithSyncedMetadata(manager, root.id, operation);
+        const result = runSessionOperationWithSyncedMetadata(
+          manager,
+          root.id,
+          operation,
+          async () => {}
+        );
         const rejected = expect(result).rejects.toThrow('metadata unavailable');
         await started.promise;
         expect((await repo.getDocMeta(getSessionRoomId(root.id)))?.meta).toEqual(root);
@@ -1608,7 +1268,7 @@ describe('session command helpers', () => {
         expect(cleaned).toEqual([]);
         failSync = false;
         await expect(
-          runSessionOperationWithSyncedMetadata(manager, root.id, operation)
+          runSessionOperationWithSyncedMetadata(manager, root.id, operation, async () => {})
         ).resolves.toEqual([child.id]);
         for (const session of [root, child]) {
           const entry = await repo.getDocMeta(getSessionRoomId(session.id));
@@ -1647,13 +1307,13 @@ describe('session command helpers', () => {
         } as unknown as Parameters<typeof runSessionOperationWithSyncedMetadata>[0];
         const listDoc = vi.spyOn(repo, 'listDoc').mockRejectedValueOnce(new Error('query failed'));
         await expect(
-          runSessionOperationWithSyncedMetadata(manager, root.id, operation)
+          runSessionOperationWithSyncedMetadata(manager, root.id, operation, async () => {})
         ).rejects.toThrow('query failed');
         expect((await repo.getDocMeta(getSessionRoomId(root.id)))?.meta).toEqual(root);
         listDoc.mockRestore();
         await repo.deleteDoc(getSessionRoomId(root.id));
         await expect(
-          runSessionOperationWithSyncedMetadata(manager, root.id, operation)
+          runSessionOperationWithSyncedMetadata(manager, root.id, operation, async () => {})
         ).rejects.toThrow('Session metadata missing');
         expect(isLoroRepoDocDeleted(await repo.getDocMeta(getSessionRoomId(root.id)))).toBe(true);
       } finally {
@@ -1681,12 +1341,12 @@ describe('session command helpers', () => {
       } as unknown as Parameters<typeof runSessionOperationWithSyncedMetadata>[0];
       const deleteDoc = vi.spyOn(repo, 'deleteDoc').mockRejectedValueOnce(new Error('disk full'));
       await expect(
-        runSessionOperationWithSyncedMetadata(manager, root.id, 'delete')
+        runSessionOperationWithSyncedMetadata(manager, root.id, 'delete', async () => {})
       ).rejects.toThrow('disk full');
       for (const session of [root, child])
         expect((await repo.getDocMeta(getSessionRoomId(session.id)))?.meta).toEqual(session);
       deleteDoc.mockRestore();
-      await runSessionOperationWithSyncedMetadata(manager, root.id, 'delete');
+      await runSessionOperationWithSyncedMetadata(manager, root.id, 'delete', async () => {});
       for (const session of [root, child])
         expect(isLoroRepoDocDeleted(await repo.getDocMeta(getSessionRoomId(session.id)))).toBe(
           true
@@ -1694,19 +1354,6 @@ describe('session command helpers', () => {
     } finally {
       await repo.destroy();
     }
-  });
-
-  it('matches local project selectors against normalized paths', () => {
-    const project = {
-      id: 'local-project-1',
-      name: 'lody',
-      rootPath: localProjectsLegacy.normalizeLocalProjectRootPath(process.cwd()),
-    };
-
-    expect(selectLocalProjectsBySelector([project], '.')).toEqual([project]);
-    expect(selectLocalProjectsBySelector([project], `${process.cwd()}${path.sep}`)).toEqual([
-      project,
-    ]);
   });
 
   it('filters local project candidates to authorized project ids before selection', () => {
@@ -1964,15 +1611,6 @@ describe('session command helpers', () => {
     ).toEqual({ githubRepoFullName: 'loro-dev/lody' });
   });
 
-  it('preserves the remote repository identity spelling', () => {
-    expect(
-      resolveLocalProjectCreateGitContext({
-        gitState: createLocalProjectGitState({ githubRepoFullName: 'Loro-Dev/Lody' }),
-        useWorktree: true,
-      })
-    ).toEqual({ branch: 'main', githubRepoFullName: 'Loro-Dev/Lody' });
-  });
-
   it('keeps a non-GitHub local origin without a GitHub identity', () => {
     expect(
       resolveLocalProjectCreateGitContext({
@@ -2003,32 +1641,6 @@ describe('session command helpers', () => {
         requestedBranch: 'feature/missing',
       })
     ).toThrow('Local project branch not found: feature/missing');
-  });
-
-  it('keeps the non-git local project rules while resolving identity', () => {
-    expect(
-      resolveLocalProjectCreateGitContext({
-        gitState: { git: false },
-      })
-    ).toEqual({});
-    expect(() =>
-      resolveLocalProjectCreateGitContext({
-        gitState: { git: false },
-        useWorktree: true,
-      })
-    ).toThrow(/--worktree/);
-    expect(() =>
-      resolveLocalProjectCreateGitContext({
-        gitState: { git: false },
-        requestedBranch: 'main',
-      })
-    ).toThrow(/not a git repository/);
-    expect(() =>
-      resolveLocalProjectCreateGitContext({
-        gitState: createLocalProjectGitState({ branches: [], currentBranch: null }),
-        useWorktree: true,
-      })
-    ).toThrow(/does not have a branch to use as a worktree base/);
   });
 
   it('downgrades session activity timestamp write failures to warnings', async () => {
@@ -2182,55 +1794,6 @@ describe('session command helpers', () => {
         text: 'Second paragraph',
       },
     ]);
-  });
-
-  it('selects the most recent transcript entries and supports reverse order', () => {
-    const entries = [
-      { index: 0, id: 'a', role: 'user', timestamp: 't0', text: 'a' },
-      { index: 1, id: 'b', role: 'assistant', timestamp: 't1', text: 'b' },
-      { index: 2, id: 'c', role: 'user', timestamp: 't2', text: 'c' },
-      { index: 3, id: 'd', role: 'assistant', timestamp: 't3', text: 'd' },
-    ] as const;
-
-    expect(selectSessionTranscriptEntries([...entries], { limit: 2 })).toEqual([
-      entries[2],
-      entries[3],
-    ]);
-    expect(selectSessionTranscriptEntries([...entries], { limit: 2, reverse: true })).toEqual([
-      entries[3],
-      entries[2],
-    ]);
-    expect(selectSessionTranscriptEntries([...entries], { all: true, reverse: true })).toEqual([
-      entries[3],
-      entries[2],
-      entries[1],
-      entries[0],
-    ]);
-  });
-
-  it('renders transcript entries as readable blocks', () => {
-    expect(
-      renderSessionTranscript([
-        {
-          index: 0,
-          id: 'entry-1',
-          role: 'user',
-          timestamp: '2026-03-12T00:00:00.000Z',
-          text: 'hello',
-        },
-        {
-          index: 1,
-          id: 'entry-2',
-          role: 'assistant',
-          timestamp: '2026-03-12T00:00:01.000Z',
-          text: 'world',
-        },
-      ])
-    ).toBe(
-      '[user] 2026-03-12T00:00:00.000Z entry-1\nhello\n\n[assistant] 2026-03-12T00:00:01.000Z entry-2\nworld'
-    );
-
-    expect(renderSessionTranscript([])).toBe('No visible history found.');
   });
 
   it('renders the visible assistant completion for human --wait output', () => {
@@ -2449,13 +2012,6 @@ describe('MCP selection at turn authoring', () => {
       await repo.destroy();
     }
   });
-
-  it('accepts CLI empty selection and rejects malformed selection inputs', () => {
-    expect(parseCliMcpServerIds('[]')).toEqual([]);
-    expect(parseCliMcpServerIds('["a", " a ", "b"]')).toEqual(['a', 'b']);
-    for (const value of ['{}', '[1]', '[""]', 'null'])
-      expect(() => parseCliMcpServerIds(value)).toThrow();
-  });
 });
 
 describe('target Machine availability from presence', () => {
@@ -2471,8 +2027,9 @@ describe('target Machine availability from presence', () => {
     workspaceId: 'workspace-1' as WorkspaceId,
     machineId: 'target-machine' as MachineId,
   };
-  const presence = (online: MachineId[] | null) => ({
-    getOnlineMachineIds: async () => (online === null ? null : new Set(online)),
+  // `null` is a presence room that is not joined and holds no fresh heartbeat.
+  const presence = (online: MachineId[] | null, synced = online !== null) => ({
+    getMachinePresenceView: async () => ({ online: new Set(online ?? []), synced }),
   });
   // A Streams path slow enough that every one-shot Machine RPC times out.
   const rpcTimesOut = () =>
@@ -2508,7 +2065,17 @@ describe('target Machine availability from presence', () => {
     });
   });
 
-  it('reports a presence-online Machine as online but stale when live status RPC times out', async () => {
+  it('admits a fresh heartbeat as online while the presence room is not joined', async () => {
+    rpcTimesOut();
+    await expect(
+      ensureTargetMachineNotOffline({
+        ...target,
+        manager: presence([target.machineId], false),
+      })
+    ).resolves.toBe('online');
+  });
+
+  it('keeps presence three-state when live status RPC times out', async () => {
     rpcTimesOut();
     const online = await readSessionLiveStatusesMany({
       ...target,
@@ -2517,17 +2084,18 @@ describe('target Machine availability from presence', () => {
     });
     expect(online.get(sessionId)).toEqual({
       sessionId,
-      machineOnline: true,
+      machinePresence: 'online',
       fresh: false,
       reason: 'timeout: Machine status request timed out',
     });
 
+    // An unanswered RPC is no evidence of absence: unknown presence stays unknown.
     const unknown = await readSessionLiveStatusesMany({
       ...target,
       sessions,
       manager: presence(null),
     });
-    expect(unknown.get(sessionId)?.machineOnline).toBe(false);
+    expect(unknown.get(sessionId)?.machinePresence).toBe('unknown');
 
     const offline = await readSessionLiveStatusesMany({
       ...target,
@@ -2536,10 +2104,53 @@ describe('target Machine availability from presence', () => {
     });
     expect(offline.get(sessionId)).toEqual({
       sessionId,
-      machineOnline: false,
+      machinePresence: 'offline',
       fresh: false,
       reason: 'Target Machine is offline: target-machine',
     });
+  });
+
+  it('asks only daemons advertising sessionLiveActivity for activity', async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(commandRuntime, 'withMachineRpcClient').mockImplementation(async (_args, run) =>
+      run({
+        requestSessionLiveStatus: async (options: Record<string, unknown>) => {
+          requests.push(options);
+          return {
+            type: 'session/live-status_response',
+            machineId: target.machineId,
+            sessionId,
+            success: true,
+            state: 'running',
+            observedAtMs: 1,
+            ...(options.includeActivity
+              ? { activity: { currentAction: 'shell: flock heavy.lock', queuedInputs: 2 } }
+              : {}),
+          };
+        },
+      } as never)
+    );
+    const read = (capabilities: Record<string, number> | undefined) =>
+      readSessionLiveStatusesMany({
+        ...target,
+        sessions,
+        manager: {
+          ...presence([target.machineId]),
+          repo: {
+            getDocMeta: async () =>
+              capabilities ? { meta: { protocolCapabilities: capabilities } } : undefined,
+          } as never,
+        },
+      });
+
+    // An older daemon rejects the unknown request field, so it is never sent.
+    expect((await read(undefined)).get(sessionId)).not.toHaveProperty('activity');
+    expect(requests[0]).not.toHaveProperty('includeActivity');
+
+    expect((await read({ sessionLiveActivity: 1 })).get(sessionId)).toMatchObject({
+      activity: { currentAction: 'shell: flock heavy.lock', queuedInputs: 2 },
+    });
+    expect(requests[1]).toMatchObject({ includeActivity: true });
   });
 });
 
@@ -2683,6 +2294,14 @@ describe('prepared command attachment inputs', () => {
       appendUserPromptHistory({ ...args, inputBlocks: [{ ...file, fileId: 'other-file' }] })
     ).rejects.toThrow('already used');
     expect(writer.readStored()).toHaveLength(1);
+    doc
+      .getList('history')
+      .push({ ...first, items: [{ type: 'text', text: 'later duplicate' }] } as never);
+    doc.commit();
+    expect(await appendUserPromptHistory(args)).toEqual({ ...first, existingStatus: 'pending' });
+    expect(writer.readStored()[0]?.items).toEqual([file]);
+    expect(writer.readStored()[1]?.items).toEqual([{ type: 'text', text: 'later duplicate' }]);
+    expect(writer.readStored()).toHaveLength(2);
   });
 
   it('prepares an attachment-only first turn and rejects an empty message before publication', async () => {
@@ -2883,100 +2502,6 @@ describe('Machine Flock freshness fallback validation', () => {
     ).rejects.toThrow('Missing local project selector');
   });
 
-  it('preserves explicit permanent failures through typed reports and wrapper causes', () => {
-    const transient = new RepoTransportError('Synthetic network failure', {
-      code: 'network',
-      phase: 'sync',
-      retryable: true,
-    });
-    const permanent = new RepoTransportError('Synthetic local CRDT failure', {
-      code: 'internal',
-      phase: 'sync',
-      retryable: false,
-    });
-    const report = new RepoSyncError({
-      ok: false,
-      outcome: 'failed',
-      transports: [
-        {
-          transportId: 'streams',
-          ok: false,
-          failures: [
-            { kind: 'flock', error: transient },
-            { kind: 'flock', error: permanent },
-          ],
-        },
-      ],
-    });
-    const wrapper = new Error('Synthetic freshness wrapper', { cause: report });
-    const result = new MachineFlockReadUnavailableError({
-      message: 'Missing cached capability',
-      cause: wrapper,
-    }).toLodyError();
-    expect(result).toMatchObject({ code: 'SYNC_UNAVAILABLE', retryable: false });
-    expect(
-      new MachineFlockReadUnavailableError({
-        message: 'Missing cached capability',
-        cause: transient,
-      }).toLodyError()
-    ).toMatchObject({ code: 'SYNC_UNAVAILABLE', retryable: true });
-    const optimisticWrapper = new RepoTransportError('Synthetic wrapper', {
-      code: 'internal',
-      phase: 'sync',
-      retryable: true,
-      cause: permanent,
-    });
-    expect(
-      new MachineFlockReadUnavailableError({
-        message: 'Missing cached capability',
-        cause: optimisticWrapper,
-      }).toLodyError().retryable
-    ).toBe(false);
-  });
-
-  it('retains retryability when a report repeats the same transient failure object', () => {
-    const failure = new RepoTransportError('Synthetic network failure', {
-      code: 'network',
-      phase: 'sync',
-      retryable: true,
-    });
-    const cause = new AggregateError([failure, failure]);
-    expect(
-      new MachineFlockReadUnavailableError({
-        message: 'Missing cached capability',
-        cause,
-      }).toLodyError()
-    ).toMatchObject({ code: 'SYNC_UNAVAILABLE', retryable: true });
-  });
-
-  it.each(['no-route', 'transport-changed'] as const)(
-    'classifies an unconfirmed %s route without inventing a transport failure code',
-    (reason) => {
-      const unavailable = new FlockSyncUnavailableError({
-        message: 'Synthetic unconfirmed route',
-        reason,
-      });
-      const classify = (cause: unknown) =>
-        new MachineFlockReadUnavailableError({
-          message: 'Missing cached capability',
-          cause,
-        }).toLodyError();
-      expect(classify(new Error('Synthetic wrapper', { cause: unavailable }))).toMatchObject({
-        code: 'SYNC_UNAVAILABLE',
-        retryable: true,
-      });
-      const permanent = new RepoTransportError('Synthetic permanent failure', {
-        code: 'unauthorized',
-        phase: 'sync',
-        retryable: false,
-      });
-      expect(classify(new AggregateError([unavailable, permanent])).retryable).toBe(false);
-      expect(classify(new AggregateError([unavailable, new Error('Unknown')])).retryable).toBe(
-        false
-      );
-    }
-  );
-
   it('retains readable Pi override caches when a reader has no launch-source context', async () => {
     const capability = {
       ...createAcpCapability(),
@@ -3005,23 +2530,6 @@ describe('Machine Flock freshness fallback validation', () => {
     expect(failure.message).not.toContain('x'.repeat(121));
     expect(failure.message).not.toContain('private');
     expect(failure.message).not.toContain('credentials');
-  });
-
-  it('does not guess retryability from unknown errors or cyclic causes', () => {
-    const error = new Error('Synthetic unknown failure');
-    error.cause = error;
-    expect(
-      new MachineFlockReadUnavailableError({
-        message: 'Missing cached capability',
-        cause: error,
-      }).toLodyError()
-    ).toMatchObject({ code: 'SYNC_UNAVAILABLE', retryable: false });
-    expect(
-      new MachineFlockReadUnavailableError({
-        message: 'Missing cached capability',
-        cause: deadline(),
-      }).toLodyError()
-    ).toMatchObject({ code: 'SYNC_UNAVAILABLE', retryable: true });
   });
 });
 
@@ -3127,6 +2635,139 @@ describe('session command output boundary', () => {
       setup.mockRestore();
       flush.mockRestore();
       vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('encrypted one-shot machine access', () => {
+  it('answers from the command replica', async () => {
+    const asked: unknown[] = [];
+    const result = await runWithEncryptedCommandAccess(
+      async (target) => {
+        asked.push(target);
+        return { allowed: false, reason: 'not_visible' };
+      },
+      () =>
+        readSessionMachineAccess({
+          // A service call with this token would reject before any answer.
+          auth: { token: '', userId: 'machine-account', machineId: 'machine' } as never,
+          workspaceId: 'workspace' as never,
+          machineId: 'other-machine' as never,
+        })
+    );
+    expect(result).toEqual({ allowed: false, reason: 'not_visible' });
+    expect(asked).toEqual([{ machineId: 'other-machine', requesterUserId: 'machine-account' }]);
+  });
+});
+
+describe('encrypted daemon machine access', () => {
+  const access = (delegated: boolean) => {
+    const asked: unknown[] = [];
+    const daemon = {
+      workspaceId: 'workspace',
+      userId: 'machine-account',
+      machineId: 'machine',
+      manager: {},
+      readInvocation: () => ({ active: false }),
+      checkEncryptedMachineAccess: async (target: unknown) => {
+        asked.push(target);
+        return { allowed: true as const };
+      },
+    } as never;
+    const result = runWithDaemonWorkspace(daemon, () =>
+      readSessionMachineAccess({
+        // A service call with this token would reject before any answer.
+        auth: { token: '', userId: 'machine-account', machineId: 'machine' } as never,
+        workspaceId: 'workspace' as never,
+        machineId: 'other-machine' as never,
+        ...(delegated
+          ? {
+              delegatedRequester: {
+                userId: 'e2ee-member:verified',
+                author: { sessionId: 'session', turnId: 'turn' },
+              } as never,
+            }
+          : {}),
+        localProjectId: 'project' as never,
+      })
+    );
+    return { asked, result };
+  };
+
+  it.each([
+    ['a command', false, 'machine-account'],
+    ['a delegated command', true, 'e2ee-member:verified'],
+  ] as const)('answers %s from the daemon', async (_name, delegated, requesterUserId) => {
+    const { asked, result } = access(delegated);
+    await expect(result).resolves.toEqual({ allowed: true });
+    expect(asked).toEqual([
+      { machineId: 'other-machine', requesterUserId, localProjectId: 'project' },
+    ]);
+  });
+});
+
+describe('paired machine billing entitlement while offline', () => {
+  it('waits once, fails open without asking again for 30 seconds, then retries and caches', async () => {
+    const { createCloudE2eeMachinePort } = await import('@/lib/cloud-cli-port');
+    const { getWorkspaceBillingEntitlementBestEffort } = await import('./session');
+    const { evaluateSessionCreateQuota } = await import('@lody/shared');
+    type Client = NonNullable<Parameters<typeof createCloudE2eeMachinePort>[0]['client']>;
+    vi.stubEnv('LODY_PLATFORM', 'cloud');
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let online = false;
+    let subscriptions = 0;
+    const client: Client = {
+      onUpdate: ((_ref: unknown, _args: unknown, listener: (value: unknown) => void) => {
+        subscriptions += 1;
+        // Offline: the subscription never answers. Online: it answers at once.
+        if (online) listener({ valid: true, effectivePlanTier: 'free', checkoutPending: false });
+        return () => {};
+      }) as unknown as Client['onUpdate'],
+      query: (() => new Promise(() => {})) as Client['query'],
+      close: async () => {},
+    };
+    const workspaceId = 'offline-billing-workspace';
+    const port = createCloudE2eeMachinePort({
+      accountId: 'synthetic-machine-owner',
+      workspaceId,
+      genesisHash: 'ab'.repeat(32),
+      machineId: 'machine',
+      credential: 'a4'.repeat(32),
+      authBaseUrl: 'https://synthetic.convex.cloud',
+      serverBaseUrl: 'https://relay.synthetic.test',
+      logger: getLogger('session'),
+      client,
+    });
+    const manager = { cloudBilling: port.billing } as unknown as Parameters<
+      typeof getWorkspaceBillingEntitlementBestEffort
+    >[0];
+    const workspace = { id: workspaceId, name: 'Offline', slug: null, role: 'member' };
+    const read = () => getWorkspaceBillingEntitlementBestEffort(manager, workspace);
+    try {
+      // The first command waits for the read deadline, then fails open.
+      const first = read();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(first).resolves.toBeNull();
+      expect(subscriptions).toBe(1);
+      // Within 30 seconds the next command fails open at once, with no new read.
+      await vi.advanceTimersByTimeAsync(29_000);
+      await expect(read()).resolves.toBeNull();
+      expect(subscriptions).toBe(1);
+      // After 30 seconds the plan is read again; the connection is back.
+      online = true;
+      await vi.advanceTimersByTimeAsync(1_000);
+      const free = await read();
+      expect(subscriptions).toBe(2);
+      expect(free).toEqual({ effectivePlanTier: 'free', checkoutPending: false });
+      if (!free) throw new Error('expected a Free plan');
+      expect(evaluateSessionCreateQuota({ ...free, sessionCount: 199 }).allowed).toBe(true);
+      expect(evaluateSessionCreateQuota({ ...free, sessionCount: 200 }).allowed).toBe(false);
+      // A successful read is cached normally again.
+      await expect(read()).resolves.toEqual(free);
+      expect(subscriptions).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
     }
   });
 });

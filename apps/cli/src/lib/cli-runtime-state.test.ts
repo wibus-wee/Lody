@@ -1,76 +1,32 @@
 import { describe, expect, it } from 'vitest';
-import type { CliRuntimeWorkspace } from '@lody/shared';
+import { CliRuntimeStateSchema } from '@lody/shared/electron-ipc';
 import { CliRuntimeStateReporter } from './cli-runtime-state';
 
-function workspace(
-  backendConnection: CliRuntimeWorkspace['backendConnection']
-): CliRuntimeWorkspace {
-  return {
-    id: 'workspace-1',
-    name: 'Alpha',
-    slug: 'alpha',
-    role: 'owner',
-    backendConnection,
-  };
-}
+describe('CLI runtime state: encrypted outage windows', () => {
+  it('publishes the window ends the desktop shows, and drops them once access is confirmed', () => {
+    let now = 1_000;
+    const reporter = new CliRuntimeStateReporter({ pid: 7, now: () => now });
+    expect(reporter.snapshot().e2eeAccessWindows).toBeUndefined();
 
-describe('CliRuntimeStateReporter connection age', () => {
-  it('preserves one backend outage across connecting and disconnected states', () => {
-    let nowMs = 1_000;
-    const reporter = new CliRuntimeStateReporter({ now: () => nowMs });
-
-    expect(reporter.snapshot().connectionAges?.backendNotConnectedSinceMs).toBe(1_000);
-
-    nowMs = 5_000;
-    reporter.setBackendConnection('disconnected');
-    expect(reporter.snapshot().connectionAges?.backendNotConnectedSinceMs).toBe(1_000);
-
-    nowMs = 9_000;
-    reporter.setBackendConnection('connecting');
-    expect(reporter.snapshot().connectionAges?.backendNotConnectedSinceMs).toBe(1_000);
-
-    reporter.setBackendConnection('connected');
-    expect(reporter.snapshot().connectionAges?.backendNotConnectedSinceMs).toBeUndefined();
-
-    nowMs = 12_000;
-    reporter.setBackendConnection('disconnected');
-    expect(reporter.snapshot().connectionAges?.backendNotConnectedSinceMs).toBe(12_000);
-  });
-
-  it('tracks each workspace outage independently and resets it on connection', () => {
-    let nowMs = 1_000;
-    const reporter = new CliRuntimeStateReporter({ now: () => nowMs });
-
-    reporter.setConnectedWorkspaces([workspace('disconnected')]);
-    expect(reporter.snapshot().connectionAges?.workspaceNotConnectedSinceMs?.['workspace-1']).toBe(
-      1_000
-    );
-
-    nowMs = 5_000;
-    reporter.setConnectedWorkspaces([workspace('reconnecting')]);
-    expect(reporter.snapshot().connectionAges?.workspaceNotConnectedSinceMs?.['workspace-1']).toBe(
-      1_000
-    );
-
-    reporter.setConnectedWorkspaces([workspace('connected')]);
-    expect(
-      reporter.snapshot().connectionAges?.workspaceNotConnectedSinceMs?.['workspace-1']
-    ).toBeUndefined();
-
-    nowMs = 12_000;
-    reporter.setConnectedWorkspaces([workspace('reconnecting')]);
-    expect(reporter.snapshot().connectionAges?.workspaceNotConnectedSinceMs?.['workspace-1']).toBe(
-      12_000
-    );
-  });
-
-  it('omits cloud connection ages when the platform has no backend', () => {
-    const reporter = new CliRuntimeStateReporter({
-      now: () => 1_000,
-      trackBackendConnectionAge: false,
+    reporter.setE2eeAccessWindow('workspace-a', {
+      executionUntilMs: 4 * 3_600_000,
+      readUntilMs: 24 * 3_600_000,
+    });
+    now = 2_000;
+    const relying = reporter.snapshot();
+    // The desktop parses this snapshot with the shared schema before reading the window.
+    expect(CliRuntimeStateSchema.parse(relying).e2eeAccessWindows).toEqual({
+      'workspace-a': { executionUntilMs: 4 * 3_600_000, readUntilMs: 24 * 3_600_000 },
     });
 
-    reporter.setConnectedWorkspaces([workspace('disconnected')]);
-    expect(reporter.snapshot().connectionAges).toBeUndefined();
+    // The same window again is not a change.
+    reporter.setE2eeAccessWindow('workspace-a', {
+      executionUntilMs: 4 * 3_600_000,
+      readUntilMs: 24 * 3_600_000,
+    });
+    expect(reporter.snapshot().updatedAtMs).toBe(relying.updatedAtMs);
+
+    reporter.setE2eeAccessWindow('workspace-a', undefined);
+    expect(reporter.snapshot().e2eeAccessWindows).toBeUndefined();
   });
 });

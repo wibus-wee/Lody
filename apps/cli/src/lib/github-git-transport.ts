@@ -1,3 +1,4 @@
+import { getCliNodeExecutable } from '@/lib/managed-daemon-release';
 import path from 'node:path';
 import {
   accessSync,
@@ -10,6 +11,7 @@ import {
   linkSync,
   copyFileSync,
   lstatSync,
+  unlinkSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { writeIfChanged } from './shell-file-utils';
@@ -263,6 +265,29 @@ main().catch(error => { diagnostic('git', 'failed', error); process.exitCode = 1
       continue;
     const target = path.join(directory, name);
     if (existsSync(target)) continue;
+    // existsSync follows links and also returns false on access errors. Only
+    // remove a cached link when stat confirms that its target is missing.
+    try {
+      if (lstatSync(target).isSymbolicLink()) {
+        try {
+          statSync(target);
+          continue;
+        } catch (error) {
+          if (
+            !(
+              error instanceof Error &&
+              'code' in error &&
+              (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+            )
+          ) {
+            throw error;
+          }
+        }
+        unlinkSync(target);
+      }
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    }
     const original = path.join(execPath, name);
     try {
       symlinkSync(original, target);
@@ -311,7 +336,7 @@ child.on('exit', (code, signal) => { if (signal) process.kill(process.pid, signa
   if (process.platform === 'win32') {
     writeIfChanged(
       path.join(directory, 'git.cmd'),
-      `@echo off\r\n"${process.execPath}" "%~dp0git" %*\r\n`
+      `@echo off\r\n"${getCliNodeExecutable()}" "%~dp0git" %*\r\n`
     );
   }
   // Written last: a marker exists only for a fully materialized transport.

@@ -1,10 +1,10 @@
+import cloudConfig from './electron.cloud.config'
 import { execSync } from 'node:child_process'
 import fs from 'node:fs'
 import { resolve } from 'node:path'
 import { defineConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import wasm from 'vite-plugin-wasm'
-import tailwindcss from '@tailwindcss/vite'
 import stylex from '@stylexjs/unplugin'
 import {
   loroCrdtBundlerAlias,
@@ -15,7 +15,7 @@ import {
   isMermaidRuntimeDependency,
   rendererBundleAliases
 } from '../../packages/components/vite-renderer-bundle-aliases'
-import { stylexOptions } from '../../packages/ui/stylex-options'
+import { componentsStylexOptions } from '../../packages/components/stylex-options'
 import { emojibaseAssetsPlugin } from '../../packages/components/vite-emojibase-assets'
 import { bootShellPlugin } from '../../packages/components/vite-boot-shell'
 import { preservePdfWorkerExports } from '../../packages/components/vite-pdf-worker'
@@ -66,7 +66,12 @@ function buildViteEnvDefine(env: Record<string, string>): Record<string, string>
   return define
 }
 
-export default defineConfig(({ mode }) => {
+export default defineConfig((context) => {
+  const platform = process.env.VITE_LODY_PLATFORM?.trim() || 'local'
+  if (!['local', 'cloud'].includes(platform))
+    throw new Error(`Unsupported VITE_LODY_PLATFORM: ${platform}`)
+  if (platform === 'cloud') return cloudConfig(context)
+  const { mode } = context
   const buildMode = mode || OSS_BUILD_MODE
   if (buildMode !== OSS_BUILD_MODE) {
     throw new Error(`The public Electron workspace only supports --mode ${OSS_BUILD_MODE}`)
@@ -85,7 +90,7 @@ export default defineConfig(({ mode }) => {
     main: {
       envDir: false,
       envPrefix: '__LodyPublicBuildOnlyPrefix__',
-      define: viteEnvDefine,
+      define: { ...viteEnvDefine, __LODY_E2E_CLOCK_BUILD__: 'false' },
       build: {
         lib: {
           entry: {
@@ -164,14 +169,13 @@ export default defineConfig(({ mode }) => {
         cssMinify: true,
         sourcemap: false,
         rollupOptions: {
-          // Build both the main app (`index.html`) and the standalone recovery
-          // page (`recovery.html`). The recovery page is loaded by the main
-          // process when the main renderer fails (did-fail-load,
-          // render-process-gone, preload-error) so it cannot share a bundle
-          // with code paths that might themselves crash on boot.
+          // The recovery page is independent of the main renderer so it can
+          // load after a crash. PR images use a separate sandboxed document to
+          // avoid relaxing the main renderer's image policy.
           input: {
             index: resolve(__dirname, 'src/renderer/index.html'),
             devbar: resolve(__dirname, 'src/renderer/devbar.html'),
+            prImage: resolve(__dirname, 'src/renderer/pr-image.html'),
             recovery: resolve(__dirname, 'src/renderer/recovery.html')
           },
           output: {
@@ -188,10 +192,8 @@ export default defineConfig(({ mode }) => {
           }
         }
       },
-      // Tailwind via Vite plugin so @fontsource url() assets are emitted by Vite.
       plugins: [
-        tailwindcss(),
-        stylex.vite(stylexOptions),
+        stylex.vite(componentsStylexOptions),
         loroCrdtWasmUrlWorkaround(),
         react(),
         wasm(),

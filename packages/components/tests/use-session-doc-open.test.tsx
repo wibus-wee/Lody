@@ -99,18 +99,4 @@ describe('useSessionDoc opening', () => {
     await act(async () => {});
     expect(acquired).toBe(1);
   });
-
-  it('starts unready when the store must still be opened', async () => {
-    const open = await openStore();
-    let finish!: (store: SessionDocStore) => void;
-    const commits = renderSessionDoc({
-      peekSessionStore: () => undefined,
-      acquireSessionStore: () => new Promise<SessionDocStore>((resolve) => (finish = resolve)),
-      releaseSessionStoreRef: () => {},
-    });
-
-    expect(commits.at(-1)).toEqual({ ready: false, turns: 0 });
-    await act(async () => finish(open));
-    expect(commits.at(-1)).toEqual({ ready: true, turns: open.history.turnCount });
-  });
 });

@@ -6,6 +6,7 @@ import {
   type MessageTextSpanKind,
 } from '@lody/shared';
 import { normalizeSessionLinksForExport } from '@lody/shared/session-link-export';
+import { restoreMessageQuoteDrafts, type PastedTextDraft } from '@/lib/pasted-text-draft';
 
 export const USER_TEXT_RENDER_LINE_LIMIT = 10;
 export const USER_TEXT_RENDER_CHAR_LIMIT = 900;
@@ -96,12 +97,38 @@ export const getTextContentFromMessageItems = (items: MessageContent[]): string 
     .filter((text) => text.trim().length > 0)
     .join('\n\n');
 
+export function getMessageQuoteEditDraft(items: MessageContent[]): {
+  text: string;
+  drafts: PastedTextDraft[];
+} {
+  let text = '';
+  const drafts: PastedTextDraft[] = [];
+  for (const item of items) {
+    const value = getCopyableItemText(item);
+    if (!value.trim()) continue;
+    if (text) text += '\n\n';
+    const restored = restoreMessageQuoteDrafts(
+      value,
+      item.type === 'text' ? item.spans : undefined
+    );
+    drafts.push(
+      ...restored.drafts.map((draft) => ({
+        ...draft,
+        start: draft.start + text.length,
+        end: draft.end + text.length,
+      }))
+    );
+    text += restored.text;
+  }
+  return { text, drafts };
+}
+
 /**
  * Span kinds that are copied as what the user wrote, not as what the agent read.
  *
- * Only `agent_role`. Its rewritten region is an instruction addressed to the
- * agent ("use lody mcp to create a session with agent role[...]") that means
- * nothing outside this conversation, while the chip on screen says `@Reviewer` —
+ * Only `agent_role`. Its rewritten region is a reference addressed to the
+ * agent ("[Agent Role: … (agentRoleId: …)]") that means nothing outside this
+ * conversation, while the chip on screen says `@Reviewer` —
  * so copying the bubble has to produce the latter.
  *
  * The other kinds stay expanded on purpose: a pasted-text span IS the content
@@ -248,19 +275,3 @@ const sliceUserTextRun = (
   }
   return { text, isTruncated: false, lineBreaks };
 };
-
-export const getVisibleAssistantTextContent = (
-  items: MessageContent[],
-  isTurnFinished: boolean
-): string =>
-  getTextContentFromMessageItems(
-    items.filter(
-      (content, index) =>
-        !shouldCollapseAssistantMessageItem({
-          content,
-          index,
-          items,
-          isTurnFinished,
-        })
-    )
-  );

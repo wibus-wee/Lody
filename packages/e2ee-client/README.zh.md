@@ -2,6 +2,16 @@
 
 [English](README.md)
 
+审批连续性：提供 `PersonalHostRemote.history` 的装配会在 claim 成功返回前，使用完整签名
+原件补齐审批快照之前的证明。公开账本页存入现有按身份和配对 session 绑定的审批证据库；
+每次重开都重新验签，并核对原快照的 head、数量和同位状态。审批原件、快照字节和 offset、
+feed 与回滚 pin 均不改变。旧快照安装首次接入该能力时需要联网补证一次，之后可用保存的
+证明离线重开。坏证明不保存，也不触发重置。未提供此可选能力的 host 保留既有快照合同。
+runtime 导出合并已保存的审批原件和本地后缀，每个绝对位置都对照 host 的真实 view 核验。
+保留状态序列化不含旧哈希，因此原件齐全时，页面在相同导出 head 和 state digest 下重放
+原件以恢复前缀证明；稀疏导出不虚构前缀。Reset history position 只清页面观察位置，既不
+补证，也不删除 host 的持久 pin。
+
 `@lody/e2ee-client` 是可选的平台中立产品组合，使用现有 `@lody/e2ee-core`。
 包内没有 Node、Electron、文件系统、SQLite、默认账号或云端地址。桌面消费共享的
 配对编解码、完整历史验证和有限收钥维护流程，保留既有原生存储与产品装配。
@@ -31,6 +41,12 @@
   悄悄当作本次操作，也不会重签未知提交。
 - `close()` 停止接纳，取消并等待操作，再释放密钥、credential 和数据库所有者。
   close/logout/清缓存不删除身份。组合不创建定时器、文档 Repo 或普通传输。
+
+## 封装 epoch
+
+新文档、Meta 和 Flock 的 seal 在 core 内部选择当前已验证 epoch。
+调用方的旧 epoch 只是提示；缺当前 key 时失败并等待重试，不生成新的旧 epoch 密文。
+已封装旧帧和历史读取保持有效；高于已验证账本的 epoch 提示必须等待追赶后重试。
 
 ## 有界退休
 
@@ -66,7 +82,7 @@ runtime open 仅取得控制 reader：只重开 ready 的既有身份，重验�
 真实 view。远端分页只能确认既有已验签 feed，不能另建信任缓存或直接推进游标。
 
 `PersonalHostPlatform.contentToken` 在已批准的 session 内接收完整绑定和设备 credential，
-产品只取得专用短期正文/附件 grant；拒绝 token、快照修复提示和 RPC-only 参数原样传递。
+产品只取得专用短期正文/附件 grant；拒绝 token 和 RPC-only 参数原样传递。
 RPC 方法只在真实原件 store 存在时出现。可选 machineSharing 在固定身份/scope、已验证
 账本源和 installed-key history 上构建 PersonalMachineSharing Layer；真实策略 owner 负责
 既有密码、持久原件、generation pin 和 freshness。缺失时不暴露两个共享方法，不用空
@@ -99,7 +115,9 @@ readerLeases: preallocated-v1 接受 open 第四个参数中的唯一调用标�
 `personalLedgerControl({ approval })` 通过注入的 `LedgerFeedStore`、
 `LedgerPinStore`、`SubmissionJournal`、`LedgerLog`、`LedgerFeedSource`、
 `WorkspaceScope` 组合持久 `LedgerFeed`。feed/pin 使用稳定数据库，提交槽按身份实例
-独立。刷新有界，验证每条后缀后才持久化位置，不 reset 或 rebase 损坏行。
+独立。刷新有界，验证每条后缀后才持久化位置。feed 同时获得独立 pin 和数据源，
+旧格式或损坏缓存仅在完整重放证明最高检查点后才能重建；身份、pin 和未决日志
+保持不变，重建缓存不授予准入。
 
 显式 `prepare(offer, true)` 准备受保护替换候选，旧指针保持 current。第二个未决候选
 会被拒绝。替换打开要求桌面重新批准的完整历史，以及成功的 pin/origin 验证；之后才
@@ -114,6 +132,66 @@ readerLeases: preallocated-v1 接受 open 第四个参数中的唯一调用标�
 仍允许 mailbox 接收。背书快照缺少发布原件时走 mailbox/history。core 保留并验证
 receive/report/distribution 原件；共享有限维护流程只确认已观察到的业务终态，也会确认另一阶段失败时成功的兄弟阶段。没有明文降级。
 
+管理换钥先检查本地是否已安装当前钥，再决定是否接收。暂存发布确认并安装后即可返回；
+mailbox 分发随后在现有 session 下执行，记录失败，不重新打开已关闭的 reader。
+自动配对若发现临时激活 reader 已关闭，会借用自己的 reader 检查和接收密钥，完成后只释放它。
+
+## 账号级配对流程
+
+新宿主使用一次批量账本追加、一次携带本地 outbox 信封的发布，以及一次带实时信箱预览的领取。
+成员身份的审批者仍须完整历史验证，但历史也批量读取。在账本稳定且历史只有一页时，
+1–64 个工作区的审批到当前密钥安装需要 3 次请求；需要完整历史时为 4 次。
+长历史、冲突与重试仍保留正常分页，可能需要更多请求。建议检查点相等只允许跳过刷新，不会推进本地 pin。
+已验证请求只在有界内存中缓存并检查过期；每次签名仍重新验证 MAC。
+内联准入原件必须匹配 MAC 认证的记录哈希及缓存中已验证的 genesis/成员，才可交给快照验收。
+KeyReceiver 仍验证每个预览信封并实际安装密钥。能力缺失、预览不可用或旧中继保留原来的读取和原件幂等投递。
+中继不会获得任何密钥材料。
+
+`@lody/e2ee-client/account-pairing` 是各宿主共用的账号级个人设备配对流程（[基础规范](../../specs/e2ee-foundations.zh.md#账号级个人设备配对owner-于-2026-11-01-批准)）。它负责标签和有效期检查、单次签名的接纳日志，以及本地终态。宿主需要提供四样东西：
+
+- `AccountPairingStore`，保存持久状态，其中不含任何密钥或私钥；
+- 中继；
+- 按工作区的端口；
+- 可选的 `diagnostics`。
+
+配对密钥只保存在内存里。桌面端使用 SQLite 存储，浏览器端的存储另行实现。身份保护方式由按工作区的端口决定，不在这个流程里决定。
+
+`@lody/e2ee-client/account-pairing/browser` 提供浏览器端的组件：
+
+- `makeIndexedDbAccountPairingStore` 为每个账号维护一个数据库。每次修改都要等事务完成后才返回；事务中止或超出存储配额时，状态不会前进。
+- `makeAccountPairingTabOwnership` 与 `withAccountPairingTabOwnership` 通过 Web Locks 保证同一时间只有一个标签页负责该账号的配对，因为配对密钥只保存在那个标签页的内存里。其他标签页会收到 `pairing-elsewhere`；标签页关闭后锁会自动释放。
+
+`@lody/e2ee-client/account-requester` 是便携宿主上新设备一侧的实现：
+
+- **`AccountPairingIdentityHost`** 是按工作区的宿主端口。它负责以下几件事：
+  - 根据已验证的 genesis 记录和成员身份，生成或复用该工作区的身份；
+  - 报告未完成的按工作区配对；
+  - 按给定的背书者安装快照邀请；
+  - 可选地从已验证的完整历史安装（`acceptAccountHistory`，用于 Member 批准、不带邀请的行）；
+  - 可选地激活工作区。
+- **`makePortableAccountPairingRequester`** 把这类宿主转换成共享流程需要的新设备端口：
+  - 它校验完整历史，并找出本账号唯一的成员身份。
+  - 安装时，批准标签认证了准入记录的账本哈希；它找到这条记录，把记录的签名者当作背书者。
+  - 遇到无关的待完成配对时，它报告 `pairing-journal-busy`，流程会把该工作区显示为 `blocked`。
+- **`makePortableAccountPairingApprover`** 是批准方一侧。在某个工作区有已打开、已接纳会话（`session.accountApproval`）的设备，可以在该工作区批准：
+  - 在本地签名个人 `AdmitDevice`，不走网络；
+  - 通过注入的账号认证 `appendRecord` 追加已记录的原件，并绑定新设备的凭据哈希，然后从已验证账本判定结果（已提交、已失效或尚未确定）；
+  - Owner 或 Admin 交付签名的快照邀请；Member 返回 `null`，批准行因此不带邀请，新设备改为验证完整历史；
+  - 给中继用的设备访问凭据只留在这个组装内部。
+- **`makeAccountE2eeRuntime`** 把账号级 `E2eeWorkspaceRuntime` 的调用分发到各工作区的运行时。它只暴露列出的方法，因此“按方法是否存在判断能力”的做法依然准确。
+
+身份保护方式由各宿主的平台决定（`PersonalHostPlatform.protection`）。
+
+## 恢复服务定位符
+
+`recoveryServiceLocator`（`./recovery-locator`）把产品站点 URL 规范化为各宿主写入恢复文件、并传给
+core 打开流程的 `serviceLocator`：即它的规范 origin，Lody Cloud 为 `https://lody.ai`，自托管为
+`SITE_URL` 的 origin。必须是 HTTPS，仅环回主机允许 HTTP。缺失或不可用的 URL 返回 `null`，宿主以
+`disabled` 拒绝恢复；后端部署 URL 或账号 ID 永远不是定位符。桌面端读取 `VITE_SITE_URL`，移动端读取
+`VITE_SITE_URL` 并默认 Lody Cloud，Web 传入自身站点 origin，因此同一份文件三端都能打开。core 以
+`locator-mismatch` 拒绝写着其他定位符的文件，宿主将其报告为 `e2ee_recovery_authentication`（文件不对的提示）。
+[Spec](../../specs/e2ee/recovery-vault.zh.md#恢复材料与密文)。
+
 ## 验证与限制
 
 `pnpm --filter @lody/e2ee-client test` 检查固定证明和 credential 边界。
@@ -124,3 +202,23 @@ receive/report/distribution 原件；共享有限维护流程只确认已观察�
 [已批准 custody Spec](../../specs/e2ee/client-custody.zh.md) 信任页面下发代码使用私钥。
 runtime 工厂是可选能力，其导出不启用任何产品组合。
 [所有权理由](../../.agents/notes/implemented/architecture/2026-10-16-e2ee-core-service-architecture.zh.md#个人设备产品组合)。
+
+## 保险库接纳
+
+host 的显式 `restoreRecovery` 命令先认证恢复包，再准备个人设备身份，核对钉住的
+创世与账号成员身份，沿用 R 接纳和持久原件。它重放签名历史，通过原有
+`InstalledEpochKeys` 承诺、保护与读回边界安装恢复出的不透明密钥。安装失败后沿用
+同一身份重试，不返回签名器、私钥、R 或 V。应用负责保险库会话、传输、账号守卫、
+入口 pin 和产品启用；恢复仍须显式选择，打开既有身份不会触发恢复。
+
+已获准的会话提供显式 `setupRecovery`：签名和已安装密钥留在会话内部，
+只有 core 的真实恢复测试通过才报告可恢复。`restoreRecovery` 可以接受原有
+offer，为仍有受保护设备身份、但工作区密钥丢失的设备补回密钥；包内安全信息
+仍须匹配，不替换设备身份。
+
+`personalRuntimeAccountRequester` 使用 runtime 原有 host 处理账号级配对，
+不会新建另一个所有者。平台可以通过可选的 `openBrowserUnlock` 提供隔离页面
+入口；此时共用配对页要求用户先确认这是自己的电脑，再创建请求。原有的其他
+设备批准入口仍保留，此回调不传递秘密。
+
+个人设备 session 的 `abandonEpoch(baseEpoch)` 调用同一 Owner 专属暂存发布流程；要求先声明能力 2，不依赖当前代钥。调用方负责证据展示与明确确认；原始记录重试和历史恢复沿用 core。

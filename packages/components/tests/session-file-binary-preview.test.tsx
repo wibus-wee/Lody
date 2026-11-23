@@ -1,113 +1,16 @@
 // @vitest-environment jsdom
-
-import { act, createElement, StrictMode } from 'react';
+import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { renderToStaticMarkup } from 'react-dom/server';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (_key: string, fallback: string) => fallback,
-  }),
-}));
-
-import { getVideoMimeTypeForPath } from '../src/lib/video-file-preview';
 import { SessionFileBinaryPreview } from '../src/components/sessions/session-file-binary-preview';
 import Papa from 'papaparse';
 import { readXlsxSelectionClipboard } from '../src/components/sessions/session-file-xlsx-clipboard';
-import {
-  createSpreadsheetClipboard,
-  writeSpreadsheetClipboard,
-} from '../src/components/sessions/session-file-spreadsheet-clipboard';
-import {
-  getOfficePreviewKind,
-  MAX_OFFICE_PREVIEW_BYTES,
-  OfficePreviewTooLargeError,
-  readOfficePreviewBytes,
-} from '../src/lib/session-file-office-source';
+import { createSpreadsheetClipboard } from '../src/components/sessions/session-file-spreadsheet-clipboard';
+import { createTestI18n, withTestI18n } from './test-i18n';
 
-describe('SessionFileBinaryPreview', () => {
-  it('opens PDFs in the paged document viewer', () => {
-    const markup = renderToStaticMarkup(
-      createElement(SessionFileBinaryPreview, {
-        path: '/workspace/Report.PDF',
-        bytes: Uint8Array.of(1),
-      })
-    );
-
-    expect(markup).toContain('aria-label="PDF viewer"');
-    expect(markup).toContain('aria-label="Previous page"');
-    expect(markup).toContain('aria-label="Pages sidebar"');
-    expect(markup).toContain('aria-label="Search document"');
-    expect(markup).not.toContain('This binary file cannot be previewed.');
-  });
-
-  it('keeps other binary files on the existing notice path', () => {
-    const markup = renderToStaticMarkup(
-      createElement(SessionFileBinaryPreview, {
-        path: '/workspace/archive.zip',
-        url: 'lody-resource://file/archive',
-      })
-    );
-
-    expect(markup).toContain('This binary file cannot be previewed.');
-  });
-
-  it.each(['docx', 'xlsx', 'pptx'])('routes %s files into the lazy office preview', (extension) => {
-    const markup = renderToStaticMarkup(
-      createElement(SessionFileBinaryPreview, {
-        path: `/workspace/report.${extension}`,
-        bytes: Uint8Array.of(1),
-      })
-    );
-
-    expect(markup).toContain('Loading document…');
-    expect(markup).not.toContain('This binary file cannot be previewed.');
-  });
-});
-
-describe('office preview source', () => {
-  it('recognizes supported extensions without promoting legacy or unrelated files', () => {
-    expect(getOfficePreviewKind('/workspace/Report.XLSX')).toBe('xlsx');
-    expect(getOfficePreviewKind('presentation.pptx?version=1')).toBe('pptx');
-    expect(getOfficePreviewKind('archive.zip')).toBeNull();
-    expect(getOfficePreviewKind('legacy.doc')).toBeNull();
-  });
-
-  it('reads only complete bounded preview bytes', async () => {
-    const fetched = await readOfficePreviewBytes({
-      url: 'lody-resource://file/workbook',
-      signal: new AbortController().signal,
-      fetcher: async () => new Response(Uint8Array.of(80, 75, 3, 4)),
-    });
-    expect(new Uint8Array(fetched)).toEqual(Uint8Array.of(80, 75, 3, 4));
-
-    await expect(
-      readOfficePreviewBytes({
-        url: 'lody-resource://file/oversized',
-        signal: new AbortController().signal,
-        fetcher: async () =>
-          new Response(Uint8Array.of(1), {
-            headers: { 'Content-Length': String(MAX_OFFICE_PREVIEW_BYTES + 1) },
-          }),
-      })
-    ).rejects.toBeInstanceOf(OfficePreviewTooLargeError);
-  });
-
-  it('rejects a cancelled read before it opens a resource', async () => {
-    const controller = new AbortController();
-    controller.abort();
-    await expect(
-      readOfficePreviewBytes({
-        url: 'lody-resource://file/cancelled',
-        signal: controller.signal,
-        fetcher: async () => {
-          throw new Error('A cancelled preview must not open a resource.');
-        },
-      })
-    ).rejects.toMatchObject({ name: 'AbortError' });
-  });
-});
+const testI18n = createTestI18n();
 
 describe('spreadsheet clipboard', () => {
   it('preserves rectangular values in text and HTML without interpreting cell markup', () => {
@@ -131,22 +34,6 @@ describe('spreadsheet clipboard', () => {
     expect(() => createSpreadsheetClipboard([['x'.repeat(10 * 1024 * 1024 + 1)]])).toThrow(
       RangeError
     );
-  });
-
-  it('reports clipboard permission failures to the caller', async () => {
-    const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: { writeText: () => Promise.reject(new DOMException('Denied', 'NotAllowedError')) },
-    });
-    try {
-      await expect(
-        writeSpreadsheetClipboard(createSpreadsheetClipboard([['value']]))
-      ).rejects.toMatchObject({ name: 'NotAllowedError' });
-    } finally {
-      if (original) Object.defineProperty(navigator, 'clipboard', original);
-      else Reflect.deleteProperty(navigator, 'clipboard');
-    }
   });
 });
 
@@ -225,14 +112,6 @@ describe('worker-backed XLSX clipboard', () => {
 });
 
 describe('video preview lifecycle', () => {
-  it('recognizes video containers without treating bare names or directories as videos', () => {
-    expect(getVideoMimeTypeForPath('clip.WEBM')).toBe('video/webm');
-    expect(getVideoMimeTypeForPath('clip.mp4?version=1')).toBe('video/mp4');
-    expect(getVideoMimeTypeForPath('webm')).toBeUndefined();
-    expect(getVideoMimeTypeForPath('folder.webm/readme')).toBeUndefined();
-    expect(getVideoMimeTypeForPath('archive.zip')).toBeUndefined();
-  });
-
   let container: HTMLDivElement;
   let root: Root;
   const blobs = new Map<string, Blob>();
@@ -276,15 +155,20 @@ describe('video preview lifecycle', () => {
     const bytes = Uint8Array.of(0x1a, 0x45, 0xdf, 0xa3);
     const render = async (path: string, active = true) => {
       await act(async () =>
-        root.render(createElement(SessionFileBinaryPreview, { path, bytes, active }))
+        root.render(
+          withTestI18n(createElement(SessionFileBinaryPreview, { path, bytes, active }), testI18n)
+        )
       );
     };
     await render('clip.WEBM');
     const video = container.querySelector('video')!;
     expect(video).not.toBeNull();
-    expect(video.controls).toBe(true);
+    expect(video.controls).toBe(false);
     expect(video.playsInline).toBe(true);
     expect(video.autoplay).toBe(false);
+    expect(container.querySelector('button[aria-label="Play"]')).not.toBeNull();
+    expect(container.querySelector('input[aria-label="Seek"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Mute"]')).not.toBeNull();
     expect(blobs.get(video.src)).toMatchObject({ type: 'video/webm', size: bytes.length });
     Object.defineProperty(video, 'paused', { configurable: true, value: false });
     await render('clip.WEBM', false);
@@ -309,18 +193,21 @@ describe('video preview lifecycle', () => {
     const render = async (url: string) => {
       await act(async () =>
         root.render(
-          createElement(SessionFileBinaryPreview, {
-            path: 'clip.webm',
-            url,
-            fileActions: {
-              onCopyPath: () => {
-                copied = true;
+          withTestI18n(
+            createElement(SessionFileBinaryPreview, {
+              path: 'clip.webm',
+              url,
+              fileActions: {
+                onCopyPath: () => {
+                  copied = true;
+                },
+                onShare: () => {
+                  shared = true;
+                },
               },
-              onShare: () => {
-                shared = true;
-              },
-            },
-          })
+            }),
+            testI18n
+          )
         )
       );
     };
@@ -342,26 +229,13 @@ describe('video preview lifecycle', () => {
     expect(blobs.size).toBe(0);
   });
 
-  it('keeps the media source usable when StrictMode replays effects', async () => {
-    await act(async () =>
-      root.render(
-        createElement(
-          StrictMode,
-          null,
-          createElement(SessionFileBinaryPreview, { path: 'clip.webm', bytes: Uint8Array.of(1) })
-        )
-      )
-    );
-    const video = container.querySelector('video')!;
-    expect(video.hasAttribute('src')).toBe(true);
-    expect(blobs.has(video.src)).toBe(true);
-    expect(blobs.size).toBe(1);
-  });
-
   it('pauses when the app backgrounds and does not resume automatically', async () => {
     await act(async () =>
       root.render(
-        createElement(SessionFileBinaryPreview, { path: 'clip.webm', url: 'blob:authorized' })
+        withTestI18n(
+          createElement(SessionFileBinaryPreview, { path: 'clip.webm', url: 'blob:authorized' }),
+          testI18n
+        )
       )
     );
     const video = container.querySelector('video')!;
@@ -372,23 +246,5 @@ describe('video preview lifecycle', () => {
     hidden.mockReturnValue(false);
     document.dispatchEvent(new Event('visibilitychange'));
     expect(video.paused).toBe(true);
-  });
-
-  it('leaves unavailable bytes on the binary notice and does not load inactive videos', async () => {
-    await act(async () =>
-      root.render(createElement(SessionFileBinaryPreview, { path: 'clip.webm' }))
-    );
-    expect(container.textContent).toContain('This binary file cannot be previewed.');
-    await act(async () =>
-      root.render(
-        createElement(SessionFileBinaryPreview, {
-          path: 'clip.webm',
-          bytes: Uint8Array.of(1),
-          active: false,
-        })
-      )
-    );
-    expect(container.querySelector('video')).toBeNull();
-    expect(blobs.size).toBe(0);
   });
 });

@@ -8,6 +8,7 @@ import {
   type PrStatus,
   type SessionId,
   type SessionMeta,
+  type SessionPullRequestLinkCheck,
   type SessionPullRequestMeta,
   type SessionPullRequestStateMeta,
   type WorkspaceId,
@@ -23,6 +24,7 @@ import {
 } from './github-credential-resolver';
 import type { AliveSessionMeta } from './pr-poll-targets';
 import type { CloudGithubTokenPort, CloudPrAssociationPort } from '@lody/platform';
+import type { PrObservation } from './github-graphql-client';
 
 /**
  * Per-workspace adapter between the poller scheduler and a live workspace
@@ -42,11 +44,28 @@ export type AssociatePullRequestArgs = {
 
 export type PrPollMetaPatch = {
   lifecycle?: PrMetaWritePlan['lifecycle'];
+  /** Per-URL `prLinkCheck:*` results (unreadable explicit links); own keys, never link records. */
+  linkChecks?: Array<{ field: `prLinkCheck:${string}`; value: SessionPullRequestLinkCheck }>;
   pullRequests?: SessionPullRequestMeta[];
   pullRequestState?: Record<string, SessionPullRequestStateMeta>;
 };
 
 export interface PrPollerWorkspaceHandle {
+  workflowObservationOwners?(): ReadonlySet<SessionId>;
+  recordWorkflowObservations?(
+    meta: SessionMeta,
+    repository: string,
+    headSha: string,
+    runs: readonly import('./workflow-runs').WorkflowRunObservation[],
+    gap: boolean,
+    observedAt: number
+  ): Promise<void>;
+  recordObservations?(
+    meta: SessionMeta,
+    repoFullName: string,
+    observations: readonly PrObservation[],
+    observedAt: number
+  ): Promise<void>;
   readonly workspaceId: string;
   /** Local machine identity — the pre-write ownership revalidation predicate. */
   readonly machineId: MachineId;
@@ -73,6 +92,9 @@ export interface PrPollerWorkspaceHandle {
 const ASSOCIATE_TIMEOUT_MS = 15_000;
 
 export function createLodyPrPollerWorkspace(options: {
+  recordObservations?: PrPollerWorkspaceHandle['recordObservations'];
+  workflowObservationOwners?: PrPollerWorkspaceHandle['workflowObservationOwners'];
+  recordWorkflowObservations?: PrPollerWorkspaceHandle['recordWorkflowObservations'];
   documentManager: LoroDocumentManager;
   workspaceId: string;
   userId: string;
@@ -97,6 +119,9 @@ export function createLodyPrPollerWorkspace(options: {
   return {
     workspaceId,
     machineId,
+    recordObservations: options.recordObservations,
+    workflowObservationOwners: options.workflowObservationOwners,
+    recordWorkflowObservations: options.recordWorkflowObservations,
 
     async listAliveSessionMetas(): Promise<AliveSessionMeta[]> {
       const rows = await listAliveSessionMetas(documentManager);
@@ -117,10 +142,11 @@ export function createLodyPrPollerWorkspace(options: {
     },
 
     async writeOwnerMeta(ownerSessionId: SessionId, patch: PrPollMetaPatch): Promise<void> {
-      const { lifecycle = [], ...legacyPatch } = patch;
+      const { lifecycle = [], linkChecks = [], ...legacyPatch } = patch;
       await documentManager.repo.upsertDocMeta(getSessionRoomId(ownerSessionId), {
         ...legacyPatch,
         ...Object.fromEntries(lifecycle.map((write) => [write.field, write.value])),
+        ...Object.fromEntries(linkChecks.map((write) => [write.field, write.value])),
       });
     },
 

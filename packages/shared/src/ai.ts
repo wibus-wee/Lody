@@ -25,6 +25,7 @@ import {
 } from './deepseek-harness';
 
 export const MANAGED_BUILTIN_RUNTIMES = [
+  { runtimeName: 'antigravity', agentType: 'antigravity', displayName: 'Antigravity' },
   { runtimeName: 'kimi-code', agentType: 'kimi', displayName: 'Kimi Code' },
   { runtimeName: 'devin', agentType: 'devin', displayName: 'Devin' },
   { runtimeName: 'grok-build', agentType: 'grok', displayName: 'Grok' },
@@ -45,6 +46,7 @@ export const BUILTIN_AGENTS = [
   { agentType: 'deepseek', displayName: 'DeepSeek Harness' },
   { agentType: 'bub', displayName: 'Bub' },
   { agentType: 'dimcode', displayName: 'Dimcode' },
+  { agentType: 'sorbet', displayName: 'Lody Agent' },
 ] as const;
 
 export type BuiltinAgent = (typeof BUILTIN_AGENTS)[number];
@@ -63,6 +65,7 @@ export type AgentType = string;
  * Exhaustive on purpose: adding a builtin agent must not silently default it.
  */
 const BUILTIN_ACP_TITLE_OWNERSHIP: Record<BuiltinAgentType, 'none' | 'untagged'> = {
+  antigravity: 'none',
   pi: 'none',
   devin: 'none',
   claude: 'untagged',
@@ -74,6 +77,7 @@ const BUILTIN_ACP_TITLE_OWNERSHIP: Record<BuiltinAgentType, 'none' | 'untagged'>
   // keeps running its isolated title agent.
   bub: 'none',
   dimcode: 'none',
+  sorbet: 'none',
 };
 
 const builtinAcpTitleOwnership = (
@@ -137,6 +141,7 @@ export type CustomAcpLaunchSpec = {
  * manages the official runtime binary for the selected builtin agent.
  */
 export type BuiltinRuntimeOverrides = {
+  antigravityPath?: string;
   codexPath?: string;
   claudeCodeExecutable?: string;
   kimiPath?: string;
@@ -144,6 +149,13 @@ export type BuiltinRuntimeOverrides = {
   devinPath?: string;
   piPath?: string;
   piExtensions?: string[];
+  /**
+   * Builtin Antigravity only: launch `agy acp --dangerously-skip-permissions`,
+   * which approves every tool permission request inside agy. This is a launch
+   * policy, not a runtime replacement, so it does not count as an override in
+   * {@link hasBuiltinRuntimeOverrideValues}.
+   */
+  antigravitySkipPermissions?: boolean;
 };
 
 export const PI_EXTENSIONS_MAX_SELECTIONS = 32;
@@ -154,6 +166,7 @@ export const isBuiltinRuntimeOverrides = (value: unknown): value is BuiltinRunti
     return false;
   }
   const record = value as {
+    antigravityPath?: unknown;
     codexPath?: unknown;
     claudeCodeExecutable?: unknown;
     kimiPath?: unknown;
@@ -161,8 +174,12 @@ export const isBuiltinRuntimeOverrides = (value: unknown): value is BuiltinRunti
     devinPath?: unknown;
     piPath?: unknown;
     piExtensions?: unknown;
+    antigravitySkipPermissions?: unknown;
   };
   return (
+    (record.antigravitySkipPermissions === undefined ||
+      typeof record.antigravitySkipPermissions === 'boolean') &&
+    (record.antigravityPath === undefined || typeof record.antigravityPath === 'string') &&
     (record.codexPath === undefined || typeof record.codexPath === 'string') &&
     (record.claudeCodeExecutable === undefined ||
       typeof record.claudeCodeExecutable === 'string') &&
@@ -182,6 +199,13 @@ export const isBuiltinRuntimeOverrides = (value: unknown): value is BuiltinRunti
   );
 };
 
+/**
+ * Whether a runtime path or Pi extension selection replaces what Lody would
+ * launch by default. Launch policies such as `antigravitySkipPermissions` are
+ * excluded: they keep the managed runtime, static capabilities, title ownership
+ * and Provider setup. Use {@link hasPersistedBuiltinRuntimeOverrides} to decide
+ * whether the field is worth persisting.
+ */
 export const hasBuiltinRuntimeOverrideValues = (
   runtimeOverrides: BuiltinRuntimeOverrides | undefined
 ): boolean =>
@@ -189,6 +213,13 @@ export const hasBuiltinRuntimeOverrideValues = (
   Object.values(runtimeOverrides).some((value) =>
     Array.isArray(value) ? value.length > 0 : typeof value === 'string' && value.trim().length > 0
   );
+
+/** Whether `runtimeOverrides` carries anything a stored Provider must keep. */
+export const hasPersistedBuiltinRuntimeOverrides = (
+  runtimeOverrides: BuiltinRuntimeOverrides | undefined
+): boolean =>
+  hasBuiltinRuntimeOverrideValues(runtimeOverrides) ||
+  runtimeOverrides?.antigravitySkipPermissions === true;
 
 export const getBuiltinRuntimeOverrideSourceVersionSuffix = (
   runtimeOverrides: BuiltinRuntimeOverrides | undefined
@@ -377,9 +408,31 @@ export type AcpCommandSummary = {
 // with the same brackets — a Claude probe stored `{ opus: ['1m'] }` — and the
 // per-model effort picker would rebuild that model's ladder from it.
 // 11: provider command previews come only from probes, never project sessions.
-export const ACP_CAPABILITY_CACHE_VERSION = 11;
+// 12: official registry Antigravity supports Lody's /usage quota compatibility reader.
+export const ACP_CAPABILITY_CACHE_VERSION = 12;
 
-export type AcpCapabilityAuthority = 'unavailable' | 'provisional' | 'authoritative';
+/**
+ * One sign-in method an ACP agent advertised in its `initialize` response.
+ *
+ * Persisted with the capability cache so the account panel can offer the
+ * agent's own sign-in methods without starting an authentication attempt
+ * first. `args` is display-only; the Machine resolves the trusted executable
+ * and arguments itself.
+ */
+export type AcpAuthMethodSummary = {
+  type: 'agent' | 'env_var' | 'terminal';
+  id?: string;
+  name?: string;
+  description?: string;
+  args?: string[];
+};
+
+export type AcpCapabilityAuthority =
+  | 'unavailable'
+  | 'provisional'
+  | 'authoritative'
+  /** Probe succeeded but advertised a model selector with zero choices. */
+  | 'degraded';
 
 export type AcpCapabilityCacheEntry = {
   cliType: AgentConfigCliType;
@@ -411,8 +464,23 @@ export type AcpCapabilityCacheEntry = {
    * stored in the capability row itself; see `acp-model-capabilities.ts`.
    */
   declaredModelControls?: Record<string, AcpModelControls>;
+  /**
+   * Each model's own option list from the config's `acpModelConfigOptions`
+   * rows, attached by `getMachineFlockAcpCapabilities`. Never stored in the
+   * capability row itself; see `acp-model-config-options.ts`.
+   */
+  observedModelConfigOptions?: Record<string, AcpConfigOptionSummary[]>;
   /** Probe commands shown before a session reports its own list; [] confirms an empty probe. */
   availableCommands?: AcpCommandSummary[];
+  /**
+   * Sign-in methods the agent advertised in its `initialize` response.
+   *
+   * `undefined` means no probe has asked yet; an empty array means the agent was
+   * asked and advertised none. Only agent-driven (registry/custom/Devin)
+   * providers record this: built-in providers sign in with their own native
+   * login command, which the adapter's method list does not describe.
+   */
+  authMethods?: AcpAuthMethodSummary[];
   /** True only when the runtime initialize response advertised `sessionCapabilities.fork`. */
   sessionFork?: boolean;
   /** Runtime advertised Core sessionTitle v1 (automatic, tagged title updates). */
@@ -438,6 +506,27 @@ export const isAcpCapabilityCacheEntryCurrent = (
 ): entry is AcpCapabilityCacheEntry => entry?.cacheVersion === ACP_CAPABILITY_CACHE_VERSION;
 
 /**
+ * Prefix of the capability source version Lody stamps for builtin Sorbet; the build
+ * segment follows it, optionally suffixed with `+<probe capability>`.
+ */
+const SORBET_SOURCE_VERSION_PREFIX = 'builtin-sorbet:@sorbetai/acp@';
+
+/** Sorbet builds that could not discover sign-in methods, so their probe wrote none. */
+const SORBET_STALE_AUTH_DISCOVERY_VERSIONS: ReadonlySet<string> = new Set(['0.1.0-alpha.4']);
+
+/**
+ * The Sorbet build an entry came from: the installed version when the npx cache could
+ * name it, otherwise the dist-tag Lody launched through. `undefined` for other agents.
+ */
+const readSorbetBuildVersion = (entry: AcpCapabilityCacheEntry): string | undefined => {
+  if (entry.cliType !== 'builtin' || entry.agentType !== 'sorbet') return undefined;
+  const sourceVersion = entry.sourceVersion;
+  if (!sourceVersion?.startsWith(SORBET_SOURCE_VERSION_PREFIX)) return undefined;
+  const [build] = sourceVersion.slice(SORBET_SOURCE_VERSION_PREFIX.length).split('+', 1);
+  return build ? build : undefined;
+};
+
+/**
  * A parsed capability entry remains readable regardless of the producer's cache version.
  * `cacheVersion` is a refresh hint, not a data-compatibility gate: mixed-version clients
  * keep using fields they understand while a newer probe converges the stored entry.
@@ -447,6 +536,16 @@ export const getReadableAcpCapabilityCacheEntry = (
 ): AcpCapabilityCacheEntry | undefined => {
   if (!entry) {
     return undefined;
+  }
+  // Sorbet is on a floating dist-tag, so the build that wrote an entry is only knowable
+  // from the version stamped into `sourceVersion`. Drop the method list those early
+  // builds could not discover; every other entry keeps the list it reported.
+  if (
+    SORBET_STALE_AUTH_DISCOVERY_VERSIONS.has(readSorbetBuildVersion(entry) ?? '') &&
+    entry.authMethods !== undefined
+  ) {
+    const { authMethods: _staleAuthMethods, ...compatible } = entry;
+    entry = compatible;
   }
   if ((entry.cacheVersion ?? 0) < 11 && entry.availableCommands !== undefined) {
     const { availableCommands: _projectCommands, ...compatible } = entry;
@@ -506,13 +605,41 @@ export const getAcpCapabilityCacheEntryAuthority = (
   if (!readableEntry) {
     return 'unavailable';
   }
-  return readableEntry.provenance === 'runtime' ? 'authoritative' : 'provisional';
+  if (readableEntry.provenance !== 'runtime') {
+    return 'provisional';
+  }
+  // A runtime-probed entry that advertises a model select with zero choices was
+  // read while the agent's catalog was unavailable — the picker the user sees
+  // renders that select directly, so the entry is verified-but-degraded rather
+  // than authoritative.
+  if (hasEmptyModelSelectOption(readableEntry.configOptions)) {
+    return 'degraded';
+  }
+  return 'authoritative';
 };
+
+/**
+ * Whether a normalized (or persisted) config-option list advertises a model
+ * selector with no choices. The agent clearly intends to expose model
+ * selection — it emitted the option — but produced an empty catalog, which is
+ * a probe-time degradation (cold upstream cache, startup race, auth lag), not
+ * an agent that legitimately has no values. Selectors render this select
+ * directly (they do not fall back to `models`), so an entry in this state must
+ * never answer a capability refresh or be presented as fully verified.
+ */
+export const hasEmptyModelSelectOption = (
+  configOptions: AcpConfigOptionSummary[] | undefined
+): boolean =>
+  (configOptions ?? []).some(
+    (option) =>
+      option.type === 'select' && option.category === 'model' && option.options.length === 0
+  );
 
 export type AcpCapabilityCacheStaleReason =
   | 'missing'
   | 'cache-version-mismatch'
-  | 'source-version-mismatch';
+  | 'source-version-mismatch'
+  | 'empty-model-catalog';
 
 export const getAcpCapabilityCacheStaleReason = (
   entry: AcpCapabilityCacheEntry | undefined,
@@ -526,6 +653,9 @@ export const getAcpCapabilityCacheStaleReason = (
   }
   if (entry.sourceVersion !== expectedSourceVersion) {
     return 'source-version-mismatch';
+  }
+  if (hasEmptyModelSelectOption(entry.configOptions)) {
+    return 'empty-model-catalog';
   }
   return undefined;
 };
@@ -647,7 +777,10 @@ export const isManagedBuiltinAgentType = (
  * Dimcode uses the same verification path with its npx-managed package.
  */
 export const supportsBuiltinProviderSetup = (agentType: string): agentType is BuiltinAgentType =>
-  isManagedBuiltinAgentType(agentType) || agentType === 'bub' || agentType === 'dimcode';
+  isManagedBuiltinAgentType(agentType) ||
+  agentType === 'bub' ||
+  agentType === 'dimcode' ||
+  agentType === 'sorbet';
 
 export const getManagedBuiltinRuntimeByAgentType = (
   agentType: string
@@ -671,6 +804,7 @@ export type StaticBuiltinAcpCapabilities = {
 export const CODEX_AUTO_REVIEW_MODE_ID = 'agent-auto-review';
 
 const BUILTIN_DEFAULT_MODE_IDS = {
+  antigravity: 'default',
   kimi: 'auto',
   // Grok advertises `default` / `plan`, not Codex `agent`. Injecting `agent`
   // makes Role/MCP session create fail with "Unsupported ACP mode".
@@ -1388,6 +1522,10 @@ export type ChatFailedMeta = {
   code?: ChatFailedCode;
   /** Human-readable error message */
   message?: string;
+  /** Quota reset instant named by the provider or its capacity observation. */
+  resetAt?: string;
+  /** Epoch-seconds form used by provider capacity observations. */
+  resetAtEpochSeconds?: number;
 };
 
 /**
@@ -1514,6 +1652,11 @@ export const SESSION_IMAGE_ALLOWED_MIME_TYPES = [
 ] as const;
 
 export type SessionImagePayload = {
+  /** Absent transport preserves the existing cloud image contract. */
+  transport?: 'local' | 'r2';
+  machineId?: string;
+  /** Immutable local snapshot identity retained after relay publication. */
+  localImageId?: string;
   encryption?: import('./encrypted-attachment').EncryptedAttachment;
   imageId: string;
   mimeType: string;
@@ -1567,6 +1710,17 @@ export function isSessionFileSourcePath(value: string): boolean {
   }
   return !normalized.split('/').some((segment) => segment === '..');
 }
+
+/** A machine-local path, never a blob key or an upload candidate. */
+export type SessionLocalAttachment = {
+  type: 'local_attachment';
+  machineId: string;
+  path: string;
+  kind: 'file' | 'image';
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+};
 
 export type SessionFilePayload = {
   encryption?: import('./encrypted-attachment').EncryptedAttachment;
@@ -1680,6 +1834,7 @@ export type SessionInputBlock =
       type: 'image';
     } & SessionImagePayload)
   | SessionFilePayload
+  | SessionLocalAttachment
   | ({
       type: 'comment_reference';
     } & CommentReferencePayload)
@@ -1753,6 +1908,7 @@ export type MessageContent =
   | {
       type: 'text';
       text: string;
+      messagePhase?: 'commentary' | 'final_answer';
       /** Mention regions of `text`. See `message-text-spans.ts`. */
       spans?: MessageTextSpan[];
     }
@@ -1761,6 +1917,7 @@ export type MessageContent =
     } & SessionImagePayload)
   | SessionImageGroupContent
   | SessionFilePayload
+  | SessionLocalAttachment
   | {
       type: 'thought';
       text: string;
@@ -1958,6 +2115,8 @@ export type ACPSessionConfig = ACPTurnConfig & {
  * Keep this looser than `ACPSessionConfig` so older docs and partial writes remain readable.
  */
 export type SessionTurnInputConfig = Partial<ACPTurnConfig> & {
+  /** Attribution only; the Host checks its durable Invocation receipt at admission. */
+  _lodyAutomation?: import('./automations/contracts').AutomationOrigin;
   /** An accepted steer has no independently editable provider turn boundary. */
   _lodyDeliveryKind?: import('./message-schemas').SessionHistoryDeliveryKind;
 };

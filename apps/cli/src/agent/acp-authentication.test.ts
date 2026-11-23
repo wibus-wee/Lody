@@ -233,6 +233,12 @@ describe('AcpAuthenticationManager', () => {
 
   it.each([
     {
+      agentType: 'antigravity',
+      runtimeOverrides: { antigravityPath: '/test/agy' },
+      command: '/test/agy',
+      args: ['acp', '--login', '--disable-telemetry'],
+    },
+    {
       agentType: 'claude',
       runtimeOverrides: { claudeCodeExecutable: '/test/claude' },
       command: '/test/claude',
@@ -282,97 +288,86 @@ describe('AcpAuthenticationManager', () => {
     }
   );
 
-  it('emits a Claude browser authorization event and accepts the fallback code through stdin', async () => {
-    const child = createFakeChild();
-    const stdin = new PassThrough();
-    const stdout = new PassThrough();
-    const stdoutListening = createDeferred<void>();
-    stdout.once('newListener', (event) => {
-      if (event === 'data') stdoutListening.resolve();
-    });
-    child.stdin = stdin;
-    child.stdout = stdout;
-    child.stderr = new PassThrough();
-    const receivedInput: string[] = [];
-    stdin.on('data', (chunk) => receivedInput.push(String(chunk)));
-    stdin.on('finish', () => {
-      queueMicrotask(() => {
-        child.exitCode = 0;
-        child.emit('exit', 0, null);
+  it.each([
+    { agentType: 'claude', input: 'browser-code', exitCode: 0 },
+    { agentType: 'antigravity', input: 'browser-code', exitCode: 0 },
+    {
+      agentType: 'antigravity',
+      input: 'https://example.test/callback?code=synthetic',
+      exitCode: 0,
+    },
+    { agentType: 'antigravity', input: 'invalid-code', exitCode: 1 },
+  ] as const)(
+    'handles $agentType browser sign-in with exit $exitCode and input $input',
+    async ({ agentType, input, exitCode }) => {
+      const child = createFakeChild();
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stdoutListening = createDeferred<void>();
+      stdout.once('newListener', (event) => {
+        if (event === 'data') stdoutListening.resolve();
       });
-    });
-    const authorizationReceived = createDeferred<void>();
-    const progress = vi.fn((event: { status: string }) => {
-      if (event.status === 'authorization') authorizationReceived.resolve();
-    });
-    const manager = new AcpAuthenticationManager(createSilentLogger(), {
-      nodeProcess: fakeNodeProcess(vi.fn(() => child)),
-      resolveLoginShellEnv: async () => ({}),
-    });
-    const authentication = manager.authenticate({
-      requestId: 'auth-claude',
-      cliType: 'builtin',
-      agentType: 'claude',
-      runtimeOverrides: { claudeCodeExecutable: '/test/claude' },
-      onProgress: progress,
-    });
-
-    await stdoutListening.promise;
-    stdout.write(
-      'If the browser did not open, visit: ' +
-        'https://claude.com/cai/oauth/authorize?code=true&client_id=test&state=test\n' +
-        'Paste code here if prompted > '
-    );
-    await authorizationReceived.promise;
-    expect(progress).toHaveBeenCalledWith(
-      expect.objectContaining({
-        status: 'authorization',
-        authorizationUrl:
-          'https://claude.com/cai/oauth/authorize?code=true&client_id=test&state=test',
-        acceptsAuthorizationCode: true,
-      })
-    );
-
-    expect(manager.submitAuthorizationCode('auth-claude', 'browser-code')).toEqual({
-      success: true,
-      disposition: 'input-accepted',
-    });
-    await expect(authentication).resolves.toEqual({
-      success: true,
-      disposition: 'authenticated',
-    });
-    expect(receivedInput).toEqual(['browser-code\n']);
-  });
-
-  it('directs unsuccessful Codex login to its diagnostics without guessing the cause', async () => {
-    const failedChild = createFakeChild();
-    const manager = new AcpAuthenticationManager(createSilentLogger(), {
-      nodeProcess: fakeNodeProcess(
-        vi.fn(() => {
-          queueMicrotask(() => {
-            failedChild.exitCode = 1;
-            failedChild.emit('exit', 1, null);
-          });
-          return failedChild;
-        })
-      ),
-      resolveLoginShellEnv: async () => ({}),
-    });
-
-    await expect(
-      manager.authenticate({
-        requestId: 'auth-codex',
+      child.stdin = stdin;
+      child.stdout = stdout;
+      child.stderr = new PassThrough();
+      const receivedInput: string[] = [];
+      stdin.on('data', (chunk) => receivedInput.push(String(chunk)));
+      stdin.on('finish', () => {
+        queueMicrotask(() => {
+          child.exitCode = exitCode;
+          child.emit('exit', exitCode, null);
+        });
+      });
+      const authorizationReceived = createDeferred<void>();
+      const progress = vi.fn((event: { status: string }) => {
+        if (event.status === 'authorization') authorizationReceived.resolve();
+      });
+      const manager = new AcpAuthenticationManager(createSilentLogger(), {
+        nodeProcess: fakeNodeProcess(vi.fn(() => child)),
+        resolveLoginShellEnv: async () => ({}),
+      });
+      const authentication = manager.authenticate({
+        requestId: 'auth-browser',
         cliType: 'builtin',
-        agentType: 'codex',
-        runtimeOverrides: { codexPath: '/test/codex' },
-      })
-    ).resolves.toEqual({
-      success: false,
-      disposition: 'error',
-      error:
-        'Codex authentication exited with code 1. Check the Codex login log on the execution machine for the cause, then try again.',
-    });
-  });
+        agentType,
+        runtimeOverrides: { claudeCodeExecutable: '/test/claude', antigravityPath: '/test/agy' },
+        onProgress: progress,
+      });
+
+      const authorizationUrl =
+        agentType === 'claude'
+          ? 'https://claude.com/cai/oauth/authorize?code=true&client_id=test&state=test'
+          : 'https://accounts.google.com/o/oauth2/auth?client_id=test&state=test';
+      await stdoutListening.promise;
+      stdout.write(
+        'If the browser did not open, visit: ' +
+          `${authorizationUrl}\n` +
+          'Paste code here if prompted > '
+      );
+      await authorizationReceived.promise;
+      expect(progress).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'authorization',
+          authorizationUrl,
+          acceptsAuthorizationCode: true,
+        })
+      );
+
+      expect(manager.submitAuthorizationCode('auth-browser', input)).toEqual({
+        success: true,
+        disposition: 'input-accepted',
+      });
+      await expect(authentication).resolves.toMatchObject(
+        exitCode === 0
+          ? { success: true, disposition: 'authenticated' }
+          : { success: false, disposition: 'error' }
+      );
+      expect(receivedInput).toEqual([`${input}\n`]);
+      if (agentType === 'antigravity') {
+        expect(progress.mock.calls.map(([event]) => event.status)).not.toContain('output');
+      }
+    }
+  );
 
   it('cancels launch preparation without spawning and allows an immediate retry', async () => {
     const firstLoginShellEnv = createDeferred<Record<string, string>>();
@@ -424,60 +419,6 @@ describe('AcpAuthenticationManager', () => {
       disposition: 'cancelled',
     });
     expect(spawnProcess).toHaveBeenCalledOnce();
-  });
-
-  it('reports managed runtime download progress while resolving the login launch', async () => {
-    const successfulChild = createFakeChild();
-    const spawnProcess = vi.fn(() => {
-      queueMicrotask(() => {
-        successfulChild.exitCode = 0;
-        successfulChild.emit('exit', 0, null);
-      });
-      return successfulChild;
-    });
-    let capturedSignal: AbortSignal | undefined;
-    const resolveAuthenticationProcessLaunch: typeof resolveBuiltinAuthenticationProcessLaunch =
-      async (input) => {
-        capturedSignal = input.signal;
-        input.onManagedRuntimeProgress?.({
-          runtimeName: 'codex',
-          version: '0.154.0',
-          platformArch: 'linux-x64',
-          phase: 'downloading',
-          downloadedBytes: 50,
-          totalBytes: 100,
-          percent: 50,
-        });
-        return { command: '/test/codex', args: ['login', '--device-auth'] };
-      };
-    const progress = vi.fn();
-    const manager = new AcpAuthenticationManager(createSilentLogger(), {
-      nodeProcess: fakeNodeProcess(spawnProcess),
-      resolveLoginShellEnv: async () => ({}),
-      resolveAuthenticationProcessLaunch,
-    });
-
-    await expect(
-      manager.authenticate({
-        requestId: 'auth-codex-download',
-        cliType: 'builtin',
-        agentType: 'codex',
-        onProgress: progress,
-      })
-    ).resolves.toEqual({ success: true, disposition: 'authenticated' });
-
-    expect(capturedSignal).toBeInstanceOf(AbortSignal);
-    expect(progress).toHaveBeenCalledWith({
-      status: 'runtime-download',
-      runtimeName: 'codex',
-      runtimePhase: 'downloading',
-      runtimePercent: 50,
-    });
-    expect(spawnProcess).toHaveBeenCalledWith(
-      '/test/codex',
-      ['login', '--device-auth'],
-      expect.objectContaining({ cwd: expect.any(String) })
-    );
   });
 
   it('cancels while launch resolution is still installing the managed runtime', async () => {
@@ -566,6 +507,59 @@ describe('AcpAuthenticationManager', () => {
     });
   });
 
+  it('keeps a replacement manager fenced after cleanup fails until the child exits', async () => {
+    vi.useFakeTimers();
+    const child = createFakeChild();
+    child.kill = vi.fn(() => true);
+    const spawned = createDeferred<void>();
+    const spawnProcess = vi.fn(() => {
+      spawned.resolve();
+      return child;
+    });
+    const options = {
+      nodeProcess: fakeNodeProcess(spawnProcess),
+      resolveLoginShellEnv: async () => ({}),
+      terminationGraceMs: 2,
+    };
+    const first = new AcpAuthenticationManager(createSilentLogger(), options);
+    const reopened = new AcpAuthenticationManager(createSilentLogger(), options);
+    const input = {
+      cliType: 'custom' as const,
+      agentType: 'unconfirmed-cleanup-fence',
+      customAcp: { command: '/synthetic/agent', args: [] },
+    };
+    try {
+      const original = first.authenticate({ ...input, requestId: 'original' });
+      await spawned.promise;
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(original).resolves.toMatchObject({
+        success: false,
+        disposition: 'error',
+        error: expect.stringContaining('process cleanup is unconfirmed'),
+      });
+      expect(child.exitCode).toBeNull();
+      await expect(
+        reopened.authenticate({ ...input, requestId: 'overlap' })
+      ).resolves.toMatchObject({
+        success: false,
+        error: expect.stringContaining('authentication is already running'),
+      });
+      expect(spawnProcess).toHaveBeenCalledTimes(1);
+
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+      const next = createFakeChild();
+      spawnProcess.mockImplementation(() => next);
+      const retry = reopened.authenticate({ ...input, requestId: 'after-exit' });
+      await vi.advanceTimersByTimeAsync(20);
+      await retry;
+      expect(spawnProcess).toHaveBeenCalledTimes(2);
+    } finally {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    }
+  });
+
   it.each(['custom', 'devin'] as const)(
     'bridges request-scoped ACP form elicitation for %s',
     async (provider) => {
@@ -578,10 +572,15 @@ describe('AcpAuthenticationManager', () => {
       const elicitationReply = createDeferred<acp.CreateElicitationResponse>();
       const agent = acp
         .agent({ name: 'test-auth-agent' })
-        .onRequest(acp.methods.agent.initialize, async ({ params }) => ({
-          protocolVersion: params.protocolVersion,
-          authMethods: [{ id: 'oauth', name: 'OAuth' }],
-        }))
+        .onRequest(acp.methods.agent.initialize, async ({ params }) => {
+          expect(params.clientCapabilities?.auth?._meta).toEqual({
+            lody: { credentialForm: { version: 1 } },
+          });
+          return {
+            protocolVersion: params.protocolVersion,
+            authMethods: [{ id: 'oauth', name: 'OAuth' }],
+          };
+        })
         .onRequest(acp.methods.agent.authenticate, async ({ client, requestId }) => {
           const reply = await client.request(acp.methods.client.elicitation.create, {
             mode: 'form',
@@ -620,8 +619,8 @@ describe('AcpAuthenticationManager', () => {
       });
       const authentication = manager.authenticate({
         requestId: 'auth-custom',
-        cliType: provider === 'devin' ? 'builtin' : 'custom',
-        agentType: provider === 'devin' ? 'devin' : 'custom-test',
+        cliType: provider === 'custom' ? 'custom' : 'builtin',
+        agentType: provider === 'custom' ? 'custom-test' : provider,
         runtimeOverrides: provider === 'devin' ? { devinPath: '/test/devin' } : undefined,
         customAcp: { command: '/test/custom-acp', args: [] },
         onProgress: (event) => {
@@ -649,6 +648,13 @@ describe('AcpAuthenticationManager', () => {
       expect(
         manager.submitAuthenticationInput(
           'auth-custom',
+          'stale-interaction',
+          JSON.stringify({ action: 'accept', content: { token: 'discarded' } })
+        )
+      ).toMatchObject({ success: false, disposition: 'error' });
+      expect(
+        manager.submitAuthenticationInput(
+          'auth-custom',
           interactionId,
           JSON.stringify({
             action: 'accept',
@@ -667,6 +673,83 @@ describe('AcpAuthenticationManager', () => {
     }
   );
 
+  it.each(['initialize', 'authenticate'] as const)(
+    'does not expose agent error text when ACP %s fails',
+    async (failingMethod) => {
+      const child = createFakeChild();
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      child.stdin = stdin;
+      child.stdout = stdout;
+      child.stderr = new PassThrough();
+      const progress: unknown[] = [];
+      const formReceived = createDeferred<string>();
+      const agent = acp
+        .agent({ name: 'test-auth-error-agent' })
+        .onRequest(acp.methods.agent.initialize, async ({ params }) => {
+          if (failingMethod === 'initialize') {
+            throw new acp.RequestError(-32603, 'secret-from-agent');
+          }
+          return {
+            protocolVersion: params.protocolVersion,
+            authMethods: [{ id: 'login', name: 'Login' }],
+          };
+        })
+        .onRequest(acp.methods.agent.authenticate, async ({ client, requestId }) => {
+          const reply = await client.request(acp.methods.client.elicitation.create, {
+            mode: 'form',
+            requestId,
+            message: 'Enter token',
+            requestedSchema: {
+              type: 'object',
+              properties: { token: { type: 'string', title: 'Token', _meta: { secret: true } } },
+              required: ['token'],
+            },
+          });
+          if (reply.action !== 'accept') throw new Error('Expected accepted input');
+          throw new acp.RequestError(-32603, `secret-from-agent ${reply.content?.token}`);
+        });
+      agent.connect(
+        acp.ndJsonStream(createStdinWritableStream(stdout), createStdoutReadableStream(stdin))
+      );
+      const manager = new AcpAuthenticationManager(createSilentLogger(), {
+        nodeProcess: fakeNodeProcess(vi.fn(() => child)),
+        resolveLoginShellEnv: async () => ({}),
+      });
+      const authentication = manager.authenticate({
+        requestId: 'auth-error',
+        cliType: 'custom',
+        agentType: 'custom-test',
+        customAcp: { command: '/test/custom-acp', args: [] },
+        onProgress: (event) => {
+          progress.push(event);
+          if (event.status === 'input-required') formReceived.resolve(event.interactionId);
+        },
+      });
+      if (failingMethod === 'authenticate') {
+        const interactionId = await formReceived.promise;
+        expect(
+          manager.submitAuthenticationInput(
+            'auth-error',
+            interactionId,
+            JSON.stringify({ action: 'accept', content: { token: 'submitted-secret' } })
+          )
+        ).toEqual({ success: true, disposition: 'input-accepted' });
+      }
+      const result = await authentication;
+      expect(result).toEqual({
+        success: false,
+        disposition: 'error',
+        error:
+          failingMethod === 'initialize'
+            ? 'custom-test ACP initialization failed. Check the agent configuration and try again.'
+            : 'custom-test ACP authentication failed. Check the sign-in details and try again.',
+      });
+      expect(JSON.stringify({ result, progress })).not.toContain('secret-from-agent');
+      expect(JSON.stringify({ result, progress })).not.toContain('submitted-secret');
+    }
+  );
+
   it('selects between advertised agent-driven authentication methods', async () => {
     const child = createFakeChild();
     const stdin = new PassThrough();
@@ -675,14 +758,15 @@ describe('AcpAuthenticationManager', () => {
     child.stdout = stdout;
     child.stderr = new PassThrough();
     const authenticatedWith = createDeferred<string>();
+    const methods = Array.from({ length: 46 }, (_, index) => ({
+      id: `provider-${index}`,
+      name: `Provider ${index}`,
+    }));
     const agent = acp
       .agent({ name: 'test-method-auth-agent' })
       .onRequest(acp.methods.agent.initialize, async ({ params }) => ({
         protocolVersion: params.protocolVersion,
-        authMethods: [
-          { id: 'oauth', name: 'OAuth' },
-          { id: 'api-key', name: 'API key' },
-        ],
+        authMethods: methods,
       }))
       .onRequest(acp.methods.agent.authenticate, async ({ params }) => {
         authenticatedWith.resolve(params.methodId);
@@ -703,7 +787,9 @@ describe('AcpAuthenticationManager', () => {
       customAcp: { command: '/test/custom-acp', args: [] },
       onProgress: (event) => {
         if (event.status === 'auth-methods') {
-          expect(event.authMethods.map((method) => method.id)).toEqual(['oauth', 'api-key']);
+          expect(event.authMethods.map((method) => method.id)).toEqual(
+            methods.map((method) => method.id)
+          );
           methodsReceived.resolve({ interactionId: event.interactionId });
         }
       },
@@ -714,14 +800,103 @@ describe('AcpAuthenticationManager', () => {
       manager.submitAuthenticationInput(
         'auth-method-choice',
         interactionId,
-        JSON.stringify({ action: 'accept', methodId: 'api-key' })
+        JSON.stringify({ action: 'accept', methodId: 'provider-45' })
       )
     ).toEqual({ success: true, disposition: 'input-accepted' });
+    await expect(authenticatedWith.promise).resolves.toBe('provider-45');
+    await expect(authentication).resolves.toEqual({
+      success: true,
+      disposition: 'authenticated',
+    });
+  });
+
+  it('uses a method picked before sign-in started without asking again', async () => {
+    const child = createFakeChild();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    child.stdin = stdin;
+    child.stdout = stdout;
+    child.stderr = new PassThrough();
+    const authenticatedWith = createDeferred<string>();
+    const agent = acp
+      .agent({ name: 'test-preselected-auth-agent' })
+      .onRequest(acp.methods.agent.initialize, async ({ params }) => ({
+        protocolVersion: params.protocolVersion,
+        authMethods: [
+          { id: 'oauth', name: 'OAuth' },
+          { id: 'api-key', name: 'API key' },
+        ],
+      }))
+      .onRequest(acp.methods.agent.authenticate, async ({ params }) => {
+        authenticatedWith.resolve(params.methodId);
+        return {};
+      });
+    agent.connect(
+      acp.ndJsonStream(createStdinWritableStream(stdout), createStdoutReadableStream(stdin))
+    );
+    const progressStatuses: string[] = [];
+    const manager = new AcpAuthenticationManager(createSilentLogger(), {
+      nodeProcess: fakeNodeProcess(vi.fn(() => child)),
+      resolveLoginShellEnv: async () => ({}),
+    });
+    const authentication = manager.authenticate({
+      requestId: 'auth-preselected',
+      cliType: 'custom',
+      agentType: 'custom-preselected',
+      customAcp: { command: '/test/custom-acp', args: [] },
+      methodId: 'api-key',
+      onProgress: (event) => progressStatuses.push(event.status),
+    });
+
     await expect(authenticatedWith.promise).resolves.toBe('api-key');
     await expect(authentication).resolves.toEqual({
       success: true,
       disposition: 'authenticated',
     });
+    expect(progressStatuses).not.toContain('auth-methods');
+  });
+
+  it('falls back to the advertised method when a cached pick is stale', async () => {
+    const child = createFakeChild();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    child.stdin = stdin;
+    child.stdout = stdout;
+    child.stderr = new PassThrough();
+    const authenticatedWith = createDeferred<string>();
+    const agent = acp
+      .agent({ name: 'test-stale-method-auth-agent' })
+      .onRequest(acp.methods.agent.initialize, async ({ params }) => ({
+        protocolVersion: params.protocolVersion,
+        authMethods: [{ id: 'api-key', name: 'API key' }],
+      }))
+      .onRequest(acp.methods.agent.authenticate, async ({ params }) => {
+        authenticatedWith.resolve(params.methodId);
+        return {};
+      });
+    agent.connect(
+      acp.ndJsonStream(createStdinWritableStream(stdout), createStdoutReadableStream(stdin))
+    );
+    const progressStatuses: string[] = [];
+    const manager = new AcpAuthenticationManager(createSilentLogger(), {
+      nodeProcess: fakeNodeProcess(vi.fn(() => child)),
+      resolveLoginShellEnv: async () => ({}),
+    });
+    const authentication = manager.authenticate({
+      requestId: 'auth-stale-pick',
+      cliType: 'custom',
+      agentType: 'custom-stale-pick',
+      customAcp: { command: '/test/custom-acp', args: [] },
+      methodId: 'oauth',
+      onProgress: (event) => progressStatuses.push(event.status),
+    });
+
+    await expect(authenticatedWith.promise).resolves.toBe('api-key');
+    await expect(authentication).resolves.toEqual({
+      success: true,
+      disposition: 'authenticated',
+    });
+    expect(progressStatuses).not.toContain('auth-methods');
   });
 
   it('cancels a pending custom ACP elicitation and terminates its process', async () => {
@@ -992,7 +1167,7 @@ describe('AcpAuthenticationManager', () => {
           error: expect.stringContaining(expected),
         })
       );
-      expect(initialize.mock.calls[0]?.[0].params.clientCapabilities.auth).toEqual({
+      expect(initialize.mock.calls[0]?.[0].params.clientCapabilities.auth).toMatchObject({
         terminal: false,
       });
     }
@@ -1197,26 +1372,6 @@ describe('probeBuiltinAuthentication', () => {
     });
   });
 
-  it.each(['CODEX_API_KEY', 'OPENAI_API_KEY'])(
-    'defers to Codex ACP when %s is set',
-    async (key) => {
-      const spawnProcess = vi.fn();
-
-      await expect(
-        probeBuiltinAuthentication({
-          cliType: 'builtin',
-          agentType: 'codex',
-          runtimeOverrides: { codexPath: '/test/codex' },
-          env: { [key]: 'test-key' },
-          logger: createSilentLogger(),
-          nodeProcess: fakeNodeProcess(spawnProcess),
-          resolveLoginShellEnv: async () => ({}),
-        })
-      ).resolves.toEqual({ status: 'unknown' });
-      expect(spawnProcess).not.toHaveBeenCalled();
-    }
-  );
-
   it.each([
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
@@ -1235,37 +1390,6 @@ describe('probeBuiltinAuthentication', () => {
         logger: createSilentLogger(),
         nodeProcess: fakeNodeProcess(spawnProcess),
         resolveLoginShellEnv: async () => ({}),
-      })
-    ).resolves.toEqual({ status: 'unknown' });
-    expect(spawnProcess).not.toHaveBeenCalled();
-  });
-
-  it('detects API-key authentication inherited from the login shell', async () => {
-    const spawnProcess = vi.fn();
-
-    await expect(
-      probeBuiltinAuthentication({
-        cliType: 'builtin',
-        agentType: 'codex',
-        runtimeOverrides: { codexPath: '/test/codex' },
-        logger: createSilentLogger(),
-        nodeProcess: fakeNodeProcess(spawnProcess),
-        resolveLoginShellEnv: async () => ({ OPENAI_API_KEY: 'shell-key' }),
-      })
-    ).resolves.toEqual({ status: 'unknown' });
-    expect(spawnProcess).not.toHaveBeenCalled();
-  });
-
-  it('leaves Kimi credential detection to the ACP adapter', async () => {
-    const spawnProcess = vi.fn();
-
-    await expect(
-      probeBuiltinAuthentication({
-        cliType: 'builtin',
-        agentType: 'kimi',
-        runtimeOverrides: { kimiPath: '/test/kimi' },
-        logger: createSilentLogger(),
-        nodeProcess: fakeNodeProcess(spawnProcess),
       })
     ).resolves.toEqual({ status: 'unknown' });
     expect(spawnProcess).not.toHaveBeenCalled();

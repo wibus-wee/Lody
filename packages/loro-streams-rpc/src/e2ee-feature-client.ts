@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { makeRealtimeContentBinding } from '@lody/e2ee-core/adapters/loro-streams';
 import {
   E2eeFeatureInputSchema,
+  e2eeFeatureTarget,
   isE2eeFeatureMethod,
   isE2eeReadQuery,
   type E2eeFeatureInput,
@@ -29,6 +30,12 @@ import {
   decodeFeatureResponsePage,
 } from './e2ee-feature-parts';
 import type { E2eeRpcStore } from './e2ee-store';
+
+// Pad signed deadlines for a slow sender; the admission upper bound also allows
+// a fast sender. Receiver work keeps the same signed deadline throughout.
+const CLOCK_SKEW_TOLERANCE_MS = 10 * 60_000;
+const featureTtl = (method: string) =>
+  (isE2eeReadQuery(method, undefined) ? 60_000 : 900_000) + CLOCK_SKEW_TOLERANCE_MS;
 
 type OpenedFeature = {
   input: E2eeFeatureInput;
@@ -58,7 +65,10 @@ export function makeE2eeFeatureRpcClient(options: {
   requesterDevice: string;
   originals: E2eeRpcStore['Service'];
   authorizeRequest: (input: E2eeFeatureInput) => Effect.Effect<void, unknown>;
-  targetSigner: (machineId: string) => Effect.Effect<string, unknown>;
+  targetSigner: (machineId: string, sharedTarget: boolean) => Effect.Effect<string, unknown>;
+  /** Shared execution preflight (`session/fork`): `false` only for a verified withdrawal
+   * on another member's machine. The receiving machine still decides. */
+  authorizeSharedExecution?: (machineId: string) => Effect.Effect<boolean, unknown>;
   binding: (resource: string) => Effect.Effect<Binding, unknown, Scope.Scope>;
 }) {
   options = Object.freeze({
@@ -228,7 +238,7 @@ export function makeE2eeFeatureRpcClient(options: {
     for (const [id, saved] of incoming) if (saved.expiresAt <= now) discard(id);
     if (
       part.expiresAt <= now ||
-      part.expiresAt > now + (isE2eeReadQuery(part.method, undefined) ? 60_000 : 900_000)
+      part.expiresAt > now + featureTtl(part.method) + CLOCK_SKEW_TOLERANCE_MS
     )
       return yield* Effect.fail(new Error('e2ee_feature_expiry'));
     if (part.count === 1) return yield* openFrames(machineId, [frameHex]);
@@ -264,7 +274,17 @@ export function makeE2eeFeatureRpcClient(options: {
     if (args.request.workspaceId !== options.workspaceId)
       return yield* Effect.fail(new Error('e2ee_feature_scope'));
     const machineId = args.request.machineId;
-    const signer = yield* options.targetSigner(machineId);
+    // Only Session, project and history work may target another member's machine.
+    const target = e2eeFeatureTarget(args.request).kind;
+    const sharedExecution = target === 'session' || target === 'project';
+    const signer = yield* options.targetSigner(machineId, target !== 'machine');
+    if (
+      sharedExecution &&
+      !(yield* (options.authorizeSharedExecution?.(machineId) ?? Effect.succeed(true)).pipe(
+        Effect.catch(() => Effect.succeed(true))
+      ))
+    )
+      return yield* Effect.fail(new Error('e2ee_machine_not_shared'));
     let saved = yield* options.originals.read('sent', key(args));
     if (!saved) {
       yield* Effect.uninterruptible(
@@ -277,6 +297,7 @@ export function makeE2eeFeatureRpcClient(options: {
             if (bytes.length > E2EE_FEATURE_MAX_REQUEST_BYTES)
               return yield* Effect.fail(new Error('e2ee_feature_size'));
             const count = Math.ceil(bytes.length / chunkBytes);
+            if (count > 128) return yield* Effect.fail(new Error('e2ee_feature_size'));
             const binding = yield* options.binding(e2eeRpcResource(machineId));
             for (let index = 0; index < count; index++) {
               const chunk = bytes.subarray(index * chunkBytes, (index + 1) * chunkBytes);
@@ -289,9 +310,7 @@ export function makeE2eeFeatureRpcClient(options: {
               const body = yield* attempt(() =>
                 encodeE2eeRpcRequestBody({
                   requestId: unhex(args.requestId),
-                  expiresAt:
-                    now +
-                    (isE2eeReadQuery(args.request.method, args.request.params) ? 60_000 : 900_000),
+                  expiresAt: now + featureTtl(args.request.method),
                   method: args.request.method,
                   params,
                 })
@@ -438,7 +457,7 @@ export function makeE2eeFeatureRpcClient(options: {
       Effect.uninterruptible(
         Effect.scoped(
           Effect.gen(function* () {
-            if ((yield* options.targetSigner(machineId)) !== options.requesterDevice)
+            if ((yield* options.targetSigner(machineId, false)) !== options.requesterDevice)
               return yield* Effect.fail(new Error('e2ee_rpc_target_changed'));
             const responseId = resultKey(request);
             const saved = yield* completeResponse(
@@ -524,7 +543,11 @@ export function makeE2eeFeatureRpcClient(options: {
     if (
       !saved ||
       saved.target !== args.request.machineId ||
-      saved.signer !== (yield* options.targetSigner(saved.target))
+      saved.signer !==
+        (yield* options.targetSigner(
+          saved.target,
+          e2eeFeatureTarget(args.request).kind !== 'machine'
+        ))
     )
       return yield* Effect.fail(new Error('e2ee_rpc_original_missing'));
     const original = yield* openFrames(saved.target, unpackFrames(saved.frame));

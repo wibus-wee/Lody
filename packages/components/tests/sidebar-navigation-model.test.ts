@@ -43,7 +43,7 @@ function sessionIds(items: SidebarNavItem[]): string[] {
 
 const baseOptions = {
   organizeMode: 'workspace' as const,
-  showFullSessionGroups: {},
+  revealedRowsByGroup: {},
   pinnedItems: [] as SidebarUpdatedItem[],
   pinnedSectionCollapsed: false,
   workspace: {
@@ -56,8 +56,8 @@ const baseOptions = {
   },
   updated: {
     items: [] as SidebarUpdatedItem[],
-    collapsed: false,
-    showFull: false,
+    collapsedBuckets: {},
+    revealedRowsByBucket: {},
   },
 };
 
@@ -75,7 +75,7 @@ describe('sidebar navigation model', () => {
                 machineId: 'machine',
                 localProjectId: 'project',
                 collapsed: false,
-                showFull: false,
+                revealedRows: 0,
                 sessions: [{ id: 'local-new' }, { id: 'local-old' }],
               },
             ],
@@ -125,12 +125,62 @@ describe('sidebar navigation model', () => {
           updatedItem('updated-old', '2026-07-16T08:00:00Z'),
           updatedItem('updated-new', '2026-07-16T11:00:00Z'),
         ],
-        collapsed: false,
-        showFull: false,
+        collapsedBuckets: {},
+        revealedRowsByBucket: {},
       },
     });
 
     expect(sessionIds(items)).toEqual(['pinned', 'updated-new', 'updated-old']);
+  });
+
+  it('walks Status Focus in manual order and skips default-collapsed Later/Settled until expanded', () => {
+    const nowMs = Date.now();
+    const recent = (minutesAgo: number) => nowMs - minutesAgo * 60_000;
+    const settledItems = Array.from({ length: 22 }, (_, index) => ({
+      ...updatedItem(`settled-${index}`, nowMs - (10 + index) * 86_400_000),
+    }));
+    const statusItems: SidebarUpdatedItem[] = [
+      ...settledItems,
+      { ...updatedItem('focus-second', recent(1)), orderKey: '82' },
+      { ...updatedItem('focus-first', recent(30)), orderKey: '80' },
+      { ...updatedItem('focus-unkeyed', recent(5)) },
+      { ...updatedItem('later-soon', recent(10)), snoozedUntil: nowMs + 2 * 3_600_000 },
+      { ...updatedItem('later-far', recent(2)), snoozedUntil: nowMs + 3 * 86_400_000 },
+    ];
+
+    const defaultItems = buildSidebarNavigationItems({
+      ...baseOptions,
+      organizeMode: 'status',
+      updated: { items: statusItems, collapsedBuckets: {}, revealedRowsByBucket: {} },
+    });
+    // Later and Settled are collapsed by default; Focus preserves manual orderKey then unkeyed recency.
+    expect(sessionIds(defaultItems)).toEqual(['focus-first', 'focus-second', 'focus-unkeyed']);
+    expect(defaultItems[0]).toEqual({
+      kind: 'session',
+      sessionId: 'focus-first',
+      groupKey: '__status:focus__',
+    });
+
+    const expanded = buildSidebarNavigationItems({
+      ...baseOptions,
+      organizeMode: 'status',
+      updated: {
+        items: statusItems,
+        collapsedBuckets: { later: false, settled: false },
+        revealedRowsByBucket: {},
+      },
+    });
+    const expandedIds = sessionIds(expanded);
+    // Focus (3), Later ascending by wake-up (2), Settled capped at 20.
+    expect(expandedIds.slice(0, 5)).toEqual([
+      'focus-first',
+      'focus-second',
+      'focus-unkeyed',
+      'later-soon',
+      'later-far',
+    ]);
+    expect(expandedIds.slice(5)).toHaveLength(20);
+    expect(expandedIds[5]).toBe('settled-0');
   });
 
   it('matches collapsed sections and each list preview limit', () => {
@@ -152,7 +202,7 @@ describe('sidebar navigation model', () => {
                 machineId: 'machine',
                 localProjectId: 'hidden-project',
                 collapsed: false,
-                showFull: false,
+                revealedRows: 0,
                 sessions: [{ id: 'hidden-local' }],
               },
             ],
@@ -170,7 +220,7 @@ describe('sidebar navigation model', () => {
     const updatedPreview = buildSidebarNavigationItems({
       ...baseOptions,
       organizeMode: 'updated',
-      updated: { items: updatedItems, collapsed: false, showFull: false },
+      updated: { items: updatedItems, collapsedBuckets: {}, revealedRowsByBucket: {} },
     });
     expect(sessionIds(updatedPreview)).toHaveLength(20);
 
@@ -178,51 +228,38 @@ describe('sidebar navigation model', () => {
       ...baseOptions,
       organizeMode: 'updated',
       pinnedItems: [updatedItem('pinned', '2026-07-16T12:00:00Z')],
-      updated: { items: updatedItems, collapsed: true, showFull: true },
+      updated: {
+        items: updatedItems,
+        collapsedBuckets: { all: true },
+        revealedRowsByBucket: { all: 20 },
+      },
     });
     expect(sessionIds(updatedCollapsed)).toEqual(['pinned']);
   });
+});
 
-  it('matches the local-project preview and expanded list', () => {
-    const localSessions = Array.from({ length: 7 }, (_, index) => ({
-      id: `local-${index}`,
-      rootRankMs: 7 - index,
-    }));
-    const localProject = {
-      machineId: 'machine',
-      localProjectId: 'project',
-      collapsed: false,
-      showFull: false,
-      sessions: localSessions,
-    };
-
-    const preview = buildSidebarNavigationItems({
+describe('sidebar navigation model pin sections', () => {
+  it('walks pin sections in their order and manual row order, skipping folded sections', () => {
+    const items = buildSidebarNavigationItems({
       ...baseOptions,
-      workspace: {
-        ...baseOptions.workspace,
-        localSections: [{ collapsed: false, projects: [localProject] }],
-      },
+      pinnedSections: [
+        { id: null, items: [updatedItem('loose', '2026-07-16T12:00:00Z')], collapsed: false },
+        {
+          id: 'maintenance',
+          // Manual order: the older conversation stays first.
+          items: [
+            updatedItem('weekly-mirror', '2026-07-01T12:00:00Z'),
+            updatedItem('deps-bump', '2026-07-16T13:00:00Z'),
+          ],
+          collapsed: false,
+        },
+        { id: 'folded', items: [updatedItem('hidden', '2026-07-16T14:00:00Z')], collapsed: true },
+      ],
     });
-    expect(sessionIds(preview)).toEqual(['local-0', 'local-1', 'local-2', 'local-3', 'local-4']);
-    expect(preview.at(-1)).toEqual({
-      kind: 'show-more',
-      groupKey: 'local-project:machine:project',
-      expanded: false,
-    });
-
-    const expanded = buildSidebarNavigationItems({
-      ...baseOptions,
-      workspace: {
-        ...baseOptions.workspace,
-        localSections: [{ collapsed: false, projects: [{ ...localProject, showFull: true }] }],
-      },
-    });
-    expect(sessionIds(expanded)).toEqual(localSessions.map((session) => session.id));
-    expect(expanded.at(-1)).toEqual({
-      kind: 'show-more',
-      groupKey: 'local-project:machine:project',
-      expanded: true,
-    });
+    expect(sessionIds(items)).toEqual(['loose', 'weekly-mirror', 'deps-bump']);
+    expect(
+      items.find((item) => item.kind === 'session' && item.sessionId === 'deps-bump')
+    ).toMatchObject({ groupKey: '__pinned__' });
   });
 });
 
@@ -237,8 +274,8 @@ describe('sidebar navigation model opened-by tree', () => {
           { ...updatedItem('other', '2026-04-22T09:00:00.000Z') },
           { ...updatedItem('opened', '2026-04-22T08:00:00.000Z'), openedBySessionId: 'opener' },
         ],
-        collapsed: false,
-        showFull: false,
+        collapsedBuckets: {},
+        revealedRowsByBucket: {},
       },
     });
 
@@ -256,8 +293,8 @@ describe('sidebar navigation model opened-by tree', () => {
           { ...updatedItem('opened', '2026-04-22T08:00:00.000Z'), openedBySessionId: 'opener' },
           updatedItem('other', '2026-04-22T07:00:00.000Z'),
         ],
-        collapsed: false,
-        showFull: false,
+        collapsedBuckets: {},
+        revealedRowsByBucket: {},
       },
     });
 
@@ -276,8 +313,8 @@ describe('sidebar navigation model opened-by tree', () => {
           { ...updatedItem('opened', '2026-04-22T08:00:00.000Z'), openedBySessionId: 'opener' },
           updatedItem('other', '2026-04-22T07:00:00.000Z'),
         ],
-        collapsed: false,
-        showFull: false,
+        collapsedBuckets: {},
+        revealedRowsByBucket: {},
       },
     });
 
@@ -324,7 +361,7 @@ describe('sidebar navigation model opened-by tree', () => {
                 machineId: 'machine-1',
                 localProjectId: 'notes',
                 collapsed: true,
-                showFull: false,
+                revealedRows: 0,
                 sessions: [],
               },
             ],

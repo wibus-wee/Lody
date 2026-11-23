@@ -3,9 +3,9 @@
 `CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
 
 Machine PR discovery, lifecycle, CI and merge/conflict reconciliation.
-Local authorization contract: [Spec](../../../../../specs/local-github-pr-observation.md).
+[Authorization](../../../../../specs/local-github-pr-observation.md).
 
-## Architecture: pure decisions, thin effects
+## Architecture
 
 Pure modules own policy; `pr-poll-scheduler.ts` wires facts → decisions → effects. Do not add priority/quota/selection/write-back
 logic to the scheduler, the GraphQL client, or the workspace adapter.
@@ -76,6 +76,13 @@ Effect adapters: `pr-poller-workspace.ts` (Loro repo + presence + credentials
   provider-clocked Flock entries; machines use the ordinary local writer. Retain orphan
   records until session purge.
   Rewrites strip legacy detail fields and `.r` readiness on touch.
+- **Explicit links are intent.** `prLink:*` records (renderer for user unlinks, daemon for
+  shim/agent reports) never edit `pullRequests`. A linked URL is queried by number and
+  appended only after a valid provider result; unreadable results write `prLinkCheck:*`.
+  Unlinked URLs are removed without a query and branch discovery never re-adds them.
+  A newly linked PR becomes current, and an open linked current PR stays current until
+  another PR is newly associated: never rank by `updatedAt` across them.
+  [Decision](../../../../../.agents/notes/implemented/feature/2026-11-21-session-explicit-pr-links.md).
 - **Machine ownership.** Each daemon enumerates only session metas whose
   `machineId` matches the local machine; archived owners are excluded.
 - **Deleted sessions get nothing.** Missing/tombstoned meta stops both writes
@@ -105,6 +112,7 @@ Effect adapters: `pr-poller-workspace.ts` (Loro repo + presence + credentials
   cadence so gating never delays a login or account switch;
   scope-wide skips log once per gate window; and a metadata write counts as a
   change only when `computePrPollMetaSignature` moves.
+- CI demand follows [Automations](../../automations/AGENTS.md).
 - **No turn-end hook.** `lastMessageAt` wakes terminal discovery. Persist the
   dispatched activity snapshot only after success; later activity remains due.
   Checkpoints outlive pruned targets. Never stamp fresh writeback activity.

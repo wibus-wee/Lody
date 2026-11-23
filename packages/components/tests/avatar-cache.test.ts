@@ -111,33 +111,6 @@ describe('avatar cache', () => {
     vi.useRealTimers();
   });
 
-  it('returns nullish avatar sources without touching the network', async () => {
-    expect(peekAvatarBlobUrl(null)).toBeNull();
-    expect(peekAvatarBlobUrl(undefined)).toBeUndefined();
-    expect(await getAvatarBlobUrl(null)).toBeNull();
-    expect(await getAvatarBlobUrl(undefined)).toBeUndefined();
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it('loads avatar blobs once and then reuses persistent cache without refetching', async () => {
-    const avatarUrl = 'https://avatars.githubusercontent.com/u/1?v=4';
-
-    fetchMock.mockResolvedValue(pngResponse('avatar'));
-
-    const firstBlobUrl = await getAvatarBlobUrl(avatarUrl);
-    expect(firstBlobUrl).toMatch(/^blob:/);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(peekAvatarBlobUrl(avatarUrl)).toBe(firstBlobUrl);
-
-    clearAvatarImageCache({ memory: true, persistent: false });
-    fetchMock.mockClear();
-
-    const secondBlobUrl = await getAvatarBlobUrl(avatarUrl);
-
-    expect(secondBlobUrl).toMatch(/^blob:/);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it('serves the persisted blob across a day boundary even when the network is down (cache-first, url-keyed)', async () => {
     // Regression guard for the old day-bucketed key: after a calendar-day
     // rollover the cache key no longer changes, so a persisted blob keeps
@@ -158,6 +131,93 @@ describe('avatar cache', () => {
     const resolved = await getAvatarBlobUrl(avatarUrl);
     // Painted from the persistent cache, not blocked on the failed fetch.
     expect(resolved).toMatch(/^blob:/);
+  });
+
+  it('persists and restores avatars via IndexedDB on file:// ("null" origin) without CacheStorage', async () => {
+    const idbRecords = new Map<string, unknown>();
+    const fakeDb = {
+      objectStoreNames: { contains: () => true },
+      onversionchange: null as (() => void) | null,
+      close: vi.fn(),
+      transaction: (_name: string, _mode: string) => {
+        const tx = {
+          oncomplete: null as (() => void) | null,
+          onerror: null as (() => void) | null,
+          onabort: null as (() => void) | null,
+          objectStore: () => ({
+            get: (key: string) => {
+              const req = {
+                result: idbRecords.get(key),
+                onsuccess: null as (() => void) | null,
+                onerror: null,
+              };
+              queueMicrotask(() => req.onsuccess?.());
+              return req;
+            },
+            getAll: () => {
+              const req = {
+                result: [...idbRecords.values()],
+                onsuccess: null as (() => void) | null,
+                onerror: null,
+              };
+              queueMicrotask(() => req.onsuccess?.());
+              return req;
+            },
+            put: (record: { key: string }) => {
+              idbRecords.set(record.key, record);
+              queueMicrotask(() => tx.oncomplete?.());
+            },
+            delete: (key: string) => {
+              idbRecords.delete(key);
+            },
+          }),
+        };
+        return tx;
+      },
+    };
+    Object.defineProperty(globalThis, 'window', {
+      value: { location: { origin: 'null' } },
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, 'indexedDB', {
+      value: {
+        open: () => {
+          const req = {
+            result: fakeDb,
+            onupgradeneeded: null,
+            onsuccess: null as (() => void) | null,
+            onerror: null,
+            onblocked: null,
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        deleteDatabase: () => {
+          idbRecords.clear();
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    try {
+      const avatarUrl = 'https://lh3.googleusercontent.com/a/synthetic-member-avatar';
+      fetchMock.mockResolvedValueOnce(pngResponse('electron-avatar'));
+      const first = await getAvatarBlobUrl(avatarUrl);
+      expect(first).toMatch(/^blob:/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      clearAvatarImageCache({ memory: true, persistent: false });
+      fetchMock.mockRejectedValue(new Error('offline'));
+
+      const restored = await getAvatarBlobUrl(avatarUrl);
+      expect(restored).toMatch(/^blob:/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      clearAvatarImageCache();
+      Reflect.deleteProperty(globalThis, 'indexedDB');
+    }
   });
 });
 

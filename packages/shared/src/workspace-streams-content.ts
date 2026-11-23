@@ -93,9 +93,12 @@ export function encryptedWorkspaceResolver(
   };
 }
 
-/** Shared feature verdicts: schedules use protected CRDT; minimal presence stays plaintext. */
+/** Shared feature verdicts: schedules use protected CRDT; minimal presence stays plaintext.
+ * Automations run on the local Host with machine-signed inputs; their remote control
+ * rides workspace Machine RPC and therefore follows `rpc`. */
 export type WorkspaceRestrictedFeature =
   | 'schedules'
+  | 'automations'
   | 'preview-comments'
   | 'code-collab-index'
   | 'shortcuts'
@@ -123,7 +126,8 @@ export function workspaceSupports(
     feature === 'presence' ||
     feature === 'export' ||
     feature === 'attachments' ||
-    feature === 'schedules'
+    feature === 'schedules' ||
+    feature === 'automations'
   );
 }
 
@@ -136,9 +140,12 @@ export type WorkspaceEpochStatus = {
 /** Reception progress only: every non-closed phase permits retained-epoch sends. */
 export type WorkspaceEpochPhase = 'ready' | 'installing' | 'waiting-key' | 'failed' | 'closed';
 
-/** Stable room providers select a confirmed installed epoch per operation.
- * Reception never removes transports or blocks old-epoch sends. Timed-out raw
- * work stays owned until settlement; its late receipt cannot commit a selection.
+/** Stable room providers retain epoch hints for UI/token coordination. Native
+ * hosts select the verified current epoch for new seals; these hints grant no
+ * authority to seal new content at an older epoch. Reception never removes
+ * transports or blocks already sealed old-epoch sends. Timed-out raw
+ * work stays owned until settlement; its late receipt cannot commit a selection,
+ * but `onLateInstallation` tells the owner to run a fresh transition then.
  * @deprecated Compose this Promise SDK boundary when its callers migrate.
  */
 export function createWorkspaceEpochTransitionLegacy(input: {
@@ -146,6 +153,8 @@ export function createWorkspaceEpochTransitionLegacy(input: {
   rotationRequired?: boolean;
   timeoutMs?: number;
   onPhase?: (phase: WorkspaceEpochPhase) => void;
+  /** A timed-out installation settled. Its result is not used; call `transition` again. */
+  onLateInstallation?: () => void;
 }) {
   let epoch = input.epoch;
   let latest: WorkspaceEpochStatus = {
@@ -219,20 +228,20 @@ export function createWorkspaceEpochTransitionLegacy(input: {
       publish('installing');
       const raw = Promise.resolve().then(ports.install);
       installation = raw;
-      void raw.then(
-        () => {
-          if (installation === raw) installation = undefined;
-        },
-        () => {
-          if (installation === raw) installation = undefined;
-        }
-      );
+      let timedOut = false;
+      const settle = () => {
+        if (installation === raw) installation = undefined;
+        // A slow installation is not a failed one: the owner's retry while it ran
+        // found it still owned, so nothing else would select its epoch.
+        if (timedOut && !isClosed()) input.onLateInstallation?.();
+      };
+      void raw.then(settle, settle);
       let timer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error('e2ee_key_update_timeout')),
-          input.timeoutMs ?? 10_000
-        );
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error('e2ee_key_update_timeout'));
+        }, input.timeoutMs ?? 10_000);
       });
       flight = (async () => {
         try {

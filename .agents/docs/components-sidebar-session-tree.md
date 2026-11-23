@@ -38,9 +38,13 @@ live outside it.
 
 ## Nesting inside one rendered list
 
-Nesting is resolved inside a single rendered list, which is what keeps section
-boundaries intact: a pinned opener and an unpinned opened Session are in different
-arrays, so both stay top-level. The tree never hides a Session — a missing,
+Desktop section membership is resolved before nesting: `getPinnedSessionTreeIds`
+keeps a pinned opener and its visible opened-by descendants together in Pinned.
+Workspace and Updated exclude that same set, so rows never appear twice. This
+does not change descendants' own pin flags: unpinning an opener returns its tree
+to the ordinary list, while an independently pinned descendant keeps its subtree
+in Pinned. Missing or filtered openers do not pull otherwise visible rows into Pinned.
+Nesting is then resolved inside each rendered list. The tree never hides a Session — a missing,
 cross-section, cycling, or deeper-than-one-level opener degrades to a top-level
 row — and the preview cap counts top-level rows so a bucket's visible size does not
 depend on how deeply it happens to nest.
@@ -53,7 +57,8 @@ moves each such row into the group of its topmost rendered ancestor, so the fan-
 stays legible. The row leaves its own group, keeping every Session in exactly one
 place for keyboard navigation and counts; it travels with its opener when that group
 is folded. Only rendered groups take part, so an opener in a hidden project, the
-Pinned section or the archive leaves the row where it was. A Local Project Session
+archive leaves the row where it was. Pinned trees have already been removed from
+Workspace groups before this placement. A Local Project Session
 joining a task group becomes a task row, and a local group's hover card names the
 moved row's own Machine rather than the project's. Two alternatives were rejected:
 making the remote Session a `parentSessionId` child, which would break the child
@@ -95,9 +100,10 @@ Work, wait, unread and send status is still the end slot's alone; +/- totals sta
 
 The opener and unrelated top-level rows keep the exact flat-list alignment; only a child
 widens the shared leading slot from 14px to 26px, which produces the 12px title indent
-without shifting the row background. The node and its hover menu share a 7px centre:
-replacing a disclosure or connector with ⋯ therefore leaves the title in place. The
-context-menu expand/collapse action uses the disclosure's callback, so either route
+without shifting the row background. The slot used to lend that same centre to the row's
+⋯ on hover; the menu now reveals in the end slot immediately before Archive, so a
+disclosure or connector keeps the 7px centre to itself and stays drawn while hovering.
+The context-menu expand/collapse action uses the disclosure's callback, so either route
 changes the same tree state.
 
 The connector is drawn from the slot, but its length encodes the ROW, and it reads the
@@ -140,6 +146,14 @@ end slot still shows one thing at a time: a running row reads `[├─ title ...
 with nothing competing for the right edge and more room for the title. Nothing is lost —
 the diff, branch, and PR detail were already in the desktop hover info card, which is
 where a user goes when they want numbers rather than a glance.
+
+The end slot reserves a 20px column per revealed action (⋯ parks left of Archive).
+That reservation is what keeps the actions off the title: the title is a flex sibling
+that truncates (or, while its marquee runs, clips inside its own container) before the
+slot. The slot paints no background of its own. An earlier slot fill tried to match the
+row's hover or selection fill, but any mismatch (a selected `group/row` row whose
+selection override never compiled, or the fill's transition lagging the row's) showed
+as a separate grey block around the icons; the ⋯'s pressed tint is an inset shadow.
 
 The mobile chat rows still keep status on their leading node; their geometry (48px
 indent, a selection checkbox in the same slot, a chevron that has to sit outside the row

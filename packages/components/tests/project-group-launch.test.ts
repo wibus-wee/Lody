@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildSessionProjectRun,
-  PROJECT_SUBMODULE_BASE,
-  SessionProjectRunSchema,
   type LocalProjectId,
   type MachineId,
   type ProjectId,
@@ -15,7 +13,10 @@ import {
   getProjectGroupMachineAvailability,
   resolveProjectGroupLaunchTarget,
 } from '@/lib/project-group-launch';
-import { placeProjectGroups } from '@/lib/project-group-placement';
+import {
+  placeProjectGroups,
+  selectVisibleLocalProjectSections,
+} from '@/lib/project-group-placement';
 
 const id = (value: string) => value as ProjectMemberId;
 const project: WorkspaceProject = {
@@ -83,28 +84,6 @@ describe('project group launch', () => {
       kind: 'machines_conflict',
       machineIds: ['machine-1', 'machine-2'],
     });
-  });
-
-  // The snapshot itself is the shared contract's; this pins the shape the
-  // landing relies on.
-  it('freezes a snapshot the shared contract accepts', () => {
-    const run = buildSessionProjectRun(
-      project,
-      project.members.map((member) => member.id)
-    );
-    expect(SessionProjectRunSchema.safeParse(run).success).toBe(true);
-    expect(run).toMatchObject({
-      id: project.id,
-      name: 'Shop',
-      instructions: 'web is the frontend',
-      root: `project-shop-${project.id}`,
-    });
-    expect(run!.members[id('proto')]).toMatchObject({
-      o: 2,
-      path: 'api/proto',
-      base: PROJECT_SUBMODULE_BASE,
-    });
-    expect(run!.members[id('api')]!.base).toBe('develop');
   });
 
   it('leaves one remaining member to an ordinary single-project conversation', () => {
@@ -232,5 +211,32 @@ describe('project placement in the sidebar', () => {
       states: [state(portable.id), state(offList.id)],
       sessions: [row('b', portable.id), row('c', 'deleted'), row('d', offList.id)],
     });
+  });
+
+  it('lists empty local projects in the Project view only when Hide Empty Projects is off', () => {
+    const m1 = 'machine-1' as MachineId;
+    const m2 = 'machine-2' as MachineId;
+    const m3 = 'machine-3' as MachineId;
+    const sections = [
+      { machineId: m1, projects: [{ id: 'web' }, { id: 'scratch' }] },
+      // Only empty folders, but a multi-repository project with conversations.
+      { machineId: m2, projects: [{ id: 'notes' }] },
+      // Only empty folders and nothing else.
+      { machineId: m3, projects: [{ id: 'old' }] },
+    ];
+    const sessions = new Map([[`${m1}:web`, 2]]);
+    const select = (hideEmptyProjects: boolean) =>
+      selectVisibleLocalProjectSections({
+        sections,
+        hideEmptyProjects,
+        sessionCountOf: (machineId, projectId) => sessions.get(`${machineId}:${projectId}`) ?? 0,
+        projectGroupSessionCountOf: (machineId) => (machineId === m2 ? 1 : 0),
+      });
+
+    expect(select(true)).toEqual([
+      { machineId: m1, projects: [{ id: 'web' }] },
+      { machineId: m2, projects: [] },
+    ]);
+    expect(select(false)).toEqual(sections);
   });
 });

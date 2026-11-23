@@ -58,10 +58,16 @@ vi.mock('../src/components/electron-menu-handler', () => ({ ElectronMenuHandler:
 vi.mock('../src/components/app-commands', () => ({ AppCommands: () => null }));
 vi.mock('../src/components/commands/command-palette', () => ({ CommandPalette: () => null }));
 
-vi.mock('../src/hooks/use-visible-session-metas', async () => {
+vi.mock('../src/hooks/use-visible-session-metas', async (importOriginal) => {
   const { useAtomValue: useTestAtomValue } = await import('jotai');
   const { sessionMetaCacheAtom: projectedSessionCacheAtom } = await import('../src/atoms/doc-meta');
   return {
+    ...(await importOriginal<typeof import('../src/hooks/use-visible-session-metas')>()),
+    useVisibleMachineIdSet: () => ({
+      visibleMachineIds: new Set(['machine-1']),
+      ownedMachineIds: new Set(['machine-1']),
+      isLoading: false,
+    }),
     useVisibleSessionMetas: () => ({
       sessions: Object.values(useTestAtomValue(projectedSessionCacheAtom)).filter(
         (session) => !session.isArchived
@@ -78,7 +84,7 @@ vi.mock('../src/hooks/use-visible-session-metas', async () => {
 const testPlatform: PlatformProvider = {
   kind: 'cloud',
   identity: {
-    session: createStaticStore({ status: 'unauthenticated' }),
+    session: createStaticStore({ status: 'authenticated', user: { id: 'user-1' } }),
     signOut: async () => {},
   },
   workspaces: {

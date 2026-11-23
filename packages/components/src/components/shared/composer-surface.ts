@@ -26,6 +26,11 @@ import {
  *   the semantic tokens they resolve to): 28px, 8px in, 10px corners, the
  *   highlight mixed 6% from the surface toward the ink, the tick at the end.
  * - A search field on that surface is typed into, so it is still the well.
+ * - Weight is 400 for every label, and 500 only for a value being typed or
+ *   chosen (a field, a search box). 550 would be a nicer optical step where
+ *   the face is variable, but the fallback resolves through static Inter,
+ *   where CSS font matching rounds 550 up to 600 and makes the input the
+ *   heaviest text in the composer.
  *
  * StyleX has no attribute or descendant selector: open, highlighted and
  * compact are read from state or a container query and applied as classes.
@@ -63,7 +68,7 @@ export const composerSurface = stylex.create({
     outlineStyle: 'none',
     fontFamily: 'inherit',
     fontSize: text.subheadlineSize,
-    fontWeight: 550,
+    fontWeight: 400,
     fontVariationSettings: "'opsz' 18",
     lineHeight: text.subheadlineLeading,
     whiteSpace: 'nowrap',
@@ -100,6 +105,13 @@ export const composerSurface = stylex.create({
     justifyContent: { default: 'flex-start', [COMPACT_FACE]: 'center' },
   },
 
+  /** Text shared by peer controls in the context row above the composer. */
+  contextLabel: {
+    fontSize: text.subheadlineSize,
+    lineHeight: text.subheadlineLeading,
+    fontWeight: 400,
+  },
+
   /* ── Context pill (above the composer) ───────────────────────────────── */
 
   /**
@@ -121,6 +133,11 @@ export const composerSurface = stylex.create({
     backgroundImage: sheen.raised,
     boxShadow: shadow.raised,
   },
+  /**
+   * In a one-row property bar (the embedded landing), the branch pill keeps its
+   * size: the machine and project labels truncate first.
+   */
+  contextPillFixed: { flexShrink: 0 },
   /** The line between the pill's two halves. */
   contextPillDivider: {
     flexShrink: 0,
@@ -236,7 +253,7 @@ export const composerSurface = stylex.create({
     color: colors.label,
     fontFamily: 'inherit',
     fontSize: text.subheadlineSize,
-    fontWeight: 550,
+    fontWeight: 500,
     fontVariationSettings: "'opsz' 18",
     lineHeight: text.subheadlineLeading,
     whiteSpace: 'nowrap',
@@ -407,7 +424,7 @@ export const composerSurface = stylex.create({
     color: colors.label,
     fontFamily: 'inherit',
     fontSize: text.subheadlineSize,
-    fontWeight: 550,
+    fontWeight: 500,
     fontVariationSettings: "'opsz' 18",
     '::placeholder': { color: colors.tertiaryLabel, opacity: 1 },
   },

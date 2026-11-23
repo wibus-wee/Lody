@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+
+import { listRepositoryFiles } from './repository-files.mjs';
 
 // Public protocol families whose ordinary content APIs reject encrypted workspaces.
 // A new operation in one of these families requires admission without updating this list.
@@ -118,9 +119,22 @@ const exceptions = new Map([
     'apps/cli/src/lib/cloud-cli-port.ts',
     new Map([
       [
+        'machines:canRequestSessionReadFromCliToken',
+        'Ordinary MCP history preflight only; encrypted reads use the verified native policy host. Mode denial fails the requested read before joining history.',
+      ],
+      [
         'auth:getWorkspaceUserProfileForCliToken',
         'Ordinary CLI profile lookup; encrypted machine composition has no account catalog capability. Backend mode rejection yields no profile.',
       ],
+    ]),
+  ],
+  [
+    'packages/components/src/providers/cloud-session-access.ts',
+    new Map([
+      ...['machines:listSessionAccess', 'machines:setSessionReadSharedWithTeam'].map((name) => [
+        name,
+        'Imperative platform port: CloudPlatformProvider supplies assertScope using the shared live legacy admission verdict before every ordinary read, write or subscription; asynchronous reads fence account/runtime changes.',
+      ]),
     ]),
   ],
   [
@@ -291,17 +305,7 @@ export function auditLegacyCloudSource(file, source) {
 }
 
 export function auditLegacyCloudTree(root) {
-  const files = [
-    ...new Set(
-      execFileSync('git', ['ls-files', '-co', '--exclude-standard'], {
-        cwd: root,
-        encoding: 'utf8',
-        maxBuffer: 20 * 1024 * 1024,
-      })
-        .trim()
-        .split('\n')
-    ),
-  ];
+  const files = [...new Set(listRepositoryFiles(root))];
   const rows = [],
     errors = [];
   for (const file of files) {
@@ -315,7 +319,15 @@ export function auditLegacyCloudTree(root) {
       file === 'packages/components/src/lib/cloud-api-operations.ts'
     )
       continue;
-    const result = auditLegacyCloudSource(file, fs.readFileSync(path.join(root, file), 'utf8'));
+    let source;
+    try {
+      source = fs.readFileSync(path.join(root, file), 'utf8');
+    } catch (error) {
+      // The pre-commit gate sees tracked files deleted from the working tree.
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    const result = auditLegacyCloudSource(file, source);
     rows.push(...result.rows);
     errors.push(...result.errors);
   }

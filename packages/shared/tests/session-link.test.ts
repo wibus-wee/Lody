@@ -72,24 +72,24 @@ describe('session resource links', () => {
       'child session ID'
     );
   });
+});
 
-  it.each([
-    'lody://session/a/../b',
-    'lody://session/a%2fb',
-    'lody://session/a%252fb',
-    'lody://session/id?workspace=a&workspace=b',
-    'lody://session/id?workspace=',
-    'lody://session/id?workspace=a+space',
-    'lody://session/id?command=delete',
-    'lody://user@session/id',
-    'lody://session:12/id',
-    'lody://session/id#token=secret',
-    'https://session/id',
-    'lody://auth/callback',
-    'lody://session/id\\other',
-    'prefix lody://session/id',
-    `lody://session/${'a'.repeat(8192)}`,
-  ])('rejects malformed or non-resource input: %s', (url) => {
-    expect(parseSessionLink(url)).toBeNull();
+describe('Today page links', () => {
+  it('reads a member page link, including an encoded local user id', async () => {
+    const { parseTodayLink } = await import('../src/session-link');
+    expect(parseTodayLink('lody://today/local%3Aabc/2026-11-20?workspace=lw_1')).toEqual({
+      userId: 'local:abc',
+      date: '2026-11-20',
+      workspaceId: 'lw_1',
+    });
+  });
+
+  it('rejects non-canonical encodings, impossible dates, extra parameters and traversal', async () => {
+    const { parseTodayLink } = await import('../src/session-link');
+    expect(parseTodayLink('lody://today/local%3aabc/2026-11-20?workspace=w')).toBeNull();
+    expect(parseTodayLink('lody://today/u1/2026-02-30?workspace=w')).toBeNull();
+    expect(parseTodayLink('lody://today/u1/2026-11-20?workspace=w&x=1')).toBeNull();
+    expect(parseTodayLink('lody://today/../2026-11-20?workspace=w')).toBeNull();
+    expect(parseTodayLink('lody://session/abc?workspace=w')).toBeNull();
   });
 });

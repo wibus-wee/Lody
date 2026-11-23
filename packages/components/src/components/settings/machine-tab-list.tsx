@@ -43,6 +43,8 @@ export type MachineTabListProps = {
   /** Workspace Machines are all shared, so show ownership instead of redundant access state. */
   showOwner?: boolean;
   ownerByUserId?: ReadonlyMap<string, MachineTabOwner>;
+  /** What an empty list says before any filter applies; defaults to no machines connected. */
+  emptyLabel?: string;
 };
 
 export function MachineTabList({
@@ -56,6 +58,7 @@ export function MachineTabList({
   showFilter = true,
   showOwner = false,
   ownerByUserId,
+  emptyLabel,
 }: MachineTabListProps) {
   const { t } = useTranslation();
   const scopeId = useId();
@@ -71,7 +74,7 @@ export function MachineTabList({
 
   return (
     <Tooltip.Provider delay={250}>
-      <FocusScope id={scopeId} {...stylex.props(styles.scope)}>
+      <FocusScope data-testid="settings-machines" id={scopeId} {...stylex.props(styles.scope)}>
         <div {...stylex.props(styles.header)}>
           <p {...stylex.props(styles.title)}>{t('workspace.machines.title', 'Machines')}</p>
           {showFilter ? (
@@ -113,9 +116,9 @@ export function MachineTabList({
             </ul>
           )}
           {items.length === 0 && (
-            <div {...stylex.props(styles.empty)}>
+            <div data-testid="settings-machines-empty" {...stylex.props(styles.empty)}>
               {totalBeforeFilter === 0
-                ? t('workspace.machines.empty', 'No machines connected')
+                ? (emptyLabel ?? t('workspace.machines.empty', 'No machines connected'))
                 : t(
                     'settings.agent.machineTabs.filter.noMatch',
                     'No machines match these filters.'
@@ -200,6 +203,7 @@ function MachineTab({
         aria-current={isSelected ? 'true' : undefined}
         data-id={`machine:${item.machine.id}`}
         data-scope-item="row"
+        data-testid="settings-machine"
         data-settings-machine-id={item.machine.id}
         onClick={onSelect}
         aria-pressed={isSelected}
@@ -254,6 +258,7 @@ function DetailedMachineTab({
         aria-current={isSelected ? 'true' : undefined}
         data-id={`machine:${item.machine.id}`}
         data-scope-item="row"
+        data-testid="settings-machine"
         data-settings-machine-id={item.machine.id}
         onClick={onSelect}
         aria-pressed={isSelected}
@@ -416,10 +421,14 @@ const styles = stylex.create({
     fontWeight: 400,
     color: colors.secondaryLabel,
   },
+  /* `auto`, not 0: mobile Settings mounts this list inside a page ScrollArea
+     whose content has no definite height, where a zero basis with
+     `min-height: 0` collapses the rows to nothing. A bounded parent still
+     shrinks it to fit and scrolls here. */
   scroller: {
     flexGrow: 1,
     flexShrink: 1,
-    flexBasis: 0,
+    flexBasis: 'auto',
     minHeight: 0,
     minWidth: 0,
     overflowY: 'auto',
@@ -519,7 +528,7 @@ const styles = stylex.create({
   },
   accessIcon: { width: '12px', height: '12px' },
   tooltipTitle: { margin: 0 },
-  tooltipHint: { margin: 0, marginTop: '2px', opacity: 0.7 },
+  tooltipHint: { margin: 0, marginTop: '2px', color: colors.secondaryLabel },
 });
 
 export function buildMachineTabItems(params: {

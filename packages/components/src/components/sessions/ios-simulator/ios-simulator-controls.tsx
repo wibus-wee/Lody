@@ -1,3 +1,4 @@
+import { useDevicePreviewPlatform } from './device-preview-platform';
 import { useLayoutEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import * as stylex from '@stylexjs/stylex';
 import {
@@ -19,12 +20,16 @@ import {
   Smartphone,
   Sun,
   SunMoon,
+  TextCursorInput,
   Vibrate,
   Volume1,
   Volume2,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import type { IosSimulatorDeviceControl } from '@lody/shared';
+import type {
+  AndroidEmulatorQuality,
+  DevicePreviewControl as IosSimulatorDeviceControl,
+} from '@lody/shared';
 import { Button } from '@lody/ui/button';
 import { Menu } from '@lody/ui/menu';
 import { Toggle } from '@lody/ui/toggle';
@@ -65,10 +70,15 @@ export type IosSimulatorControlsProps = {
   onScreenshot: (target: IosSimulatorScreenshotTarget) => void;
   onViewModeChange: (mode: IosSimulatorViewMode) => void;
   onToggleFullscreen: () => void;
+  /** Android capture quality; lives in the More menu, never its own row. */
+  quality?: {
+    onChange: (value: AndroidEmulatorQuality) => void;
+    disabled?: boolean;
+  } | null;
 };
 
 type ControlItem = {
-  id: string;
+  id: IosSimulatorControlId;
   label: string;
   icon: Icon;
   disabled: boolean;
@@ -116,6 +126,7 @@ const styles = stylex.create({
 });
 
 function useControlGroups(props: IosSimulatorControlsProps) {
+  const platform = useDevicePreviewPlatform();
   const { t } = useTranslation();
   const { controlsSupported, availability, pendingControl, onControl, onTypeText, onOpenUrl } =
     props;
@@ -139,6 +150,9 @@ function useControlGroups(props: IosSimulatorControlsProps) {
       label: t('sessions.iosSimulator.controls.navigation', 'Navigation'),
       keepAt: 'narrow',
       items: [
+        ...(availability.back
+          ? [item('back', t('sessions.devicePreview.back', 'Back'), RotateCcw, button('back'))]
+          : []),
         item('home', t('sessions.iosSimulator.controls.home', 'Home'), House, button('home')),
         item(
           'app-switcher',
@@ -162,7 +176,9 @@ function useControlGroups(props: IosSimulatorControlsProps) {
         ),
         item(
           'rotate-right',
-          t('sessions.iosSimulator.controls.rotateRight', 'Rotate right'),
+          platform === 'android'
+            ? t('sessions.devicePreview.rotate', 'Rotate')
+            : t('sessions.iosSimulator.controls.rotateRight', 'Rotate right'),
           RotateCw,
           () => onControl({ kind: 'rotate', direction: 'right' })
         ),
@@ -202,9 +218,15 @@ function useControlGroups(props: IosSimulatorControlsProps) {
       keepAt: 'wide',
       items: [
         item(
+          'software-keyboard',
+          t('sessions.iosSimulator.controls.toggleKeyboard', 'Show/hide simulator keyboard'),
+          Keyboard,
+          button('software-keyboard')
+        ),
+        item(
           'text',
           t('sessions.iosSimulator.controls.typeText', 'Type text…'),
-          Keyboard,
+          TextCursorInput,
           onTypeText
         ),
         item(
@@ -216,7 +238,14 @@ function useControlGroups(props: IosSimulatorControlsProps) {
       ],
     },
   ];
-  return groups;
+  return platform === 'android'
+    ? groups
+        .map((group) => ({
+          ...group,
+          items: group.items.filter((entry) => availability[entry.id]),
+        }))
+        .filter((group) => group.items.length > 0)
+    : groups;
 }
 
 function ToolbarIconButton({
@@ -369,6 +398,26 @@ function ViewRows({ props }: { props: IosSimulatorControlsProps }) {
   );
 }
 
+function QualityRows({ quality }: { quality: NonNullable<IosSimulatorControlsProps['quality']> }) {
+  const { t } = useTranslation();
+  return (
+    <Menu.Group>
+      <Menu.GroupLabel>
+        {t('sessions.androidEmulator.quality.label', 'Preview quality')}
+      </Menu.GroupLabel>
+      <Menu.Item disabled={quality.disabled} onClick={() => quality.onChange('saver')}>
+        {t('sessions.androidEmulator.quality.saver', 'Data saver')}
+      </Menu.Item>
+      <Menu.Item disabled={quality.disabled} onClick={() => quality.onChange('balanced')}>
+        {t('sessions.androidEmulator.quality.balanced', 'Balanced')}
+      </Menu.Item>
+      <Menu.Item disabled={quality.disabled} onClick={() => quality.onChange('clear')}>
+        {t('sessions.androidEmulator.quality.clear', 'Clear')}
+      </Menu.Item>
+    </Menu.Group>
+  );
+}
+
 function GroupRows({ group }: { group: ControlGroup }) {
   return (
     <Menu.Group>
@@ -442,6 +491,7 @@ export function IosSimulatorControls(props: IosSimulatorControlsProps) {
             <Menu.GroupLabel>{t('sessions.iosSimulator.controls.view', 'View')}</Menu.GroupLabel>
             <ViewRows props={props} />
           </Menu.Group>
+          {props.quality ? <QualityRows quality={props.quality} /> : null}
         </Menu.Content>
       </Menu.Root>
     );
@@ -452,6 +502,7 @@ export function IosSimulatorControls(props: IosSimulatorControlsProps) {
   const shown = groups.filter(fits);
   const folded = groups.filter((group) => !fits(group));
   const appearanceFits = density === 'wide';
+  const foldsControls = props.controlsSupported && !appearanceFits;
   return (
     <div ref={rowRef} {...stylex.props(styles.row)} data-testid="ios-simulator-controls">
       <Tooltip.Provider delay={350}>
@@ -487,20 +538,25 @@ export function IosSimulatorControls(props: IosSimulatorControlsProps) {
               <AppearanceRows props={props} />
             </MenuTriggerButton>
           ) : null}
-          {props.controlsSupported && !appearanceFits ? (
+          {foldsControls || props.quality ? (
             <MenuTriggerButton
               label={t('sessions.iosSimulator.controls.moreControls', 'More controls')}
               icon={Ellipsis}
             >
-              {folded.map((group) => (
-                <GroupRows key={group.id} group={group} />
-              ))}
-              <Menu.Group>
-                <Menu.GroupLabel>
-                  {t('sessions.iosSimulator.controls.appearance', 'Appearance')}
-                </Menu.GroupLabel>
-                <AppearanceRows props={props} />
-              </Menu.Group>
+              {foldsControls ? (
+                <>
+                  {folded.map((group) => (
+                    <GroupRows key={group.id} group={group} />
+                  ))}
+                  <Menu.Group>
+                    <Menu.GroupLabel>
+                      {t('sessions.iosSimulator.controls.appearance', 'Appearance')}
+                    </Menu.GroupLabel>
+                    <AppearanceRows props={props} />
+                  </Menu.Group>
+                </>
+              ) : null}
+              {props.quality ? <QualityRows quality={props.quality} /> : null}
             </MenuTriggerButton>
           ) : null}
           <span {...stylex.props(styles.spacer)} />

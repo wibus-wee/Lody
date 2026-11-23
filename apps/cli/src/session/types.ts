@@ -1,5 +1,6 @@
 import {
   type AgentConfigId,
+  type AgentRoleId,
   type AgentConfigCliType,
   type BuiltinRuntimeOverrides,
   type CustomAcpLaunchSpec,
@@ -39,6 +40,15 @@ export interface SessionConfig {
   magpieGatewayUrl?: string;
   project?: ProjectRef;
   projectRun?: import('@lody/shared').SessionProjectRun;
+  /**
+   * Encrypted turns: rejects execution inputs outside the authorized project scope.
+   * Called on every Project group or parent project read from synced metadata,
+   * because those can change after authorization.
+   */
+  authorizeExecutionInputs?: (input: {
+    project?: ProjectRef;
+    projectRun?: import('@lody/shared').SessionProjectRun;
+  }) => Promise<void>;
   // undefined means create a new session
   sessionId?: SessionId;
   // promptBuildConfig: PromptBuildConfig;
@@ -89,6 +99,8 @@ export interface SessionConfig {
 
   /** Parent session ID for child tab sessions. When set, reuse the parent's workspace directory. */
   parentSessionId?: SessionId;
+  agentRoleId?: AgentRoleId;
+  openedBySessionId?: SessionId;
 
   /** Git commit author name (from session creator) */
   userName: string;

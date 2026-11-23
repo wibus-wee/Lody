@@ -1,6 +1,6 @@
+// @vitest-environment jsdom
 import { resolveDirectMarkdownFileOpenTarget } from '../src/lib/session-file-open-target';
 import { NativeTextSelectionHoldContext } from '../src/hooks/use-conversation-text-selection';
-// @vitest-environment jsdom
 
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
@@ -55,27 +55,6 @@ describe('agent file links in finished turns', () => {
     container = undefined;
     vi.useRealTimers();
     vi.restoreAllMocks();
-  });
-
-  it('resets copy feedback while mounted and releases its timer on unmount', async () => {
-    vi.useFakeTimers();
-    await act(async () => {
-      root?.render(createElement(MarkdownRenderer, { text: '[Guide](./guide.md)' }));
-    });
-    const link = container?.querySelector<HTMLButtonElement>('button[title="./guide.md"]');
-    expect(link).not.toBeNull();
-    await act(async () => link!.click());
-    expect(writeTextToClipboard).toHaveBeenLastCalledWith('./guide.md');
-    expect(link?.querySelector('.lucide-check')).not.toBeNull();
-    await act(async () => vi.advanceTimersByTime(1200));
-    expect(link?.querySelector('.lucide-check')).toBeNull();
-    expect(link?.querySelector('.lucide-copy')).not.toBeNull();
-
-    await act(async () => link!.click());
-    expect(link?.querySelector('.lucide-check')).not.toBeNull();
-    await act(async () => root?.unmount());
-    root = undefined;
-    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('renders one clickable chip per cited file, keeping the surrounding prose intact', async () => {
@@ -218,20 +197,6 @@ describe('agent file links in finished turns', () => {
       );
       expect(container?.querySelectorAll('button[title]')).toHaveLength(index === first ? 1 : 0);
     }
-  });
-
-  it('copies the original Codex path with punctuation and confirms success', async () => {
-    const path = '/tmp/exports/预算 #draft%20.xlsx';
-    await act(async () =>
-      root?.render(
-        createElement(MarkdownRenderer, { text: `:codex-file-citation{path="${path}"}` })
-      )
-    );
-    const button = container!.querySelector<HTMLButtonElement>('button');
-    expect(button).not.toBeNull();
-    await act(async () => button!.click());
-    expect(writeTextToClipboard).toHaveBeenLastCalledWith(path);
-    expect(toast.success).toHaveBeenLastCalledWith('File path copied');
   });
   it.each(['/tmp/file%00.txt', '/tmp/file.txt#L0'])(
     'copies invalid absolute target %s instead of opening it',

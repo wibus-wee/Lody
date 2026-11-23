@@ -35,7 +35,19 @@ export const HistoryEntryWriteSchema = z.object({
     ])
     .optional(),
   scheduleRun: scheduleRunNotificationSourceSchema.optional(),
-  cancellationReason: z.literal('user_stop').optional(),
+  derivedFrom: z
+    .object({
+      sessionId: z.string().trim().min(1).max(256),
+      userTurnId: z.string().trim().min(1).max(256),
+    })
+    .strict()
+    .optional(),
+  queuedInput: z.literal(true).optional(),
+  e2eeIntent: z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{131}$/)
+    .optional(),
+  cancellationReason: z.enum(['user_stop', 'machine_update']).optional(),
   inputConfig: z
     .preprocess(normalizeLegacyAcpSessionConfig, SessionHistoryInputConfigSchema)
     .optional(),

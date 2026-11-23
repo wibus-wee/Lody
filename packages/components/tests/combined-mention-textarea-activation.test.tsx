@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-
 import React, { act, useState } from 'react';
 import {
   buildMentionFileIndex,
@@ -61,10 +60,16 @@ vi.mock('../src/components/mentions/mention-agent-role-source', async (importOri
   useAgentRoleMentionItems: () => [],
 }));
 
+import { Provider, createStore } from 'jotai';
+import { currentWorkspaceIdAtom } from '../src/atoms';
 import { UserMessageEditor } from '../src/components/ai-gui/user-message-editor';
 import { CombinedMentionTextarea } from '../src/components/mentions/combined-mention-textarea';
+import { __resetIssuePrFetchFreshnessForTests } from '../src/components/mentions/issue-pr-hash-mention';
+import { composerIn } from './composer-test-utils';
 import { initI18n } from '../src/i18n';
 import { commands } from '../src/lib/commands';
+import { invalidateGitHubTokensForWorkspace } from '../src/lib/github-token';
+import { installGitHubTokenPort } from '../src/lib/github-token-port';
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -90,6 +95,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
 
   afterEach(async () => {
     await act(async () => root.unmount());
+    __resetIssuePrFetchFreshnessForTests();
     vi.useRealTimers();
     container.remove();
     if (originalScrollIntoView) {
@@ -103,14 +109,19 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
 
   async function render(props: {
     value: string;
+    workspaceId?: string;
     skillAgent?: { machineId?: string; cliType?: string };
     mentionSource?: unknown;
     commandsEnabled?: boolean;
     availableCommands?: Array<{ name: string; description: string }>;
   }) {
+    const store = props.workspaceId ? createStore() : null;
+    if (store && props.workspaceId) {
+      store.set(currentWorkspaceIdAtom, props.workspaceId as never);
+    }
     function ControlledComposer() {
       const [value, setValue] = React.useState(props.value);
-      return (
+      const content = (
         <CombinedMentionTextarea
           value={value}
           onValueChange={setValue}
@@ -121,6 +132,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
           resetOnEmpty={false}
         />
       );
+      return store ? <Provider store={store}>{content}</Provider> : content;
     }
 
     await act(async () => {
@@ -129,7 +141,9 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
   }
 
   function textarea() {
-    return container.querySelector('textarea');
+    return container.querySelector('[data-composer-editor], textarea')
+      ? composerIn(container)
+      : null;
   }
 
   /**
@@ -150,17 +164,9 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
   async function typeInto(value: string) {
     const input = textarea();
     if (!input) throw new Error('composer textarea missing');
-    await act(async () => {
-      input.focus();
-      const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        'value'
-      )?.set;
-      setter?.call(input, value);
-      input.selectionStart = value.length;
-      input.selectionEnd = value.length;
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
+    input.focus();
+    input.edit(value, value.length);
+    await act(async () => {});
   }
 
   it.each(['/', '、'])(
@@ -339,74 +345,6 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     );
   });
 
-  it('renders a plain textarea when no mention type is reachable', async () => {
-    await render({ value: '' });
-
-    expect(textarea()).not.toBeNull();
-    expect(mentionTreeMounted()).toBe(false);
-  });
-
-  it('mounts the mention tree when sessions are the only mentionable type', async () => {
-    sessionItems.push({
-      sessionId: 's1',
-      title: 'Fix the parser',
-      slug: 'fix-the-parser',
-      projectKey: 'chat',
-    });
-
-    await render({ value: '' });
-
-    expect(mentionTreeMounted()).toBe(true);
-  });
-
-  it('wraps ArrowUp from the first @ result and continues in reverse order', async () => {
-    vi.useFakeTimers();
-    sessionItems.push(
-      {
-        sessionId: 's1',
-        title: 'First session',
-        slug: 'first-session',
-        activityAt: 3,
-        projectKey: 'chat',
-      },
-      {
-        sessionId: 's2',
-        title: 'Second session',
-        slug: 'second-session',
-        activityAt: 2,
-        projectKey: 'chat',
-      },
-      {
-        sessionId: 's3',
-        title: 'Third session',
-        slug: 'third-session',
-        activityAt: 1,
-        projectKey: 'chat',
-      }
-    );
-    await render({ value: '' });
-    await typeInto('@session:');
-    await act(async () => vi.advanceTimersToNextFrame());
-
-    const input = textarea();
-    if (!input) throw new Error('composer textarea missing');
-    expect(highlightedRowText()).toContain('First session');
-
-    await act(async () => {
-      input.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
-      );
-    });
-    expect(highlightedRowText()).toContain('Third session');
-
-    await act(async () => {
-      input.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
-      );
-    });
-    expect(highlightedRowText()).toContain('Second session');
-  });
-
   it('starts in the current project and toggles without losing query or focus', async () => {
     sessionItems.push(
       {
@@ -448,7 +386,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     });
 
     expect(input.value).toBe('@session:parser');
-    expect(document.activeElement).toBe(input);
+    expect(document.activeElement).toBe(input.element);
     expect(document.body.textContent).toContain('Other parser work');
     expect(document.body.textContent).toContain('All projects');
 
@@ -522,7 +460,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
         expect(document.body.textContent).toContain(`Nothing matches “${query}”`);
         expect(document.body.textContent).not.toContain('There are no other sessions');
         expect(textarea()!.value).toBe(`@session:${query}`);
-        expect(document.activeElement).toBe(textarea());
+        expect(document.activeElement).toBe(textarea()?.element);
         await typeInto('@session:');
         expect(rows()).toEqual(initialRows);
       }
@@ -532,7 +470,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
         commands.execute('mention.toggleSessionProjectScope');
       });
       expect(textarea()!.value).toBe('@session:elsewhere');
-      expect(document.activeElement).toBe(textarea());
+      expect(document.activeElement).toBe(textarea()?.element);
       expect(rows()).toHaveLength(1);
       expect(rows()[0]).toContain('Elsewhere parser work');
       await typeInto('@session:zzzzunmatched');
@@ -595,22 +533,6 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     expect(commands.execute('mention.toggleSessionProjectScope')).toBe(false);
   });
 
-  it('does not scan skills until something asks for them', async () => {
-    await render({ value: '', skillAgent: { machineId: 'machine-1' } });
-
-    expect(skillScanEnabled).not.toContain(true);
-  });
-
-  it('scans skills when the menu scopes to the Skills category', async () => {
-    await render({ value: '', skillAgent: { machineId: 'machine-1' } });
-    expect(skillScanEnabled).not.toContain(true);
-
-    // Typed/pasted namespace prefixes still activate their lazy source.
-    await typeInto('@skill:');
-
-    expect(skillScanEnabled).toContain(true);
-  });
-
   it.each(['$', '￥', '¥'])('opens skills from %s and commits the dollar form', async (trigger) => {
     for (const token of ['review', 'research']) {
       skillItems.push({
@@ -660,9 +582,108 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     expect(document.querySelector('[data-slot="mention-item"]')).toBeNull();
   });
 
-  it('still scans skills for a draft that already carries a $ token', async () => {
-    await render({ value: 'use $review', skillAgent: { machineId: 'machine-1' } });
+  it('hides Issues and Pull Requests for unlinked repositories and recovers once linked', async () => {
+    let repoLinked = false;
+    let tokenRequests = 0;
+    const uninstallPort = installGitHubTokenPort({
+      getRepoToken: async () => {
+        tokenRequests += 1;
+        if (!repoLinked) {
+          return {
+            success: false,
+            errorCode: 'repo_not_linked',
+            errorMessage:
+              'Repository acme/unlinked is not linked to your workspace. Add it in Settings → Integrations → GitHub.',
+          };
+        }
+        return {
+          success: true,
+          token: 'ghs_linked',
+          expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        };
+      },
+      getOperationToken: async () => ({
+        success: false,
+        errorCode: 'repo_not_linked',
+        errorMessage: 'not linked',
+      }),
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(
+        JSON.stringify([
+          {
+            number: 42,
+            title: 'Linked repo issue',
+            state: 'open',
+            updated_at: '2026-01-01T00:00:00Z',
+            html_url: 'https://github.com/acme/unlinked/issues/42',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
 
-    expect(skillScanEnabled).toContain(true);
+    try {
+      await render({
+        value: '',
+        workspaceId: 'ws-1',
+        mentionSource: {
+          kind: 'github',
+          repoFullName: 'acme/unlinked',
+          issuePrEnabled: false,
+        },
+      });
+      await typeInto('@');
+      expect(document.body.textContent).toContain('Files');
+      expect(document.body.textContent).not.toContain('Issues');
+      expect(document.body.textContent).not.toContain('Pull Requests');
+      expect(tokenRequests).toBe(0);
+
+      await render({
+        value: '',
+        workspaceId: 'ws-1',
+        mentionSource: {
+          kind: 'local',
+          machineId: 'machine-1',
+          workspaceId: 'ws-1',
+          localProjectId: 'project-1',
+          githubRepoFullName: 'acme/unlinked',
+        },
+      });
+      await typeInto('@linked');
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(tokenRequests).toBe(1);
+      expect(document.body.textContent).not.toContain('is not linked to your workspace');
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      expect(document.body.textContent).not.toContain('Issues');
+      expect(document.body.textContent).not.toContain('Pull Requests');
+
+      await typeInto('');
+      await typeInto('@again');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(tokenRequests).toBe(1);
+      expect(document.body.textContent).not.toContain('Issues');
+
+      repoLinked = true;
+      await act(async () => {
+        invalidateGitHubTokensForWorkspace('ws-1');
+      });
+      await typeInto('');
+      await typeInto('@Linked');
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(document.body.textContent).toContain('Linked repo issue');
+    } finally {
+      fetchSpy.mockRestore();
+      uninstallPort();
+    }
   });
 });

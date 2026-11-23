@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+import { getFunctionName } from 'convex/server';
 import {
   createRouter,
   createRootRoute,
@@ -6,22 +8,15 @@ import {
   Outlet,
   RouterProvider,
 } from '@tanstack/react-router';
-// @vitest-environment jsdom
 
-import React, { act } from 'react';
+import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Provider, createStore, type Store } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type {
-  AgentConfigId,
-  AgentConfigMeta,
-  LocalProjectId,
-  MachineId,
-  ProviderSetupTask,
-  WorkspaceId,
-} from '@lody/shared';
+import type { MachineId, ProviderSetupTask, WorkspaceId } from '@lody/shared';
 
 const mocks = vi.hoisted(() => ({
+  personalAuthorization: 'authorized',
   createGitHubInstallState: vi.fn(),
   getCliState: vi.fn(),
   onCliState: vi.fn(),
@@ -37,7 +32,10 @@ vi.mock('convex/react', async (importOriginal) => ({
 
 vi.mock('../src/hooks/use-recoverable-convex-query', () => ({
   usePublicConvexQuery: () => undefined,
-  useRecoverableConvexQuery: () => [],
+  useRecoverableConvexQuery: (ref: unknown) =>
+    getFunctionName(ref as never) === 'github:getPersonalOperationSettings'
+      ? { enabled: false, authorization: { state: mocks.personalAuthorization } }
+      : [],
 }));
 
 vi.mock('../src/hooks/use-authenticated-convex', async (importOriginal) => {
@@ -45,6 +43,7 @@ vi.mock('../src/hooks/use-authenticated-convex', async (importOriginal) => {
   return {
     ...actual,
     useAuthenticatedConvex: () => ({ isAuthenticated: true, isLoading: false }),
+    useOptionalAuthenticatedConvex: () => ({ isAuthenticated: true, isLoading: false }),
   };
 });
 
@@ -63,12 +62,9 @@ import {
   OnboardingOverlay,
   resolveDesktopOnboardingPhase,
 } from '../src/components/onboarding/onboarding-overlay';
-import { OnboardingLoadingView } from '../src/components/onboarding/onboarding-loading';
+
 import { getDesktopOnboardingSteps } from '../src/components/onboarding/onboarding-steps';
-import {
-  ProjectsScreen,
-  ProjectsScreenView,
-} from '../src/components/onboarding/screens/projects-screen';
+import { ProjectsScreen } from '../src/components/onboarding/screens/projects-screen';
 import { ProvidersScreenView } from '../src/components/onboarding/screens/providers-screen';
 import { SummaryScreen } from '../src/components/onboarding/screens/summary-screen';
 import { initI18n } from '../src/i18n';
@@ -128,6 +124,7 @@ describe('desktop onboarding flow', () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     await initI18n('en');
     localStorage.clear();
+    mocks.personalAuthorization = 'authorized';
     mocks.createGitHubInstallState.mockResolvedValue({ state: 'github-state-1' });
     mocks.openExternalUrl.mockResolvedValue(true);
     mocks.useVisibleLocalProjects.mockReturnValue({ projects: new Map() });
@@ -179,14 +176,6 @@ describe('desktop onboarding flow', () => {
     expect(mocks.getCliState).not.toHaveBeenCalled();
   });
 
-  it('marks the stalled startup step as a spring probe after the bypass', async () => {
-    await act(async () => {
-      root?.render(<OnboardingLoadingView phase="starting" stage="fleet-start" bypassed />);
-    });
-
-    expect(container.querySelector('[data-onboarding-stalled-probe]')).not.toBeNull();
-  });
-
   it('derives steps and repairs stale phases from platform capabilities', () => {
     expect(getDesktopOnboardingSteps({ cloudAccount: false, multiWorkspace: false })).toEqual([
       'ceremony',
@@ -218,56 +207,6 @@ describe('desktop onboarding flow', () => {
         hasProject: false,
       })
     ).toBe('projects');
-  });
-
-  it('returns the exact selected local project', async () => {
-    const onComplete = vi.fn();
-    const selectedMachine = 'machine-2' as MachineId;
-    const selectedProject = 'project-2' as LocalProjectId;
-    await act(async () => {
-      root?.render(
-        <ProjectsScreenView
-          local={[
-            {
-              key: `${machineId}:project-1`,
-              machineId,
-              localProjectId: 'project-1' as LocalProjectId,
-              name: 'first',
-              detail: '/first',
-            },
-            {
-              key: `${selectedMachine}:${selectedProject}`,
-              machineId: selectedMachine,
-              localProjectId: selectedProject,
-              name: 'selected',
-              detail: '/selected',
-            },
-          ]}
-          github={[]}
-          importing={false}
-          connectingGitHub={false}
-          canImportLocal
-          canConnectGitHub={false}
-          loadingRepos={false}
-          selectedProjectKey={`local:${selectedMachine}:${selectedProject}`}
-          onAddLocal={vi.fn()}
-          onConnectGitHub={vi.fn()}
-          onBack={vi.fn()}
-          onSkip={vi.fn()}
-          onComplete={onComplete}
-        />
-      );
-    });
-
-    await act(async () => {
-      findButton(container, 'Next').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
-    expect(onComplete).toHaveBeenCalledWith({
-      kind: 'local',
-      machineId: selectedMachine,
-      localProjectId: selectedProject,
-      name: 'selected',
-    });
   });
 
   it.each(['unknown', 'provisional'] as const)(
@@ -411,6 +350,24 @@ describe('desktop onboarding flow', () => {
     expect(container.textContent).toContain('Control and pairing');
   });
 
+  it('guides missing personal GitHub authorization to settings before starting App installation', async () => {
+    mocks.personalAuthorization = 'missing';
+    await act(async () =>
+      root?.render(
+        <TestCloudPlatformProvider>
+          <Provider store={store}>
+            <ProjectsScreen onBack={vi.fn()} onSkip={vi.fn()} onComplete={vi.fn()} />
+          </Provider>
+        </TestCloudPlatformProvider>
+      )
+    );
+    await act(async () => findButton(container, 'Connect a GitHub repository').click());
+    expect(mocks.openExternalUrl.mock.calls.at(-1)?.[0]).toContain(
+      '/workspace-1/settings/github?github_install_error=authorization_required'
+    );
+    expect(mocks.createGitHubInstallState).not.toHaveBeenCalled();
+  });
+
   it('keeps GitHub available while the local agent is not ready', async () => {
     store.set(localProbeResultAtom, null);
     store.set(localCliStartingAtom, false);
@@ -489,115 +446,6 @@ describe('desktop onboarding flow', () => {
       providerSetupId: setup.id,
       agentName: setup.config.name,
     });
-  });
-
-  it('continues with an AgentConfig only after it is published', async () => {
-    const onNext = vi.fn();
-    const config: AgentConfigMeta = {
-      id: 'config-ready' as AgentConfigId,
-      machineId,
-      name: 'Codex',
-      description: undefined,
-      cliType: 'builtin',
-      agentType: 'codex',
-      env: {},
-    };
-
-    await act(async () => {
-      root?.render(
-        <ProvidersScreenView
-          configs={[config]}
-          testStatuses={{}}
-          selectedProviderId={config.id}
-          noLocalMachine={false}
-          localMachineId={machineId}
-          onEdit={vi.fn()}
-          onTest={vi.fn()}
-          onDelete={vi.fn()}
-          onAdd={vi.fn()}
-          onBack={vi.fn()}
-          onSkip={vi.fn()}
-          onNext={onNext}
-        />
-      );
-    });
-
-    await act(async () => {
-      findButton(container, 'Next').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
-    expect(onNext).toHaveBeenCalledWith({
-      kind: 'agentConfig',
-      agentConfigId: config.id,
-      agentName: config.name,
-    });
-  });
-
-  it('keeps provider activity compact in the badge and progress button', async () => {
-    const config: AgentConfigMeta = {
-      id: 'config-progress' as AgentConfigId,
-      machineId,
-      name: 'Codex',
-      description: undefined,
-      cliType: 'builtin',
-      agentType: 'codex',
-      env: {},
-    };
-
-    await act(async () => {
-      root?.render(
-        <ProvidersScreenView
-          configs={[config]}
-          testStatuses={{}}
-          testActivities={{ [config.id]: { phase: 'downloading-runtime', percent: 64 } }}
-          noLocalMachine={false}
-          onEdit={vi.fn()}
-          onTest={vi.fn()}
-          onDelete={vi.fn()}
-          onAdd={vi.fn()}
-          onBack={vi.fn()}
-          onSkip={vi.fn()}
-          onNext={vi.fn()}
-        />
-      );
-    });
-
-    expect(container.textContent).toContain('Downloading');
-    expect(findButton(container, '64%').disabled).toBe(true);
-    expect(container.textContent).not.toContain('Downloading the agent runtime');
-  });
-
-  it('keeps the latest provider failure reason on the failed badge', async () => {
-    const config: AgentConfigMeta = {
-      id: 'config-failed' as AgentConfigId,
-      machineId,
-      name: 'Codex',
-      description: undefined,
-      cliType: 'builtin',
-      agentType: 'codex',
-      env: {},
-    };
-
-    await act(async () => {
-      root?.render(
-        <ProvidersScreenView
-          configs={[config]}
-          testStatuses={{ [config.id]: 'failed' }}
-          failureReasons={{ [config.id]: 'The API key was rejected.' }}
-          noLocalMachine={false}
-          onEdit={vi.fn()}
-          onTest={vi.fn()}
-          onDelete={vi.fn()}
-          onAdd={vi.fn()}
-          onBack={vi.fn()}
-          onSkip={vi.fn()}
-          onNext={vi.fn()}
-        />
-      );
-    });
-
-    expect(
-      container.querySelector('[aria-label="Failed: The API key was rejected."]')
-    ).not.toBeNull();
   });
 
   it('keeps failed Agent setup retryable from Summary with investigation detail', async () => {

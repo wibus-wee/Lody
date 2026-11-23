@@ -1,3 +1,4 @@
+import { readSessionHistoryMetadata } from '@lody/shared/session-data';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import * as stylex from '@stylexjs/stylex';
 import { useAtomValue } from 'jotai';
@@ -14,7 +15,6 @@ import {
   withScheduleRecurrenceTimeZone,
   type ScheduleRecurrence,
   type ScheduleTrigger,
-  ScheduleRepository,
   getDeviceTimeZone,
   scheduleProposalRuleToRecurrence,
   scheduleProposalRuleToTrigger,
@@ -72,10 +72,8 @@ const styles = stylex.create({
     fontSize: '0.9em',
     color: 'hsl(var(--muted-foreground) / 1)',
     boxShadow: {
-      default:
-        'var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000), var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), 0 0.5px 1px 1px var(--tw-shadow-color, rgba(0, 0, 0, 0.03))',
-      [DARK]:
-        'var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000), var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), 0 0 #0000',
+      default: '0 0.5px 1px 1px rgba(0, 0, 0, 0.03)',
+      [DARK]: 'none',
     },
   },
   receiptTitle: {
@@ -235,7 +233,7 @@ export function ScheduleProposalNotice({
     if (!runtime) return undefined;
     let cancelled = false;
     void runtime
-      .withSessionStore(sessionId, (store) => store.sessionData.history.readAll())
+      .withSessionStore(sessionId, (store) => readSessionHistoryMetadata(store.sessionData.history))
       .then((history) => {
         if (cancelled) return;
         const config = resolveSessionConversationConfig(history);
@@ -377,7 +375,7 @@ export function ScheduleProposalNotice({
         // Re-resolve from history at click time, so a mode changed since the
         // card rendered is the one that gets persisted.
         const history = await runtime.withSessionStore(sessionId, (store) =>
-          store.sessionData.history.readAll()
+          readSessionHistoryMetadata(store.sessionData.history)
         );
         const latest = resolveSessionConversationConfig(history);
         const final = resolveScheduleProposalTarget({
@@ -405,11 +403,13 @@ export function ScheduleProposalNotice({
         // The proposal id is the schedule id, so a double click or a retried
         // write cannot create two schedules.
         const scheduleId = meta.proposalId;
+        const { ScheduleRepository } = await import('@lody/shared/schedule-repository');
         await runtime.withScheduleStore(
           scheduleId,
           () =>
             new ScheduleRepository(runtime.repo, runtime.workspaceId, {
               protectedContent: runtime.contentMode === 'e2ee',
+              signDeclaration: runtime.signScheduleDeclaration,
             }).save({
               scheduleId,
               activationId: uuid(),

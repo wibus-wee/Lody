@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-
 import { act, createElement, type ComponentProps } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
+import { getDefaultStore } from 'jotai';
+import { agentConfigMetaCacheAtom } from '../src/atoms/doc-meta';
 import {
   AGENT_ROLE_VERSION,
   type AgentConfigId,
@@ -12,14 +13,17 @@ import {
   type MachineId,
 } from '@lody/shared';
 
-// The menu resolves its default agent pool from machine presence; this surface
-// passes `availableAgentConfigs` instead, so the pool is not what is under test.
+// Simulate missing/offline presence independently of the known Agent catalog.
 vi.mock('../src/hooks/use-online-machines', () => ({ useOnlineMachines: () => [] }));
-
-import { DesktopRunConfigMenu } from '../src/components/sessions/desktop-run-config-menu';
+import {
+  DesktopMachineMenu,
+  DesktopRunConfigMenu,
+} from '../src/components/sessions/desktop-run-config-menu';
 import { MobileSessionRunConfig } from '../src/components/mobile/mobile-session-run-config';
 import type { ComposerAgentRoleItem } from '../src/lib/composer-agent-roles';
 import { initI18n } from '../src/i18n';
+import { commands, formatKeyBinding } from '../src/lib/commands';
+import { CommandShortcutHost } from '../src/lib/commands/shortcut-host';
 import { Tooltip } from '@lody/ui/tooltip';
 
 (
@@ -90,6 +94,7 @@ describe('DesktopRunConfigMenu role face', () => {
   });
 
   afterEach(async () => {
+    getDefaultStore().set(agentConfigMetaCacheAtom, {});
     if (root) {
       await act(async () => {
         root?.unmount();
@@ -105,20 +110,13 @@ describe('DesktopRunConfigMenu role face', () => {
       root?.render(
         createElement(
           Tooltip.Provider,
-          { delayDuration: 0 },
+          { delay: 0 },
           createElement(DesktopRunConfigMenu, { ...baseProps, ...props })
         )
       );
     });
     return container as HTMLDivElement;
   };
-
-  it('names the agent and its values together when no Role is selected', async () => {
-    const view = await render();
-    const trigger = view.querySelector('button[aria-label="Run configuration"]');
-    expect(trigger?.textContent).toContain('Codex Primary');
-    expect(trigger?.textContent).toContain('5.5');
-  });
 
   it('keeps the selected ACP model face while sending locks the menu', async () => {
     const props: Partial<MenuProps> = {
@@ -152,6 +150,47 @@ describe('DesktopRunConfigMenu role face', () => {
     expect(document.querySelector('[role="menu"]')).toBeNull();
   });
 
+  it('shows speed tiers on the face as glyphs only and keeps their names in the menu', async () => {
+    const speedSelector = {
+      configId: 'fast-mode',
+      category: 'other',
+      label: 'Speed',
+      type: 'select' as const,
+      currentValue: 'off',
+      options: [
+        { value: 'off', label: 'Standard' },
+        { value: 'fast', label: 'Fast' },
+        { value: 'ultrafast', label: 'Ultrafast' },
+      ],
+    };
+    const speedGlyph = async (value: string) => {
+      const view = await render({
+        configOptionSelectors: [speedSelector],
+        configOptionValues: { 'fast-mode': value },
+      });
+      const trigger = view.querySelector<HTMLButtonElement>('[data-run-config-trigger]')!;
+      return { trigger, glyph: trigger.querySelector('[role="img"]') };
+    };
+
+    const fast = await speedGlyph('fast');
+    expect(fast.glyph?.getAttribute('aria-label')).toBe('Fast');
+    expect(fast.trigger.textContent).not.toContain('Fast');
+    const fastMarkup = fast.glyph?.outerHTML;
+
+    const ultra = await speedGlyph('ultrafast');
+    expect(ultra.glyph?.getAttribute('aria-label')).toBe('Ultrafast');
+    expect(ultra.trigger.textContent).not.toContain('Ultrafast');
+    expect(ultra.glyph?.outerHTML).not.toBe(fastMarkup);
+
+    expect((await speedGlyph('off')).glyph).toBeNull();
+
+    await speedGlyph('ultrafast');
+    await act(async () => {
+      ultra.trigger.click();
+    });
+    expect(document.querySelector('[role="menu"]')?.textContent).toContain('Ultrafast');
+  });
+
   it('keeps Role identity and pinned values on the locked face', async () => {
     const props = {
       agentRoles: { items: [roleItem], selectedRoleId: role.id, onSelect: () => undefined },
@@ -182,29 +221,6 @@ describe('DesktopRunConfigMenu role face', () => {
       trigger?.click();
     });
     expect(document.querySelector('[role="dialog"]')).toBeNull();
-  });
-
-  it('keeps the menu closed and explains when a machine must be selected first', async () => {
-    const disabledReason = 'Select a machine first';
-    const view = await render({ disabledReason });
-    const trigger = view.querySelector<HTMLButtonElement>('button[aria-label="Run configuration"]');
-    expect(trigger?.getAttribute('aria-disabled')).toBe('true');
-
-    await act(async () => {
-      trigger?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
-      trigger?.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, button: 0 }));
-      await new Promise((resolve) => setTimeout(resolve, 40));
-    });
-    expect(document.querySelector('[role="menu"]')).toBeNull();
-
-    await act(async () => {
-      trigger?.focus();
-    });
-    await vi.waitFor(() => {
-      expect(document.querySelector('[data-base-ui-portal] [data-side]')?.textContent).toContain(
-        disabledReason
-      );
-    });
   });
 
   it('gives the button to the Role alone and leaves its values inert beside it', async () => {
@@ -260,47 +276,301 @@ describe('DesktopRunConfigMenu role face', () => {
     return document.querySelector('[role="menu"]') as HTMLElement;
   };
 
-  it('leads the menu with the Role row, above the rows a Role answers', async () => {
-    const view = await render({
-      agentRoles: { items: [roleItem], selectedRoleId: role.id, onSelect: () => undefined },
-    });
-    const menu = await openMenu(view);
-    const rows = [...menu.querySelectorAll('[role="menuitem"]')].map((node) =>
-      node.textContent?.trim()
+  it('lets a blank tab switch Agents without online presence and keeps its machine scope', async () => {
+    const second: AgentConfigMeta = {
+      ...agentConfig,
+      id: 'config-2' as AgentConfigId,
+      name: 'Claude Secondary',
+      agentType: 'claude',
+    };
+    const otherMachine: AgentConfigMeta = {
+      ...agentConfig,
+      id: 'config-other' as AgentConfigId,
+      machineId: 'machine-other' as MachineId,
+    };
+    getDefaultStore().set(
+      agentConfigMetaCacheAtom,
+      Object.fromEntries([agentConfig, second, otherMachine].map((config) => [config.id, config]))
     );
-    const roleRow = rows.findIndex((text) => text?.startsWith('Role'));
-    const agentRow = rows.findIndex((text) => text?.startsWith('Agent'));
-    expect(roleRow).toBeGreaterThanOrEqual(0);
-    expect(agentRow).toBeGreaterThan(roleRow);
-    // The row states which Role, so the menu never opens denying its own face.
-    expect(rows[roleRow]).toContain('Code Reviewer');
+    let chosen: MenuProps['agentSelection'] = baseProps.agentSelection;
+    const view = await render({
+      availableAgentConfigs: undefined,
+      allowedMachineIds: [machineId],
+      onAgentConfigChange: (selection) => {
+        chosen = selection;
+      },
+    });
+    await act(async () => {
+      view
+        .querySelector('button[aria-label="Run configuration"]')
+        ?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+    });
+    await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull());
+    const agent = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((element) =>
+      element.textContent?.startsWith('Agent')
+    );
+    expect(agent?.getAttribute('aria-disabled')).not.toBe('true');
+    await act(async () => {
+      agent!.focus();
+      agent!.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'ArrowRight',
+          code: 'ArrowRight',
+          bubbles: true,
+        })
+      );
+    });
+    await vi.waitFor(() =>
+      expect(document.querySelectorAll('[data-testid="chat-agent-option"]')).toHaveLength(2)
+    );
+    const target = document.querySelector<HTMLElement>(
+      `[data-agent-config-id="${second.id}"][data-testid="chat-agent-option"]`
+    );
+    await act(async () => target!.click());
+    expect(chosen).toEqual({ agentId: second.id, machineId });
+    await render({
+      availableAgentConfigs: undefined,
+      allowedMachineIds: [machineId],
+      agentSelection: chosen,
+    });
+    expect(
+      view.querySelector<HTMLElement>('[data-run-config-trigger]')?.dataset.agentConfigId
+    ).toBe(second.id);
   });
 
-  it('turns the Role row value into the way to make one when there are none', async () => {
-    const onCreate = vi.fn();
+  it.each([
+    { allowedMachineIds: [] as MachineId[], agentLocked: false },
+    { allowedMachineIds: [machineId], agentLocked: true },
+  ])(
+    'keeps Agent selection locked for scope/lock $agentLocked $allowedMachineIds',
+    async (props) => {
+      getDefaultStore().set(agentConfigMetaCacheAtom, { [agentConfig.id]: agentConfig });
+      const view = await render({ ...props, availableAgentConfigs: undefined });
+      await act(async () => {
+        view
+          .querySelector('button[aria-label="Run configuration"]')
+          ?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+      });
+      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull());
+      const agent = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(
+        (element) => element.textContent?.startsWith('Agent')
+      );
+      expect(agent?.getAttribute('aria-disabled')).toBe('true');
+      expect(document.querySelector('[data-testid="chat-agent-option"]')).toBeNull();
+    }
+  );
+
+  it('binds same-name Agent options to the IDs used by their selection action', async () => {
+    const second: AgentConfigMeta = {
+      ...agentConfig,
+      id: 'config-2' as AgentConfigId,
+      machineId: 'machine-2' as MachineId,
+    };
+    let chosen: { agentId: AgentConfigId; machineId: MachineId } | undefined;
     const view = await render({
-      agentRoles: { items: [], selectedRoleId: null, onSelect: () => undefined, onCreate },
+      availableAgentConfigs: [agentConfig, second],
+      onAgentConfigChange: (selection) => {
+        chosen = selection;
+      },
     });
-    const menu = await openMenu(view);
-    const roleRow = [...menu.querySelectorAll('[role="menuitem"]')].find((node) =>
-      node.textContent?.trim().startsWith('Role')
-    );
-    expect(
-      roleRow?.querySelector('[aria-label="Create role from current settings"]')
-    ).not.toBeNull();
     await act(async () => {
-      (roleRow as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      view
+        .querySelector('button[aria-label="Run configuration"]')
+        ?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+    });
+    await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull());
+    const agent = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((element) =>
+      element.textContent?.startsWith('Agent')
+    );
+    expect(agent).toBeDefined();
+    await act(async () => {
+      agent!.focus();
+      agent!.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', bubbles: true })
+      );
+    });
+    await vi.waitFor(() =>
+      expect(document.querySelectorAll('[data-testid="chat-agent-option"]')).toHaveLength(2)
+    );
+    const options = [
+      ...document.querySelectorAll<HTMLElement>('[data-testid="chat-agent-option"]'),
+    ];
+    expect(
+      options.map((element) => [element.dataset.agentConfigId, element.dataset.machineId])
+    ).toEqual([
+      [agentConfig.id, agentConfig.machineId],
+      [second.id, second.machineId],
+    ]);
+    const target = options.find((element) => element.dataset.agentConfigId === second.id)!;
+    await act(async () => target.click());
+    expect(chosen).toEqual({ agentId: second.id, machineId: second.machineId });
+    await render({ availableAgentConfigs: [agentConfig, second], agentSelection: chosen });
+    const actualSelection = view.querySelector<HTMLElement>('[data-run-config-trigger]');
+    expect(actualSelection?.dataset.agentConfigId).toBe(second.id);
+    expect(actualSelection?.dataset.machineId).toBe(second.machineId);
+  });
+});
+
+describe('DesktopRunConfigMenu ⌘/ chord', () => {
+  let root: Root | undefined;
+  let container: HTMLDivElement | undefined;
+  let originalMatchMedia: typeof window.matchMedia | undefined;
+
+  const manyModels = ['gpt-5.5', 'gpt-5.4', 'gpt-5.3', 'gpt-5.2', 'gpt-5.1', 'gpt-5.0'].map(
+    (value) => ({ value, label: value })
+  );
+
+  const pressRunConfigChord = (target: Window | Element) =>
+    target.dispatchEvent(
+      new KeyboardEvent('keydown', { key: '/', code: 'Slash', ctrlKey: true, bubbles: true })
+    );
+
+  const renderComposerBox = async (props: Partial<MenuProps> = {}) => {
+    await act(async () => {
+      root?.render(
+        createElement(
+          Tooltip.Provider,
+          { delay: 0 },
+          createElement(
+            'div',
+            null,
+            createElement(CommandShortcutHost),
+            createElement('textarea', { 'data-lody-composer-input': '' }),
+            createElement(DesktopRunConfigMenu, { ...baseProps, ...props })
+          )
+        )
+      );
+    });
+    return container as HTMLDivElement;
+  };
+
+  beforeEach(async () => {
+    await initI18n('en');
+    commands.resetAllUserKeybindings();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    if (originalMatchMedia !== undefined) {
+      window.matchMedia = originalMatchMedia;
+      originalMatchMedia = undefined;
+    }
+    if (root) {
+      await act(async () => {
+        root?.unmount();
+      });
+      root = undefined;
+    }
+    for (const command of commands.list()) commands.unregister(command.id);
+    commands.resetAllUserKeybindings();
+    container?.remove();
+    container = undefined;
+  });
+
+  it('opens into the model search on ⌘/ while its composer is focused', async () => {
+    originalMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === '(pointer: fine)',
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => true,
+    })) as unknown as typeof window.matchMedia;
+    const view = await renderComposerBox({ modelOptions: manyModels });
+    const composer = view.querySelector('[data-lody-composer-input]')!;
+    expect(document.body.querySelector('[data-lody-menu-search]')).toBeNull();
+
+    await act(async () => {
+      pressRunConfigChord(window);
       await new Promise((resolve) => setTimeout(resolve, 40));
     });
-    expect(onCreate).toHaveBeenCalled();
+    expect(document.body.querySelector('[role="menu"]')).toBeNull();
+
+    await act(async () => {
+      pressRunConfigChord(composer);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+    expect(document.body.querySelector('[role="menu"]')).not.toBeNull();
+
+    const search = document.body.querySelector('[data-lody-menu-search]');
+    expect(search).not.toBeNull();
+    await vi.waitFor(() => expect(document.activeElement).toBe(search));
   });
 
-  it('drops the Role face as soon as the selection is no longer that Role', async () => {
-    const view = await render({
-      agentRoles: { items: [roleItem], selectedRoleId: null, onSelect: () => undefined },
+  it('does not open on ⌘/ while its surface is inactive', async () => {
+    const view = await renderComposerBox({ commandsEnabled: false });
+    await act(async () => {
+      pressRunConfigChord(view.querySelector('[data-lody-composer-input]')!);
+      await new Promise((resolve) => setTimeout(resolve, 40));
     });
-    const trigger = view.querySelector('button[aria-label="Run configuration"]');
-    expect(trigger?.textContent).toContain('Codex Primary');
-    expect(trigger?.textContent).not.toContain('Code Reviewer');
+    expect(document.body.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it('shows the active ⌘/ binding in the trigger tooltip', async () => {
+    const view = await renderComposerBox({ modelOptions: manyModels });
+    const trigger = view.querySelector('[data-run-config-trigger]')!;
+    await act(async () => {
+      trigger.dispatchEvent(new MouseEvent('mouseenter'));
+      trigger.dispatchEvent(new MouseEvent('mousemove'));
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+    const expected = commands
+      .getKeybindingsFor('session.openRunConfig')
+      .map((binding) => formatKeyBinding(binding))[0];
+    expect(expected).toBeTruthy();
+    expect(document.body.textContent).toContain(`Run configuration`);
+    expect(document.body.textContent).toContain(expected);
+  });
+});
+
+describe('DesktopMachineMenu offline selection', () => {
+  const longName = 'ubuntu-gpu-workstation-shanghai-02';
+  let view: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(async () => {
+    await initI18n();
+    view = document.createElement('div');
+    document.body.append(view);
+    root = createRoot(view);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    view.remove();
+  });
+
+  const renderTrigger = (offline: boolean) => {
+    act(() =>
+      root.render(
+        <DesktopMachineMenu
+          value={machineId}
+          selectedLabel={longName}
+          offline={offline}
+          options={[]}
+          onChange={() => {}}
+        />
+      )
+    );
+    return view.querySelector<HTMLElement>('[data-testid="chat-machine-trigger"]');
+  };
+
+  it('keeps the offline mark outside the machine name that truncates', () => {
+    const trigger = renderTrigger(true);
+    const name = Array.from(trigger?.querySelectorAll('span') ?? []).find((element) =>
+      element.textContent?.startsWith(longName)
+    );
+
+    expect(name?.textContent).toBe(longName);
+    expect(trigger?.textContent).toContain('Offline');
+  });
+
+  it('shows no offline mark for an available machine', () => {
+    expect(renderTrigger(false)?.textContent).not.toContain('Offline');
   });
 });

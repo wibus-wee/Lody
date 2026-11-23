@@ -46,6 +46,8 @@ Main-process `console` output, lifecycle, and embedded-CLI supervision reach the
 CLI daily log through `desktop-log.ts`; write synchronously, never persist
 credentials (redaction is only a backstop), and trace CLI spawns without their
 arguments. See the [tracing decision](../../../../.agents/notes/implemented/feature/2026-09-25-daily-log-crash-and-stall-tracing.md).
+URL diagnostics retain fixed route names and structural metadata only; arbitrary
+URL components and parameter names do not belong in diagnostics.
 
 ## Prepared windows
 
@@ -54,6 +56,8 @@ to sender, target and generation; cancellation belongs to its source request.
 Expire unclaimed views and destroy them on source close. Claim adopts identity and
 reload target without remounting; activate renderer effects only after native show.
 The [window Spec](../../../../specs/desktop-windows.md) owns the behavior contract.
+Background ownership uses Web Locks rather than leader-election IPC:
+[decision](../../../../.agents/notes/implemented/feature/2026-09-10-desktop-windows.md).
 
 ## Startup theme
 
@@ -75,6 +79,10 @@ The encrypted adapter enables Meta, Loro documents and the owning workspace/mach
 `e2ee-custody-electron.ts` is the readiness-gated native composition factory.
 Reject unavailable native encryption and Linux `basic_text`/unknown backends;
 never reuse auth cookie plaintext overrides or fall back to plaintext files.
+
+New content seals prefer installed current keys inside core, never renderer hints.
+Only genuine absence permits retained published keys within the durable fifteen-minute
+observation budget; exhaustion fails for retry. Keep sealed old frames and history. See the [sealing decision](../../../../.agents/notes/implemented/architecture/2026-10-27-e2ee-epoch-receive-barrier.md).
 
 All installed/candidate binding fields are authenticated AAD and encrypted in the
 core payload. For new workspaces, use `prepareDevice` only for local genesis signing, then
@@ -106,11 +114,21 @@ packaging result; native safeStorage assurance needs an isolated platform run.
 It grants no renderer reader/status/content capability. Preserve existing readers;
 release a cold temporary host before replying. `status` still requires a window reader.
 
+The recovery vault (`services/e2ee-recovery-vault.mts`) is enabled by default unless
+main starts with `LODY_E2EE_RECOVERY_VAULT=off`. Main owns recovery file dialogs/bytes,
+passkey ceremonies and Argon2id password derivation, writing files only to user-chosen
+paths and returning outcomes or `e2ee_recovery_*` codes, never keys or file bytes.
+Its account journal holds pins, summaries and intents only. Spec: [recovery vault](../../../../specs/e2ee/recovery-vault.md).
+
 Team-member joining uses `services/e2ee-member-join.mts`: retain exact KeyPackages
 and every signed admission before I/O. Unknown outcomes cannot replace them;
 verify competing ledger bytes or a terminal server reservation before retirement.
 New accounts replay genuine history from their independently retained genesis;
 server labels never establish native identity. [Decision](../../../../.agents/notes/proposed/feature/2026-10-28-e2ee-team-joining-native.md).
+Approval never awaits a key round; account pairing alone waits, bounded, on `firstPass`: `services/e2ee-key-delivery.mts`
+owns later delivery and retries it on the shared backoff from a bounded main-owned due timer and due polls ([delivery](../../../../.agents/notes/proposed/feature/2026-10-28-e2ee-team-joining-native.md#key-delivery-after-admission)).
 
 Removal erases `member_joins` and `personal_join_histories`. All three join installs
 clear the removed marker only after verifying a different retained signing key.
+Access-loss classification, refusal codes and dispatch confirmation follow the
+[IPC rules](ipc/AGENTS.md#e2ee-access-loss).

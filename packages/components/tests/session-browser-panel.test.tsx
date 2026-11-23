@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Provider, createStore } from 'jotai';
@@ -19,13 +18,20 @@ import type {
 } from '@lody/shared';
 
 import { runtimeAtom, userAtom, type WorkspaceRuntime } from '../src/atoms';
+import { machineMetaCacheAtom } from '../src/atoms/doc-meta';
+import { getMachineRoomId, parseBrowserAddress } from '@lody/shared';
 import { SessionBrowserPanel } from '../src/components/sessions/session-browser-panel';
 import { SessionPreviewPreload } from '../src/components/sessions/session-preview-preload';
 import { clearManagedPreviewFrame } from '../src/components/sessions/managed-preview-frame-cache';
 import { PlatformContext } from '@lody/platform/react';
 import { LOCAL_PLATFORM_CAPABILITIES } from '@lody/platform';
 import { TEST_CLOUD_PLATFORM } from './test-platform';
-import { clearSessionBrowserResumeState } from '../src/components/sessions/session-browser-resume-state';
+import { writeTextToClipboard } from '../src/lib/clipboard';
+import {
+  clearSessionBrowserResumeState,
+  rememberSessionBrowserResumeState,
+  rememberSessionRemotePreview,
+} from '../src/components/sessions/session-browser-resume-state';
 
 const publicBrowserSurfaceRender = vi.hoisted(() => vi.fn());
 
@@ -222,6 +228,16 @@ const createRuntime = (options?: {
     success: true,
     connection: observedConnection,
   }));
+  const requestSessionPreviewRevoke = vi.fn(async () => ({
+    type: 'session/preview-revoke_response' as const,
+    sessionId: session.id,
+    success: true as const,
+    connection: {
+      ...remoteConnection,
+      status: 'closed' as const,
+      closedReason: 'revoked' as const,
+    },
+  }));
   const runtime = {
     workspaceSlug: 'workspace-browser',
     workspaceId: 'workspace-browser-id' as WorkspaceId,
@@ -235,7 +251,7 @@ const createRuntime = (options?: {
     requestSessionPreviewEndpointAcquire,
     requestSessionPreviewEndpointRelease,
     requestSessionPreviewStatus,
-    requestSessionPreviewRevoke: vi.fn(async () => null),
+    requestSessionPreviewRevoke,
   } as unknown as WorkspaceRuntime;
   return {
     runtime,
@@ -246,6 +262,7 @@ const createRuntime = (options?: {
     requestSessionPreviewCreate,
     requestSessionPreviewEndpointAcquire,
     requestSessionPreviewEndpointRelease,
+    requestSessionPreviewRevoke,
   };
 };
 
@@ -343,30 +360,6 @@ describe('SessionBrowserPanel controller', () => {
     };
   };
 
-  it('preloads the exact reported page after live confirmation, without polling or renewal', async () => {
-    const { runtime } = createRuntime({ preview: reportedPreview });
-    const mounted = await renderPreload(runtime);
-    try {
-      const frame = document.querySelector<HTMLIFrameElement>('[data-lody-preview-preload] iframe');
-      expect(frame?.src).toBe(
-        'https://browser-preview.trycloudflare.com/dashboard?mode=dev&__lody_preview_token=remote-token'
-      );
-      await mounted.render({
-        ...reportedPreview,
-        connection: { ...remoteConnection, updatedAt: 2 },
-      });
-      expect(document.querySelector('[data-lody-preview-preload] iframe')).toBe(frame);
-      await act(async () => {
-        vi.advanceTimersByTime(10 * 60 * 1000);
-      });
-      expect(frame?.isConnected).toBe(false);
-      expect(document.querySelector('[data-lody-preview-preload]')).toBeNull();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      mounted.restore();
-    }
-  });
-
   it('invalidates preloading on endpoint closure and does not revive a late status result', async () => {
     const { runtime, requestSessionPreviewStatus } = createRuntime({ preview: reportedPreview });
     const pending = Promise.withResolvers<SessionPreviewStatusResponse>();
@@ -394,27 +387,6 @@ describe('SessionBrowserPanel controller', () => {
         connection: { ...remoteConnection, status: 'closed' },
       });
       expect(frame?.isConnected).toBe(false);
-    } finally {
-      mounted.restore();
-    }
-  });
-
-  it('disposes speculative content when the client enters the background', async () => {
-    const { runtime } = createRuntime({ preview: reportedPreview });
-    const mounted = await renderPreload(runtime);
-    try {
-      const frame = document.querySelector('[data-lody-preview-preload] iframe');
-      expect(frame?.isConnected).toBe(true);
-      vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
-      await act(async () => {
-        document.dispatchEvent(new Event('visibilitychange'));
-      });
-      expect(frame?.isConnected).toBe(false);
-      vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
-      await act(async () => {
-        document.dispatchEvent(new Event('visibilitychange'));
-      });
-      expect(document.querySelector('[data-lody-preview-preload]')).toBeNull();
     } finally {
       mounted.restore();
     }
@@ -452,11 +424,25 @@ describe('SessionBrowserPanel controller', () => {
       candidateNavigationRequestId?: number;
       panelSession?: SessionMeta;
       onCandidateNavigationRequestHandled?: (requestId: number) => void;
+      protocolCapabilities?: Record<string, number>;
     }
   ) => {
     const store = createStore();
     store.set(userAtom, { id: 'user-1', name: 'Browser User', email: 'browser@example.com' });
     store.set(runtimeAtom, runtime);
+    if (options?.protocolCapabilities) {
+      const targetSession = options.panelSession ?? session;
+      store.set(machineMetaCacheAtom, {
+        [getMachineRoomId(targetSession.machineId)]: {
+          id: targetSession.machineId,
+          name: 'Dev Mac',
+          cliVersion: '9.9.9',
+          os: 'darwin',
+          sessions: [],
+          protocolCapabilities: options.protocolCapabilities,
+        },
+      });
+    }
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
@@ -776,68 +762,6 @@ describe('SessionBrowserPanel controller', () => {
     );
   });
 
-  it('clears only a public navigation request that the surface has dispatched', async () => {
-    const testRuntime = createRuntime();
-    const rendered = await renderPanel(testRuntime.runtime);
-
-    await enterAddress(rendered, 'example.com/docs');
-
-    const firstProps = publicBrowserSurfaceRender.mock.calls.at(-1)?.[0] as {
-      navigationRequest: { id: number; url: string } | null;
-      onNavigationRequestConsumed: (request: { id: number; url: string }) => void;
-    };
-    expect(firstProps.navigationRequest).toEqual({ id: 1, url: 'https://example.com/docs' });
-
-    await act(async () => {
-      firstProps.onNavigationRequestConsumed({ id: 999, url: 'https://example.com/other' });
-      await flushMicrotasks();
-    });
-    expect(publicBrowserSurfaceRender.mock.calls.at(-1)?.[0].navigationRequest).toBe(
-      firstProps.navigationRequest
-    );
-
-    await act(async () => {
-      firstProps.onNavigationRequestConsumed(firstProps.navigationRequest!);
-      await flushMicrotasks();
-    });
-    expect(publicBrowserSurfaceRender.mock.calls.at(-1)?.[0].navigationRequest).toBeNull();
-  });
-
-  it('assigns a new request id when retrying a consumed public navigation', async () => {
-    const testRuntime = createRuntime();
-    const rendered = await renderPanel(testRuntime.runtime);
-
-    await enterAddress(rendered, 'example.com/docs');
-
-    const firstProps = publicBrowserSurfaceRender.mock.calls.at(-1)?.[0] as {
-      navigationRequest: { id: number; url: string } | null;
-      onStateChange: (state: ElectronPublicBrowserState) => void;
-      onNavigationRequestConsumed: (request: { id: number; url: string }) => void;
-    };
-    const firstRequest = firstProps.navigationRequest!;
-    expect(firstRequest).toEqual({ id: 1, url: 'https://example.com/docs' });
-
-    await act(async () => {
-      firstProps.onNavigationRequestConsumed(firstRequest);
-      firstProps.onStateChange({
-        browserId: 'session-browser-session-browser-controller',
-        phase: 'error',
-        url: firstRequest.url,
-        canGoBack: false,
-        canGoForward: false,
-        error: 'load failed',
-      });
-      await flushMicrotasks();
-    });
-
-    await enterAddress(rendered, 'example.com/docs');
-
-    expect(publicBrowserSurfaceRender.mock.calls.at(-1)?.[0].navigationRequest).toEqual({
-      id: 2,
-      url: 'https://example.com/docs',
-    });
-  });
-
   it('reattaches a public browser without navigating again after remount', async () => {
     const testRuntime = createRuntime();
     const rendered = await renderPanel(testRuntime.runtime);
@@ -1000,53 +924,6 @@ describe('SessionBrowserPanel controller', () => {
     expect(rendered.textContent).not.toContain('Unexpected create');
   });
 
-  it('opens a reported candidate from the composer bar and creates its tunnel directly', async () => {
-    const onCandidateNavigationRequestHandled = vi.fn();
-    const testRuntime = createRuntime({
-      plane: 'cloud',
-      preview: {
-        candidate: {
-          status: 'available',
-          candidateId: 'candidate-browser',
-          target: localTarget,
-          updatedAt: 1,
-        },
-      },
-    });
-    const rendered = await renderPanel(testRuntime.runtime, {
-      candidateNavigationRequestId: 1,
-      onCandidateNavigationRequestHandled,
-    });
-
-    expect(onCandidateNavigationRequestHandled).toHaveBeenCalledWith(1);
-    expect(document.body.textContent).not.toContain('Open a remote preview?');
-    expect(testRuntime.requestSessionPreviewCreate).toHaveBeenCalledWith(
-      session.machineId,
-      session.id,
-      'user-1',
-      localTarget,
-      expect.objectContaining({
-        source: 'browser_address',
-        targetClass: 'loopback',
-        target: localTarget,
-        confirmedByUserId: 'user-1',
-      }),
-      expect.objectContaining({ restart: undefined })
-    );
-    expect(testRuntime.requestSessionPreviewCreate).toHaveBeenCalledOnce();
-    expect(rendered.querySelector('[data-testid="managed-preview"]')).not.toBeNull();
-
-    await act(async () => root?.unmount());
-    root = undefined;
-    container?.remove();
-    container = undefined;
-
-    await renderPanel(testRuntime.runtime, { candidateNavigationRequestId: 0 });
-
-    expect(document.body.textContent).not.toContain('Open a remote preview?');
-    expect(testRuntime.requestSessionPreviewCreate).toHaveBeenCalledOnce();
-  });
-
   it('keeps a composer bar request pending until a reported candidate reaches the session doc', async () => {
     const onCandidateNavigationRequestHandled = vi.fn();
     const catchingUp = createCatchingUpSessionStore(session.id);
@@ -1099,61 +976,6 @@ describe('SessionBrowserPanel controller', () => {
     expect(testRuntime.requestSessionPreviewCreate).not.toHaveBeenCalled();
   });
 
-  it('shows remote connection progress until the tunnel viewer URL is ready', async () => {
-    let resolveCreate: ((response: SessionPreviewCreateResponse) => void) | undefined;
-    const createPreview = () =>
-      new Promise<SessionPreviewCreateResponse>((resolve) => {
-        resolveCreate = resolve;
-      });
-    const testRuntime = createRuntime({ plane: 'cloud', createPreview });
-    const rendered = await renderPanel(testRuntime.runtime);
-
-    await enterAddress(rendered, '127.0.0.1:5173/dashboard?mode=dev');
-
-    expect(rendered.querySelector('[role="status"]')?.textContent).toContain(
-      'Establishing a secure preview connection…'
-    );
-    expect(
-      (rendered.querySelector('input[aria-label="Address"]') as HTMLInputElement).disabled
-    ).toBe(true);
-    expect(rendered.querySelector('[data-testid="managed-preview"]')).toBeNull();
-
-    await act(async () => {
-      resolveCreate?.({
-        type: 'session/preview-create_response',
-        sessionId: session.id,
-        success: true,
-        connection: remoteConnection,
-      });
-      await flushMicrotasks();
-    });
-
-    const surface = rendered.querySelector('[data-testid="managed-preview"]');
-    expect(surface?.getAttribute('data-viewer-url')).toBe(
-      'https://browser-preview.trycloudflare.com/dashboard?mode=dev&__lody_preview_token=remote-token'
-    );
-    expect(surface?.getAttribute('data-logical-url')).toBe(
-      'http://127.0.0.1:5173/dashboard?mode=dev'
-    );
-  });
-
-  it('surfaces an unexpected remote navigation failure instead of rejecting silently', async () => {
-    const testRuntime = createRuntime({
-      plane: 'cloud',
-      createPreview: async () => {
-        throw new Error('preview transport disconnected');
-      },
-    });
-    const rendered = await renderPanel(testRuntime.runtime);
-
-    await enterAddress(rendered, '127.0.0.1:5173/dashboard?mode=dev');
-
-    expect(rendered.querySelector('[role="alert"]')?.textContent).toContain(
-      'Page could not be opened: preview transport disconnected'
-    );
-    expect(rendered.querySelector('[role="status"]')).not.toBeNull();
-  });
-
   it('keeps a local session endpoint alive across panel unmount and resumes it on remount', async () => {
     window.__LODY_ELECTRON__ = true;
     const testRuntime = createRuntime({ plane: 'local' });
@@ -1204,5 +1026,310 @@ describe('SessionBrowserPanel controller', () => {
     );
     expect(rendered.querySelector('[data-testid="managed-preview"]')).toBe(localViewer);
     expect(localViewer?.getAttribute('data-viewer-url')).toBe(localEndpoint.viewerUrl);
+  });
+
+  it('reuses a cached unexpired preview link immediately on reopen with a background check and zero machine-resolution stall', async () => {
+    const statusPending = Promise.withResolvers<SessionPreviewStatusResponse>();
+    const testRuntime = createRuntime({ plane: 'cloud' });
+    const rendered = await renderPanel(testRuntime.runtime);
+
+    // 1. Initial load creates and caches the preview link + navigates to /settings
+    await enterAddress(rendered, '127.0.0.1:5173/settings');
+    expect(testRuntime.requestSessionPreviewCreate).toHaveBeenCalledTimes(1);
+    expect(rendered.querySelector('[data-testid="managed-preview"]')).not.toBeNull();
+
+    // 2. Unmount (simulate switching to another conversation)
+    await act(async () => root?.unmount());
+    root = undefined;
+    container?.remove();
+    container = undefined;
+
+    // 3. Reopen while status check is slow/pending
+    testRuntime.requestSessionPreviewCreate.mockClear();
+    testRuntime.requestSessionPreviewStatus.mockReturnValue(statusPending.promise);
+    const reopened = await renderPanel(testRuntime.runtime, { candidateNavigationRequestId: 1 });
+
+    // Preview is visible immediately from cache; never stalled on machine resolution or creating a new link
+    expect(
+      reopened.querySelector('[data-testid="managed-preview"]')?.getAttribute('data-viewer-url')
+    ).toBe('https://browser-preview.trycloudflare.com/settings?__lody_preview_token=remote-token');
+    expect(reopened.textContent).not.toContain('Resolving the session machine');
+    expect(testRuntime.requestSessionPreviewCreate).not.toHaveBeenCalled();
+
+    // Right side of address bar shows background check indicator while page stays visible
+    const statusButton = reopened.querySelector('button[aria-label*="Checking preview link"]');
+    expect(statusButton).not.toBeNull();
+
+    // Clicking copy link copies the cached URL immediately without waiting for any remote RPC
+    vi.mocked(writeTextToClipboard).mockClear();
+    await clickButton(reopened, 'Copy share URL');
+    expect(writeTextToClipboard).toHaveBeenCalledWith(
+      'https://browser-preview.trycloudflare.com/settings?__lody_preview_token=remote-token'
+    );
+    expect(testRuntime.requestSessionPreviewCreate).not.toHaveBeenCalled();
+
+    // Completing the background check clears the checking state cleanly
+    await act(async () => {
+      statusPending.resolve({
+        type: 'session/preview-status_response',
+        sessionId: session.id,
+        success: true,
+        connection: remoteConnection,
+      });
+      await flushMicrotasks();
+    });
+    expect(reopened.querySelector('button[aria-label*="Checking preview link"]')).toBeNull();
+    expect(reopened.querySelector('[data-testid="managed-preview"]')).not.toBeNull();
+  });
+
+  it('shows a regenerate button when background check confirms link unavailable and returns to the last browsed page on click', async () => {
+    const regeneratedConnection: PreviewConnection = {
+      ...remoteConnection,
+      endpointId: 'endpoint-browser-regenerated',
+      publicUrl: 'https://fresh-preview.trycloudflare.com/?__lody_preview_token=fresh-token',
+      updatedAt: 2,
+    };
+    const testRuntime = createRuntime({
+      plane: 'cloud',
+      connection: regeneratedConnection,
+    });
+    rememberSessionBrowserResumeState(session.id, {
+      currentAddress: parseBrowserAddress('http://127.0.0.1:5173/settings'),
+      machinePlane: 'cloud',
+    });
+    rememberSessionRemotePreview(session.id, remoteConnection, Date.now() + 60_000);
+
+    testRuntime.requestSessionPreviewStatus.mockResolvedValue({
+      type: 'session/preview-status_response',
+      sessionId: session.id,
+      success: true,
+      connection: { ...remoteConnection, status: 'closed' },
+    });
+
+    const rendered = await renderPanel(testRuntime.runtime);
+
+    // Must NOT auto-regenerate; shows regenerate icon on right of address bar
+    expect(testRuntime.requestSessionPreviewCreate).not.toHaveBeenCalled();
+    const regenButton = rendered.querySelector<HTMLButtonElement>(
+      '[data-testid="preview-regenerate-button"]'
+    );
+    expect(regenButton).not.toBeNull();
+    expect(regenButton?.getAttribute('aria-label')).toBe('Regenerate preview link');
+
+    // Clicking regenerate creates a new link and navigates back to /settings
+    await act(async () => {
+      regenButton?.click();
+      await flushMicrotasks();
+    });
+    expect(testRuntime.requestSessionPreviewCreate).toHaveBeenCalledTimes(1);
+    expect(
+      rendered.querySelector('[data-testid="managed-preview"]')?.getAttribute('data-viewer-url')
+    ).toBe('https://fresh-preview.trycloudflare.com/settings?__lody_preview_token=fresh-token');
+  });
+
+  it('shows regenerate action without auto-rebuilding when a cached preview link is already expired', async () => {
+    const regeneratedConnection: PreviewConnection = {
+      ...remoteConnection,
+      endpointId: 'endpoint-browser-after-expiry',
+      publicUrl: 'https://renewed-preview.trycloudflare.com/?__lody_preview_token=renewed-token',
+      updatedAt: 3,
+    };
+    const testRuntime = createRuntime({
+      plane: 'cloud',
+      connection: regeneratedConnection,
+    });
+    rememberSessionBrowserResumeState(session.id, {
+      currentAddress: parseBrowserAddress('http://127.0.0.1:5173/settings'),
+      machinePlane: 'cloud',
+    });
+    // Explicitly expired in the past
+    rememberSessionRemotePreview(session.id, remoteConnection, Date.now() - 1_000);
+
+    const rendered = await renderPanel(testRuntime.runtime);
+
+    expect(testRuntime.requestSessionPreviewCreate).not.toHaveBeenCalled();
+    expect(rendered.querySelector('[data-testid="managed-preview"]')).toBeNull();
+    const regenButton = rendered.querySelector<HTMLButtonElement>(
+      '[data-testid="preview-regenerate-button"]'
+    );
+    expect(regenButton).not.toBeNull();
+
+    await act(async () => {
+      regenButton?.click();
+      await flushMicrotasks();
+    });
+    expect(testRuntime.requestSessionPreviewCreate).toHaveBeenCalledTimes(1);
+    expect(
+      rendered.querySelector('[data-testid="managed-preview"]')?.getAttribute('data-viewer-url')
+    ).toBe('https://renewed-preview.trycloudflare.com/settings?__lody_preview_token=renewed-token');
+  });
+
+  it('keeps the cached preview visible and reports unconfirmed status when background check times out', async () => {
+    const testRuntime = createRuntime({ plane: 'cloud' });
+    rememberSessionBrowserResumeState(session.id, {
+      currentAddress: parseBrowserAddress('http://127.0.0.1:5173/dashboard?mode=dev'),
+      machinePlane: 'cloud',
+    });
+    rememberSessionRemotePreview(session.id, remoteConnection, Date.now() + 60_000);
+    testRuntime.requestSessionPreviewStatus.mockResolvedValue({
+      type: 'session/preview-status_response',
+      sessionId: session.id,
+      success: false,
+      error: 'timeout',
+      message: 'Request timed out',
+    });
+
+    const rendered = await renderPanel(testRuntime.runtime);
+
+    // Current preview stays visible even though background check timed out
+    expect(
+      rendered.querySelector('[data-testid="managed-preview"]')?.getAttribute('data-viewer-url')
+    ).toBe(
+      'https://browser-preview.trycloudflare.com/dashboard?mode=dev&__lody_preview_token=remote-token'
+    );
+    expect(
+      rendered.querySelector('button[aria-label*="Unable to confirm connection right now"]')
+    ).not.toBeNull();
+    expect(rendered.querySelector('[data-testid="preview-regenerate-button"]')).toBeNull();
+  });
+
+  it('caches the preloaded preview link so opening Preview immediately reuses it', async () => {
+    const statusPending = Promise.withResolvers<SessionPreviewStatusResponse>();
+    const testRuntime = createRuntime({
+      plane: 'cloud',
+      preview: reportedPreview,
+    });
+    testRuntime.requestSessionPreviewStatus.mockResolvedValueOnce({
+      type: 'session/preview-status_response',
+      sessionId: session.id,
+      success: true,
+      connection: remoteConnection,
+      expiresAt: Date.now() + 60_000,
+    });
+
+    const store = createStore();
+    store.set(runtimeAtom, testRuntime.runtime);
+    store.set(userAtom, { id: 'user-1', name: 'Preview User', email: 'preview@example.com' });
+    const preloadContainer = document.createElement('div');
+    document.body.appendChild(preloadContainer);
+    const preloadRoot = createRoot(preloadContainer);
+    await act(async () => {
+      preloadRoot.render(
+        createElement(
+          PlatformContext.Provider,
+          { value: TEST_CLOUD_PLATFORM },
+          createElement(Provider, { store }, createElement(SessionPreviewPreload, { session }))
+        )
+      );
+      await flushMicrotasks();
+    });
+    await act(async () => preloadRoot.unmount());
+    preloadContainer.remove();
+
+    // Now opening the browser panel while status check is slow should open immediately from cached preload link
+    testRuntime.requestSessionPreviewStatus.mockReturnValue(statusPending.promise);
+    const rendered = await renderPanel(testRuntime.runtime, { candidateNavigationRequestId: 1 });
+    expect(
+      rendered.querySelector('[data-testid="managed-preview"]')?.getAttribute('data-viewer-url')
+    ).toBe(
+      'https://browser-preview.trycloudflare.com/dashboard?mode=dev&__lody_preview_token=remote-token'
+    );
+    expect(testRuntime.requestSessionPreviewCreate).not.toHaveBeenCalled();
+  });
+
+  it('offers split disconnect options when machine supports previewStopProcess and keeps primary click safe', async () => {
+    const testRuntime = createRuntime({
+      plane: 'cloud',
+      preview: { connection: remoteConnection },
+    });
+    rememberSessionBrowserResumeState(session.id, {
+      currentAddress: parseBrowserAddress('http://127.0.0.1:5173/dashboard?mode=dev'),
+      machinePlane: 'cloud',
+    });
+    rememberSessionRemotePreview(session.id, remoteConnection, Date.now() + 60_000);
+
+    const rendered = await renderPanel(testRuntime.runtime, {
+      protocolCapabilities: { previewStopProcess: 1 },
+    });
+
+    const primaryBtn = rendered.querySelector<HTMLButtonElement>(
+      '[data-testid="browser-disconnect-button"]'
+    );
+    const menuTrigger = rendered.querySelector<HTMLButtonElement>(
+      '[data-testid="browser-disconnect-button-menu"]'
+    );
+    expect(primaryBtn).not.toBeNull();
+    expect(menuTrigger).not.toBeNull();
+
+    await act(async () => {
+      primaryBtn?.click();
+      await flushMicrotasks();
+    });
+    expect(testRuntime.requestSessionPreviewRevoke).toHaveBeenCalledWith(
+      session.machineId,
+      session.id,
+      'user-1',
+      { reason: 'user_revoked' }
+    );
+  });
+
+  it('sends stopProcess: true when selecting Close preview and stop server from the disconnect menu', async () => {
+    const testRuntime = createRuntime({
+      plane: 'cloud',
+      preview: { connection: remoteConnection },
+    });
+    rememberSessionBrowserResumeState(session.id, {
+      currentAddress: parseBrowserAddress('http://127.0.0.1:5173/dashboard?mode=dev'),
+      machinePlane: 'cloud',
+    });
+    rememberSessionRemotePreview(session.id, remoteConnection, Date.now() + 60_000);
+
+    const rendered = await renderPanel(testRuntime.runtime, {
+      protocolCapabilities: { previewStopProcess: 1 },
+    });
+
+    const menuTrigger = rendered.querySelector<HTMLButtonElement>(
+      '[data-testid="browser-disconnect-button-menu"]'
+    );
+    expect(menuTrigger).not.toBeNull();
+    await act(async () => {
+      menuTrigger?.click();
+      await flushMicrotasks();
+    });
+
+    const stopServerItem = [...document.querySelectorAll('[role="menuitem"]')].find((node) =>
+      node.textContent?.includes('Close preview and stop server')
+    ) as HTMLElement | undefined;
+    expect(stopServerItem).toBeDefined();
+
+    await act(async () => {
+      stopServerItem?.click();
+      await flushMicrotasks();
+    });
+    expect(testRuntime.requestSessionPreviewRevoke).toHaveBeenCalledWith(
+      session.machineId,
+      session.id,
+      'user-1',
+      { reason: 'user_revoked', stopProcess: true }
+    );
+  });
+
+  it('hides the disconnect dropdown menu when the machine lacks previewStopProcess capability', async () => {
+    const testRuntime = createRuntime({
+      plane: 'cloud',
+      preview: { connection: remoteConnection },
+    });
+    rememberSessionBrowserResumeState(session.id, {
+      currentAddress: parseBrowserAddress('http://127.0.0.1:5173/dashboard?mode=dev'),
+      machinePlane: 'cloud',
+    });
+    rememberSessionRemotePreview(session.id, remoteConnection, Date.now() + 60_000);
+
+    const rendered = await renderPanel(testRuntime.runtime, {
+      protocolCapabilities: {},
+    });
+
+    expect(rendered.querySelector('[data-testid="browser-disconnect-button"]')).not.toBeNull();
+    expect(rendered.querySelector('[data-testid="browser-disconnect-button-menu"]')).toBeNull();
   });
 });

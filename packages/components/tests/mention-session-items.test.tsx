@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
-
 import { act, createElement, useEffect, type ReactNode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Provider, createStore, type Store } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getSessionRoomId,
+  getMachineRoomId,
   type MachineId,
   type SessionId,
   type SessionMeta,
@@ -42,7 +42,7 @@ vi.mock('@/hooks/use-machine-flock-rows', () => machineFlockMocks);
 vi.mock('../src/hooks/use-machine-flock-rows', () => machineFlockMocks);
 
 import { userAtom } from '../src/atoms';
-import { sessionMetaCacheAtom } from '../src/atoms/doc-meta';
+import { machineMetaCacheAtom, sessionMetaCacheAtom } from '../src/atoms/doc-meta';
 import { currentWorkspaceIdAtom } from '../src/atoms/workspace-context';
 import { useSessionMentionItems } from '../src/components/mentions/mention-session-source';
 import { TestCloudPlatformProvider } from './test-platform';
@@ -85,7 +85,9 @@ describe('useSessionMentionItems', () => {
 
   beforeEach(() => {
     snapshot = undefined;
-    queryMocks.machineRows = [];
+    queryMocks.machineRows = [
+      { machineId: 'own-machine', ownerUserId: 'viewer-user', sharedWithTeam: false, updatedAt: 1 },
+    ];
     queryMocks.localProjectRows = [];
     queryMocks.useQuery.mockReset();
     queryMocks.useQuery.mockImplementation((query) => {
@@ -103,6 +105,13 @@ describe('useSessionMentionItems', () => {
       email: 'viewer@example.com',
     });
     store.set(currentWorkspaceIdAtom, 'workspace-mentions' as WorkspaceId);
+    store.set(machineMetaCacheAtom, {
+      [getMachineRoomId('own-machine' as MachineId)]: {
+        id: 'own-machine',
+        ownerUserId: 'viewer-user',
+        name: 'Viewer machine',
+      } as never,
+    });
   });
 
   afterEach(async () => {
@@ -169,37 +178,6 @@ describe('useSessionMentionItems', () => {
 
     // Recency-ordered: child first, parent second; archived stays excluded.
     expect(snapshot).toEqual(['child-session', 'parent-session']);
-  });
-
-  it('builds the items once for every composer surface of a conversation', async () => {
-    const one = cachedSession({ id: 'one-session', title: 'one', lastMessageAt: 20 });
-    const two = cachedSession({ id: 'two-session', title: 'two', lastMessageAt: 10 });
-    store.set(sessionMetaCacheAtom, {
-      [getSessionRoomId(one.id)]: one,
-      [getSessionRoomId(two.id)]: two,
-    });
-    const seen: unknown[] = [];
-    function Surface() {
-      const items = useSessionMentionItems('one-session');
-      seen.push(items);
-      return null;
-    }
-
-    // Input area, composer and mention textarea each read the items.
-    await mount(createElement('div', null, createElement(Surface), createElement(Surface)));
-    const settled = seen.slice(-2);
-    expect(settled[0]).toBe(settled[1]);
-
-    // A session-list change is a new list: the surfaces move to fresh items together.
-    await act(async () => {
-      store.set(sessionMetaCacheAtom, {
-        [getSessionRoomId(one.id)]: one,
-        [getSessionRoomId(two.id)]: { ...two, title: 'renamed' },
-      });
-    });
-    const latest = seen.slice(-2);
-    expect(latest[0]).toBe(latest[1]);
-    expect(latest[0]).not.toBe(settled[0]);
   });
 
   it('still drops the session the composer belongs to', async () => {

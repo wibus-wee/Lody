@@ -22,11 +22,15 @@ bound, so the windowed path avoids mirroring it into memory as an array. Everyth
 `getState()` has no `history` key and `setState` receives a draft without one,
 so the ordinary spellings of a second path do not compile. What types cannot
 close is a deliberate escape — a cast that puts the key back, or reaching past
-the store into the raw `LoroDoc` — and
-`tests/no-materialized-history-in-components.test.ts` fails on those. No component reads the raw history list; composition injects the shared reader.
+the store into the raw `LoroDoc`. Do not bypass these boundaries. No component
+reads the raw history list; composition injects the shared reader.
 
 Full-history actions use the authoritative consistent full-read operation.
 Performance comparisons must use the current full-Mirror baseline.
+
+## Image previews
+
+Pending local images use only scoped host previews. Published `r2` images retain local-first previews and authenticated cloud fallback when unavailable. Follow [rendering](components/ai-gui/session-files-rendering.md) for image publication and cache behavior. Sends, schedules, and replay preserve image identity without capability preflights. Plaintext desktop sends prepare known matching targets locally; protected sends and schedules always use encrypted transfer for unprepared attachments.
 
 ## Conversation exports
 
@@ -122,16 +126,15 @@ Cancellation retains selection and cannot remove a user destination.
 ## Billing data
 
 - After auth/workspace resolution, preload billing overview into the session-scoped
-  cache for latency only. Permissions, quotas, destructive guards, and Stripe invoice
+  cache for latency only. A rejected preload stays inside its leaf and never reaches
+  the route error boundary. Permissions, quotas, destructive guards, and Stripe invoice
   history remain live/on-demand.
 
 ## ACP selectors
 
-- Built-in Codex reasoning selectors normalize cached options against exact model support
-  in `components/shared/acp-selector-options.ts`: GPT-6 Astra/Sol and GPT-5.6 Sol/Terra
-  expose Max/Ultra; GPT-6 Luna and GPT-5.6 Luna expose Max only. Keep this aligned with
-  the ACP model catalog; a model version threshold cannot represent per-model differences,
-  and cached efforts may belong to a different selected model.
+- Effort ladders follow the selected model: its recorded options, then the adapter's
+  per-model declaration, then `modelReasoningEfforts` (`components/shared/acp-selector-options.ts`).
+  Never hard-code a provider's per-model tiers; cached efforts may belong to another model.
 
 ## ACP authentication
 

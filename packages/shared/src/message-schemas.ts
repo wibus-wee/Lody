@@ -1,5 +1,10 @@
+import {
+  ManagedDaemonUpdateStatusSchema,
+  ManagedDaemonUpgradeOptionsSchema,
+} from './daemon-update';
 import { EncryptedAttachmentSchema } from './encrypted-attachment';
 import { ProjectLocalMemberProbeSchema, SessionProjectRunSchema } from './workspace-project';
+import { automationOriginSchema } from './automations/contracts';
 import { AgentRoleProposalMetaSchema } from './agent-role-proposal';
 import { isMagpieGatewayUrl } from './magpie-import';
 import { MemoryBindingSchema } from './memory-provider';
@@ -32,25 +37,20 @@ import type { ProjectRef } from './project';
 import { MAX_MESSAGE_TEXT_SPAN_MARK_LENGTH, MESSAGE_TEXT_SPAN_KINDS } from './message-text-spans';
 import { RpcSecretPublicKeySchema } from './rpc-secret';
 import { LodyOperationIdSchema, LodyOperationCompletionSchema } from './session-orchestration';
-import { isSensitiveAcpConfigOptionId } from './acp-config-option-sensitivity';
 import { normalizeMcpServerIdSelection } from './workspace-mcp';
 import {
   ACP_AUTH_FORM_FIELD_MAX_COUNT,
   ACP_AUTH_ID_MAX_LENGTH,
   ACP_AUTH_LABEL_MAX_LENGTH,
-  ACP_AUTH_METHOD_MAX_COUNT,
   ACP_AUTH_SELECT_OPTION_MAX_COUNT,
   ACP_AUTH_TEXT_MAX_LENGTH,
   ACP_AUTHORIZATION_URL_MAX_LENGTH,
   isAcpAuthenticationFormWithinByteLimit,
 } from './acp-authentication-limits';
 
-// ============================================
-// BASE ID TYPE SCHEMAS
-// Zod's .brand() is incompatible with the repository's existing TypeScript
-// brands. Convert at this validation boundary so parsed session ids carry the
-// domain type without forcing casts throughout application code.
-// ============================================
+const SharedStringSchema = z.string();
+const SharedOptionalStringSchema = SharedStringSchema.optional();
+const SharedTrimmedNonEmptyStringSchema = SharedStringSchema.trim().min(1);
 
 export const SessionIdSchema = z.string().transform((value) => value as SessionId);
 export const MachineIdSchema = z.string();
@@ -63,8 +63,8 @@ export const WorktreeSetupScriptConfigSchema = z
   .object({
     scripts: z
       .object({
-        bash: z.string().optional(),
-        powershell: z.string().optional(),
+        bash: SharedOptionalStringSchema,
+        powershell: SharedOptionalStringSchema,
       })
       .strict(),
     timeoutMs: z.number().int().positive().optional(),
@@ -73,39 +73,37 @@ export const WorktreeSetupScriptConfigSchema = z
 
 export const WorktreeCleanupScriptConfigSchema = WorktreeSetupScriptConfigSchema;
 
-// ============================================
-// ACP SESSION CONFIG SCHEMAS
-// ============================================
-
 export const CliTypeSchema = z.enum(['kimi', 'grok', 'claude', 'codex']);
 export const AgentConfigCliTypeSchema = z.enum(['builtin', 'registry', 'custom']);
 
 /** Launch spec for `cliType: 'custom'` agents (see `CustomAcpLaunchSpec`). */
 export const CustomAcpLaunchSpecSchema = z
   .object({
-    command: z.string().trim().min(1),
-    args: z.array(z.string()).optional(),
+    command: SharedTrimmedNonEmptyStringSchema,
+    args: z.array(SharedStringSchema).optional(),
   })
   .strict();
 
 export const BuiltinRuntimeOverridesSchema = z
   .object({
-    codexPath: z.string().optional(),
-    claudeCodeExecutable: z.string().optional(),
-    kimiPath: z.string().optional(),
-    grokPath: z.string().optional(),
-    devinPath: z.string().optional(),
-    piPath: z.string().optional(),
+    antigravityPath: SharedOptionalStringSchema,
+    codexPath: SharedOptionalStringSchema,
+    claudeCodeExecutable: SharedOptionalStringSchema,
+    kimiPath: SharedOptionalStringSchema,
+    grokPath: SharedOptionalStringSchema,
+    devinPath: SharedOptionalStringSchema,
+    piPath: SharedOptionalStringSchema,
     piExtensions: z
       .array(z.string().trim().min(1).max(PI_EXTENSION_PATH_MAX_LENGTH))
       .max(PI_EXTENSIONS_MAX_SELECTIONS)
       .optional(),
+    antigravitySkipPermissions: z.boolean().optional(),
   })
   .strict();
 
-export const AcpConfigOptionValueSchema = z.union([z.string(), z.boolean()]);
+export const AcpConfigOptionValueSchema = z.union([SharedStringSchema, z.boolean()]);
 const AcpConfigOptionValuesSchema = z
-  .record(z.string(), AcpConfigOptionValueSchema)
+  .record(SharedStringSchema, AcpConfigOptionValueSchema)
   .transform((values) =>
     Object.fromEntries(Object.entries(values).filter(([key]) => key !== '$cid'))
   );
@@ -113,8 +111,8 @@ const AcpConfigOptionValuesSchema = z
 export const IssuePRMentionSchema = z
   .object({
     type: z.enum(['issue', 'pr']),
-    title: z.string(),
-    url: z.string(),
+    title: SharedStringSchema,
+    url: SharedStringSchema,
     number: z.number(),
   })
   .strict();
@@ -126,12 +124,15 @@ const OptionalPositiveIntegerSchema = z.preprocess(
 
 const OptionalStringSchema = z.preprocess(
   (value) => (value === null ? undefined : value),
-  z.string().optional()
+  SharedOptionalStringSchema
 );
 
 export const SessionImagePayloadSchema = z
   .object({
-    imageId: z.string(),
+    imageId: SharedStringSchema,
+    transport: z.enum(['local', 'r2']).optional(),
+    machineId: MachineIdSchema.optional(),
+    localImageId: z.string().uuid().optional(),
     encryption: EncryptedAttachmentSchema.optional(),
     mimeType: z.enum(SESSION_IMAGE_ALLOWED_MIME_TYPES),
     fileName: OptionalStringSchema,
@@ -140,11 +141,27 @@ export const SessionImagePayloadSchema = z
     height: OptionalPositiveIntegerSchema,
     storageSessionId: SessionIdSchema.optional(),
   })
-  .strict().superRefine((image, ctx) => {
+  .strict()
+  .superRefine((image, ctx) => {
+    if (
+      image.transport === 'local' &&
+      (!image.machineId ||
+        !image.localImageId ||
+        image.imageId !== image.localImageId ||
+        image.encryption)
+    )
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid local image reference' });
+    if (image.localImageId && !image.machineId)
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Local image requires its machine' });
     const manifest = image.encryption;
-    if (manifest && (manifest.kind !== 'image' || manifest.parts[0] !== image.imageId ||
-      manifest.sizeBytes !== image.sizeBytes || manifest.mimeType !== image.mimeType ||
-      manifest.fileName !== (image.fileName ?? ''))) {
+    if (
+      manifest &&
+      (manifest.kind !== 'image' ||
+        manifest.parts[0] !== image.imageId ||
+        manifest.sizeBytes !== image.sizeBytes ||
+        manifest.mimeType !== image.mimeType ||
+        manifest.fileName !== (image.fileName ?? ''))
+    ) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Encrypted image reference mismatch' });
     }
   });
@@ -160,19 +177,15 @@ export const SessionImageGroupContentSchema = z
   })
   .strict();
 
-// Base object (no cross-field refinement) so it can participate in
-// `z.discriminatedUnion('type', ...)`. The transport/machineId invariant is
-// enforced by `refineSessionFileBlock` at the array level (a ZodEffects schema
-// cannot be a discriminated-union member).
 const SessionFileBlockObjectSchema = z
   .object({
     type: z.literal('file'),
-    fileId: z.string(),
+    fileId: SharedStringSchema,
     encryption: EncryptedAttachmentSchema.optional(),
-    fileName: z.string(),
-    mimeType: z.string(),
+    fileName: SharedStringSchema,
+    mimeType: SharedStringSchema,
     sizeBytes: z.number().int().nonnegative().max(SESSION_FILE_MAX_SIZE_BYTES),
-    sha256: z.string(),
+    sha256: SharedStringSchema,
     textPreview: z.boolean(),
     sourcePath: z.string().refine(isSessionFileSourcePath).optional(),
     transport: z.enum(['r2', 'local']),
@@ -187,14 +200,21 @@ const refineSessionFileBlock = (
   ctx: z.RefinementCtx,
   basePath: PropertyKey[] = []
 ): void => {
-  if (block.encryption && (block.encryption.kind !== 'file' || block.fileId !== block.encryption.parts[0] ||
-    block.sizeBytes !== block.encryption.sizeBytes || block.fileName !== block.encryption.fileName ||
-    block.mimeType !== block.encryption.mimeType || block.transport !== 'r2')) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: basePath, message: 'Encrypted attachment reference mismatch' });
+  if (
+    block.encryption &&
+    (block.encryption.kind !== 'file' ||
+      block.fileId !== block.encryption.parts[0] ||
+      block.sizeBytes !== block.encryption.sizeBytes ||
+      block.fileName !== block.encryption.fileName ||
+      block.mimeType !== block.encryption.mimeType ||
+      block.transport !== 'r2')
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: basePath,
+      message: 'Encrypted attachment reference mismatch',
+    });
   }
-  // transport='local' means the bytes only exist on a specific machine pending
-  // backfill; without machineId other devices can't render the honest
-  // "uploading from <machine>" pending state.
   if (block.transport === 'local' && (block.machineId === undefined || block.machineId === '')) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -214,11 +234,8 @@ const MessageTextSpanSchema = z
     end: z.number().int().nonnegative(),
     kind: z.enum(MESSAGE_TEXT_SPAN_KINDS),
     label: z.string().min(1),
-    target: z.string().optional(),
-    // The same bar `sanitizeMessageTextSpans` applies. This object is `.strict()`,
-    // and a rejected span fails the whole block list — which surfaces as an empty
-    // prompt, not as a missing chip — so a field one side knows must be declared
-    // on both.
+    target: SharedOptionalStringSchema,
+    quoteVersion: z.literal(1).optional(),
     mark: z.string().min(1).max(MAX_MESSAGE_TEXT_SPAN_MARK_LENGTH).optional(),
   })
   .strict();
@@ -226,33 +243,28 @@ const MessageTextSpanSchema = z
 const SessionTextInputBlockSchema = z
   .object({
     type: z.literal('text'),
-    text: z.string(),
-    // Optional so every text block written before spans existed still parses.
-    // Offsets are NOT checked against `text` here — only the shape is. The
-    // range check belongs to `sanitizeMessageTextSpans`, which also runs on the
-    // read path, where spans arrive through the session document's untyped
-    // catchall and never see this schema at all.
+    text: SharedStringSchema,
     spans: z.array(MessageTextSpanSchema).optional(),
   })
   .strict();
 
 const CommentReferenceReplySchema = z.object({
-  authorName: z.string(),
-  body: z.string(),
+  authorName: SharedStringSchema,
+  body: SharedStringSchema,
 });
 
 const CommentReferencePayloadSchema = z.object({
   source: z.enum(['lody', 'github']),
-  path: z.string(),
+  path: SharedStringSchema,
   lineNumber: z.number().int(),
   side: z.enum(['additions', 'deletions']),
-  commentBody: z.string(),
-  authorName: z.string(),
-  authorImage: z.string().optional(),
+  commentBody: SharedStringSchema,
+  authorName: SharedStringSchema,
+  authorImage: SharedOptionalStringSchema,
   replies: z.array(CommentReferenceReplySchema).optional(),
-  turnId: z.string().optional(),
+  turnId: SharedOptionalStringSchema,
   mode: z.enum(['conversation', 'base']).optional(),
-  threadId: z.string().optional(),
+  threadId: SharedOptionalStringSchema,
   githubThreadId: z.number().int().optional(),
 });
 
@@ -284,8 +296,8 @@ const VisualAnnotationAnchorSchema = z
     version: z.literal(1),
     page: z
       .object({
-        url: z.string(),
-        pathname: z.string(),
+        url: SharedStringSchema,
+        pathname: SharedStringSchema,
         viewport: VisualAnnotationViewportSchema,
       })
       .strict(),
@@ -301,11 +313,11 @@ const VisualAnnotationAnchorSchema = z
       .strict(),
     target: z
       .object({
-        tag: z.string(),
-        id: z.string().optional(),
-        role: z.string().optional(),
-        attributes: z.record(z.string(), z.string()),
-        text: z.string().optional(),
+        tag: SharedStringSchema,
+        id: SharedOptionalStringSchema,
+        role: SharedOptionalStringSchema,
+        attributes: z.record(SharedStringSchema, SharedStringSchema),
+        text: SharedOptionalStringSchema,
         rect: z
           .object({
             x: z.number(),
@@ -315,8 +327,8 @@ const VisualAnnotationAnchorSchema = z
           })
           .strict(),
         rectRatio: VisualAnnotationRectRatioSchema,
-        selector: z.string(),
-        xpath: z.string().optional(),
+        selector: SharedStringSchema,
+        xpath: SharedOptionalStringSchema,
       })
       .strict(),
     context: z
@@ -324,15 +336,15 @@ const VisualAnnotationAnchorSchema = z
         ancestors: z.array(
           z
             .object({
-              tag: z.string(),
-              id: z.string().optional(),
-              role: z.string().optional(),
-              selector: z.string().optional(),
-              text: z.string().optional(),
+              tag: SharedStringSchema,
+              id: SharedOptionalStringSchema,
+              role: SharedOptionalStringSchema,
+              selector: SharedOptionalStringSchema,
+              text: SharedOptionalStringSchema,
             })
             .strict()
         ),
-        nearbyText: z.array(z.string()).optional(),
+        nearbyText: z.array(SharedStringSchema).optional(),
       })
       .strict(),
   })
@@ -341,10 +353,10 @@ const VisualAnnotationAnchorSchema = z
 const VisualAnnotationReferencePayloadSchema = z
   .object({
     source: z.literal('visual_annotation'),
-    commentId: z.string(),
-    turnId: z.string().optional(),
-    body: z.string(),
-    authorName: z.string().optional(),
+    commentId: SharedStringSchema,
+    turnId: SharedOptionalStringSchema,
+    body: SharedStringSchema,
+    authorName: SharedOptionalStringSchema,
     status: z.enum(['completed', 'submitted', 'cancelled']).optional(),
     anchor: VisualAnnotationAnchorSchema,
   })
@@ -355,10 +367,23 @@ const SessionVisualAnnotationReferenceInputBlockSchema =
     type: z.literal('visual_annotation_reference'),
   }).strict();
 
+export const SessionLocalAttachmentSchema = z
+  .object({
+    type: z.literal('local_attachment'),
+    machineId: MachineIdSchema,
+    path: SharedTrimmedNonEmptyStringSchema,
+    kind: z.enum(['file', 'image']),
+    fileName: SharedTrimmedNonEmptyStringSchema,
+    mimeType: SharedTrimmedNonEmptyStringSchema,
+    sizeBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+
 export const SessionInputBlockSchema = z.discriminatedUnion('type', [
   SessionTextInputBlockSchema,
   SessionImageInputBlockSchema,
   SessionFileBlockObjectSchema,
+  SessionLocalAttachmentSchema,
   SessionCommentReferenceInputBlockSchema,
   SessionVisualAnnotationReferenceInputBlockSchema,
 ]);
@@ -369,9 +394,10 @@ export const SessionInputBlocksSchema = z
     let imageCount = 0;
     let fileCount = 0;
     blocks.forEach((block, index) => {
-      if (block.type === 'image') {
+      if (block.type === 'image' || (block.type === 'local_attachment' && block.kind === 'image')) {
         imageCount += 1;
       }
+      if (block.type === 'local_attachment' && block.kind === 'file') fileCount += 1;
       if (block.type === 'file') {
         fileCount += 1;
         refineSessionFileBlock(block, ctx, [index]);
@@ -395,15 +421,15 @@ export const SessionInputBlocksSchema = z
 
 export const ACPTurnConfigSchema = z
   .object({
-    prompt: z.string(),
+    prompt: SharedStringSchema,
     inputBlocks: SessionInputBlocksSchema.optional(),
     cliType: AgentConfigCliTypeSchema,
-    agentType: z.string().trim().min(1),
-    modeId: z.string().optional(),
-    modelId: z.string().optional(),
+    agentType: SharedTrimmedNonEmptyStringSchema,
+    modeId: SharedOptionalStringSchema,
+    modelId: SharedOptionalStringSchema,
     configOptionValues: AcpConfigOptionValuesSchema.optional(),
     memory: MemoryBindingSchema.optional(),
-    mcpServerIds: z.array(z.string()).optional(),
+    mcpServerIds: z.array(SharedStringSchema).optional(),
     agentRoleId: z.string().trim().min(1).nullable().optional(),
     agentRoleRevision: z.number().int().nonnegative().optional(),
     agentRoleSnapshot: AgentRoleSnapshotSchema.optional(),
@@ -425,7 +451,10 @@ export const SessionHistoryDeliveryKindSchema = z.literal('steer');
 export type SessionHistoryDeliveryKind = z.infer<typeof SessionHistoryDeliveryKindSchema>;
 
 export const SessionHistoryInputConfigSchema = ACPTurnConfigSchema.partial()
-  .extend({ _lodyDeliveryKind: SessionHistoryDeliveryKindSchema.optional() })
+  .extend({
+    _lodyDeliveryKind: SessionHistoryDeliveryKindSchema.optional(),
+    _lodyAutomation: automationOriginSchema.optional(),
+  })
   .strip();
 
 const LooseSessionTurnInputConfigSchema = SessionHistoryInputConfigSchema.passthrough();
@@ -462,6 +491,8 @@ export const normalizeSessionTurnInputConfig = (
 
   const record = value as Record<string, unknown>;
   const normalized: SessionTurnInputConfig = {};
+  if (record._lodyAutomation !== undefined)
+    normalized._lodyAutomation = automationOriginSchema.parse(record._lodyAutomation);
 
   const prompt = trimOptionalString(record.prompt);
   if (prompt) {
@@ -469,6 +500,16 @@ export const normalizeSessionTurnInputConfig = (
   }
 
   const inputBlocks = maybeParseField(SessionInputBlocksSchema, record.inputBlocks);
+  if (
+    !inputBlocks &&
+    Array.isArray(record.inputBlocks) &&
+    record.inputBlocks.some(
+      (block) =>
+        block?.type === 'local_attachment' ||
+        (block?.type === 'image' && block?.transport === 'local')
+    )
+  )
+    throw new Error('Invalid local attachment input');
   if (inputBlocks) {
     normalized.inputBlocks = inputBlocks;
   }
@@ -568,8 +609,8 @@ export const ProjectRefSchema = z.discriminatedUnion('kind', [
   z
     .object({
       kind: z.literal('github'),
-      repoFullName: z.string(),
-      branch: z.string().trim().min(1),
+      repoFullName: SharedStringSchema,
+      branch: SharedTrimmedNonEmptyStringSchema,
     })
     .strict(),
   z
@@ -589,10 +630,6 @@ export const SessionStartMetaSchema = z
   })
   .strict();
 
-// ============================================
-// CONTROL MESSAGE SCHEMAS
-// ============================================
-
 export const SessionCreateRequestSchema = z
   .object({
     type: z.literal('session/create'),
@@ -605,11 +642,11 @@ export const SessionCreateRequestSchema = z
     acpSessionConfig: ACPSessionConfigSchema,
     worktreeSetup: WorktreeSetupScriptConfigSchema.optional(),
     worktreeCleanup: WorktreeCleanupScriptConfigSchema.optional(),
-    env: z.record(z.string(), z.string()).optional(),
-    userTurnId: z.string().optional(),
-    userId: z.string(),
-    userName: z.string(),
-    userEmail: z.string(),
+    env: z.record(SharedStringSchema, SharedStringSchema).optional(),
+    userTurnId: SharedOptionalStringSchema,
+    userId: SharedStringSchema,
+    userName: SharedStringSchema,
+    userEmail: SharedStringSchema,
     parentSessionId: SessionIdSchema.optional(),
   })
   .strict();
@@ -619,7 +656,7 @@ export const SessionCreateResponseSchema = z
     type: z.literal('session/create_response'),
     sessionId: SessionIdSchema,
     success: z.boolean(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -638,10 +675,10 @@ export const SessionChatRequestSchema = z
     workspaceId: WorkspaceIdSchema,
     project: ProjectRefSchema.optional(),
     acpSessionConfig: ACPSessionConfigSchema,
-    userTurnId: z.string(),
-    userId: z.string(),
-    userName: z.string(),
-    userEmail: z.string(),
+    userTurnId: SharedStringSchema,
+    userId: SharedStringSchema,
+    userName: SharedStringSchema,
+    userEmail: SharedStringSchema,
   })
   .strict();
 
@@ -649,9 +686,9 @@ export const SessionChatResponseSchema = z
   .object({
     type: z.literal('session/chat_response'),
     sessionId: SessionIdSchema,
-    userTurnId: z.string(),
+    userTurnId: SharedStringSchema,
     success: z.boolean(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -659,7 +696,7 @@ export const SessionChatAckSchema = z
   .object({
     type: z.literal('session/chat_ack'),
     sessionId: SessionIdSchema,
-    userTurnId: z.string(),
+    userTurnId: SharedStringSchema,
   })
   .strict();
 
@@ -669,7 +706,7 @@ export const SessionCancelRequestSchema = z
     sessionId: SessionIdSchema,
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    turnId: z.string(),
+    turnId: SharedStringSchema,
     cancelId: z.string().uuid().optional(),
     pauseInbox: z.boolean().optional(),
     subagentTaskId: z.string().trim().min(1).optional(),
@@ -681,7 +718,7 @@ export const SessionCancelResponseSchema = z
     type: z.literal('session/cancel_response'),
     sessionId: SessionIdSchema,
     success: z.boolean(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -691,11 +728,11 @@ export const SessionSteerRequestSchema = z
     sessionId: SessionIdSchema,
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    expectedTurnId: z.string().trim().min(1),
-    userTurnId: z.string().trim().min(1),
-    userId: z.string().trim().min(1),
-    timestamp: z.string().trim().min(1),
-    inputConfig: z.record(z.string(), z.unknown()),
+    expectedTurnId: SharedTrimmedNonEmptyStringSchema,
+    userTurnId: SharedTrimmedNonEmptyStringSchema,
+    userId: SharedTrimmedNonEmptyStringSchema,
+    timestamp: SharedTrimmedNonEmptyStringSchema,
+    inputConfig: z.record(SharedStringSchema, z.unknown()),
   })
   .strict();
 
@@ -708,7 +745,7 @@ export const SessionSteerResponseSchema = z
   .object({
     type: z.literal('session/steer_response'),
     sessionId: SessionIdSchema,
-    userTurnId: z.string().trim().min(1),
+    userTurnId: SharedTrimmedNonEmptyStringSchema,
     applied: z.boolean(),
     recoveryOwned: z.boolean().optional(),
     disposition: z.enum([
@@ -721,7 +758,7 @@ export const SessionSteerResponseSchema = z
       'promotion-failed',
       'error',
     ]),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -732,7 +769,7 @@ export const SessionGoalResponseSchema = z
     action: z.enum(SESSION_GOAL_ACTIONS),
     accepted: z.boolean(),
     disposition: z.enum(['applied', 'turn_started', 'queued', 'unsupported', 'error']),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -741,7 +778,7 @@ export const SessionTerminateResponseSchema = z
     type: z.literal('session/terminate_response'),
     sessionId: SessionIdSchema,
     success: z.boolean(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -787,13 +824,11 @@ export const SessionEditAndResendErrorCodeSchema = z.enum([
 export const SessionEditAndResendSpecSchema = z
   .object({
     sessionId: SessionIdSchema,
-    expectedUserTurnId: z.string().trim().min(1),
-    replacementUserTurnId: z.string().trim().min(1),
-    requestedByUserId: z.string().trim().min(1),
-    timestamp: z.string().trim().min(1),
-    // Opaque on the wire. The owning CLI applies the same normalization used
-    // for ordinary dispatch before it creates the replacement history entry.
-    inputConfig: z.record(z.string(), z.unknown()),
+    expectedUserTurnId: SharedTrimmedNonEmptyStringSchema,
+    replacementUserTurnId: SharedTrimmedNonEmptyStringSchema,
+    requestedByUserId: SharedTrimmedNonEmptyStringSchema,
+    timestamp: SharedTrimmedNonEmptyStringSchema,
+    inputConfig: z.record(SharedStringSchema, z.unknown()),
   })
   .strict()
   .refine((spec) => spec.expectedUserTurnId !== spec.replacementUserTurnId, {
@@ -805,12 +840,12 @@ export const SessionEditAndResendResponseSchema = z
   .object({
     type: z.literal('session/edit-and-resend_response'),
     sessionId: SessionIdSchema,
-    replacementUserTurnId: z.string().trim().min(1),
+    replacementUserTurnId: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     error: z
       .object({
         code: SessionEditAndResendErrorCodeSchema,
-        message: z.string().trim().min(1),
+        message: SharedTrimmedNonEmptyStringSchema,
       })
       .strict()
       .optional(),
@@ -820,9 +855,9 @@ export const SessionEditAndResendResponseSchema = z
 export const SessionForkSpecSchema = z
   .object({
     sourceSessionId: SessionIdSchema,
-    sourceTurnId: z.string().trim().min(1),
+    sourceTurnId: SharedTrimmedNonEmptyStringSchema,
     targetSessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
+    requestedByUserId: SharedTrimmedNonEmptyStringSchema,
     targetContext: z
       .discriminatedUnion('kind', [
         z.object({ kind: z.literal('shared') }).strict(),
@@ -856,14 +891,14 @@ export const SessionForkResponseSchema = z
       z
         .object({
           code: SessionForkWarningCodeSchema,
-          message: z.string().trim().min(1),
+          message: SharedTrimmedNonEmptyStringSchema,
         })
         .strict()
     ),
     error: z
       .object({
         code: SessionForkErrorCodeSchema,
-        message: z.string().trim().min(1),
+        message: SharedTrimmedNonEmptyStringSchema,
       })
       .strict()
       .optional(),
@@ -872,10 +907,10 @@ export const SessionForkResponseSchema = z
 
 export const SessionForkOperationSchema = z
   .object({
-    id: z.string().trim().min(1),
+    id: SharedTrimmedNonEmptyStringSchema,
     sourceSessionId: SessionIdSchema,
-    sourceTurnId: z.string().trim().min(1),
-    requestedByUserId: z.string().trim().min(1),
+    sourceTurnId: SharedTrimmedNonEmptyStringSchema,
+    requestedByUserId: SharedTrimmedNonEmptyStringSchema,
     targetContext: z.enum(['shared', 'new-worktree']),
     capturedHeadSha: z
       .string()
@@ -889,12 +924,12 @@ export const SessionForkOperationSchema = z
     error: z
       .object({
         code: SessionForkErrorCodeSchema,
-        message: z.string().trim().min(1),
+        message: SharedTrimmedNonEmptyStringSchema,
       })
       .strict()
       .optional(),
-    createdAt: z.string().trim().min(1),
-    updatedAt: z.string().trim().min(1),
+    createdAt: SharedTrimmedNonEmptyStringSchema,
+    updatedAt: SharedTrimmedNonEmptyStringSchema,
   })
   .strict();
 
@@ -951,97 +986,21 @@ export const SessionDispatchTurnResponseSchema = z
   .object({
     type: z.literal('session/dispatch-turn_response'),
     sessionId: SessionIdSchema,
-    userTurnId: z.string().trim().min(1),
+    userTurnId: SharedTrimmedNonEmptyStringSchema,
     accepted: z.boolean(),
     disposition: z.enum(['accepted', 'duplicate', 'already-terminal', 'not-owned', 'error']),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
 export type SessionDispatchTurnResponse = z.infer<typeof SessionDispatchTurnResponseSchema>;
 
-const SessionPreparationIdSchema = z.string().trim().min(1).max(128);
-export const SessionPreparationRunConfigSchema = z
-  .object({
-    modeId: z.string().trim().min(1).optional(),
-    modelId: z.string().trim().min(1).optional(),
-    configOptionValues: AcpConfigOptionValuesSchema.transform((values) =>
-      Object.fromEntries(
-        Object.entries(values).filter(([configId]) => !isSensitiveAcpConfigOptionId(configId))
-      )
-    ).optional(),
-    memory: MemoryBindingSchema.optional(),
-    mcpServerIds: z
-      .array(z.string())
-      .transform((ids) => normalizeMcpServerIdSelection(ids) ?? [])
-      .optional(),
-  })
-  .strict();
-
-/**
- * Draft session preparation request from desktops that predate its removal.
- * Daemons decline it without doing any work; the schemas remain only so those
- * requests still parse. Draft text, launch secrets, and secret-shaped ACP
- * option values were never part of the request.
- */
-export const SessionPreparationSpecSchema = z
-  .object({
-    preparationId: SessionPreparationIdSchema,
-    sessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
-    agentConfigId: AgentConfigIdSchema,
-    cliType: AgentConfigCliTypeSchema,
-    agentType: z.string().trim().min(1),
-    project: ProjectRefSchema.optional(),
-    runConfig: SessionPreparationRunConfigSchema.optional(),
-  })
-  .strict();
-
-export type SessionPreparationSpec = z.infer<typeof SessionPreparationSpecSchema>;
-
-export const SessionPreparationCancelSpecSchema = z
-  .object({
-    preparationId: SessionPreparationIdSchema,
-    sessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
-  })
-  .strict();
-
-export type SessionPreparationCancelSpec = z.infer<typeof SessionPreparationCancelSpecSchema>;
-
-export const SessionPrepareResponseSchema = z
-  .object({
-    type: z.literal('session/prepare_response'),
-    preparationId: SessionPreparationIdSchema,
-    sessionId: SessionIdSchema,
-    accepted: z.boolean(),
-    disposition: z.enum(['accepted', 'duplicate', 'replaced', 'busy', 'not-owned', 'error']),
-    error: z.string().optional(),
-  })
-  .strict();
-
-export type SessionPrepareResponse = z.infer<typeof SessionPrepareResponseSchema>;
-
-export const SessionPrepareCancelResponseSchema = z
-  .object({
-    type: z.literal('session/prepare-cancel_response'),
-    preparationId: SessionPreparationIdSchema,
-    sessionId: SessionIdSchema,
-    cancelled: z.boolean(),
-    disposition: z.enum(['cancelled', 'not-found', 'not-owned', 'error']),
-    error: z.string().optional(),
-  })
-  .strict();
-
-export type SessionPrepareCancelResponse = z.infer<typeof SessionPrepareCancelResponseSchema>;
-
-// Permission schemas (simplified - actual types come from @agentclientprotocol/sdk)
-const PermissionMetaSchema = z.record(z.string(), z.unknown()).nullable();
+const PermissionMetaSchema = z.record(SharedStringSchema, z.unknown()).nullable();
 
 export const PermissionOptionSchema = z.object({
-  optionId: z.string(),
-  name: z.string(),
-  description: z.string().optional(),
+  optionId: SharedStringSchema,
+  name: SharedStringSchema,
+  description: SharedOptionalStringSchema,
   kind: z.enum(['allow_once', 'allow_always', 'deny', 'reject_once', 'reject_always']).optional(),
   _meta: PermissionMetaSchema.optional(),
 });
@@ -1050,10 +1009,10 @@ export const RequestPermissionRequestSchema = z.object({
   sessionId: SessionIdSchema,
   toolCall: z
     .object({
-      toolCallId: z.string(),
-      title: z.string().optional(),
-      status: z.string().optional(),
-      kind: z.string().optional(),
+      toolCallId: SharedStringSchema,
+      title: SharedOptionalStringSchema,
+      status: SharedOptionalStringSchema,
+      kind: SharedOptionalStringSchema,
     })
     .loose(),
   options: z.array(PermissionOptionSchema),
@@ -1065,7 +1024,7 @@ export const PermissionOutcomeSchema = z.union([
   z
     .object({
       outcome: z.literal('selected'),
-      optionId: z.string(),
+      optionId: SharedStringSchema,
       _meta: PermissionMetaSchema.optional(),
     })
     .loose(),
@@ -1075,7 +1034,7 @@ export const PermissionRequestMessageSchema = z
   .object({
     type: z.literal('session/permission_request'),
     sessionId: SessionIdSchema,
-    requestId: z.string(),
+    requestId: SharedStringSchema,
     request: RequestPermissionRequestSchema.loose(),
   })
   .strict();
@@ -1083,13 +1042,9 @@ export const PermissionRequestMessageSchema = z
 export const PermissionResponseMessageSchema = z.object({
   type: z.literal('session/permission_response'),
   sessionId: SessionIdSchema,
-  requestId: z.string(),
+  requestId: SharedStringSchema,
   outcome: PermissionOutcomeSchema,
 });
-
-// ============================================
-// MACHINE STATUS AND CONTROL SCHEMAS
-// ============================================
 
 export const MachineResourceInfoSchema = z
   .object({
@@ -1106,6 +1061,18 @@ export const MachineStatusRequestSchema = z
     type: z.literal('machine/status'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
+    /** Only for daemons advertising `machineDiskStatus`. */
+    includeDisk: z.literal(true).optional(),
+    includeDaemonUpdate: z.literal(true).optional(),
+  })
+  .strict();
+
+/** Free space of the volume holding the Lody data directory. */
+export const MachineDiskInfoSchema = z
+  .object({
+    totalGB: z.number().nonnegative(),
+    freeGB: z.number().nonnegative(),
+    usedPercent: z.number().min(0).max(100),
   })
   .strict();
 
@@ -1137,8 +1104,10 @@ export const MachineStatusResponseSchema = z
     machineId: MachineIdSchema,
     success: z.boolean(),
     resources: MachineResourceInfoSchema.optional(),
+    disk: MachineDiskInfoSchema.optional(),
     lifecycle: MachineLifecycleCapabilitySchema.optional(),
-    error: z.string().optional(),
+    daemonUpdate: ManagedDaemonUpdateStatusSchema.nullable().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1148,7 +1117,7 @@ export const MachinePreviewControlResponseSchema = z
     machineId: MachineIdSchema,
     success: z.boolean(),
     runtimeNonce: z.string().uuid().optional(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1157,7 +1126,7 @@ export const MachinePingRequestSchema = z
     type: z.literal('machine/ping'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    requestId: z.string().trim().min(1),
+    requestId: SharedTrimmedNonEmptyStringSchema,
   })
   .strict();
 
@@ -1165,10 +1134,10 @@ export const MachinePingResponseSchema = z
   .object({
     type: z.literal('machine/ping_response'),
     machineId: MachineIdSchema,
-    requestId: z.string().trim().min(1),
+    requestId: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     message: z.literal('pong').optional(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1185,11 +1154,12 @@ export const MachineLifecycleDispositionSchema = z.enum([
 export const MachineRestartRequestSchema = z
   .object({
     type: z.literal('machine/restart'),
+    restoreMachineId: MachineIdSchema.optional(),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    requesterUserId: z.string().trim().min(1),
-    requestToken: z.string().trim().min(1),
-    requestId: z.string().trim().min(1),
+    requesterUserId: SharedTrimmedNonEmptyStringSchema,
+    requestToken: SharedTrimmedNonEmptyStringSchema,
+    requestId: SharedTrimmedNonEmptyStringSchema,
   })
   .strict();
 
@@ -1197,11 +1167,11 @@ export const MachineRestartResponseSchema = z
   .object({
     type: z.literal('machine/restart_response'),
     machineId: MachineIdSchema,
-    requestId: z.string().trim().min(1),
+    requestId: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     accepted: z.boolean(),
     disposition: MachineLifecycleDispositionSchema,
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1210,10 +1180,11 @@ export const MachineUpgradeRequestSchema = z
     type: z.literal('machine/upgrade'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    requesterUserId: z.string().trim().min(1),
-    requestToken: z.string().trim().min(1),
-    requestId: z.string().trim().min(1),
+    requesterUserId: SharedTrimmedNonEmptyStringSchema,
+    requestToken: SharedTrimmedNonEmptyStringSchema,
+    requestId: SharedTrimmedNonEmptyStringSchema,
     targetVersion: z.string().trim().min(1).optional(),
+    upgrade: ManagedDaemonUpgradeOptionsSchema.optional(),
   })
   .strict();
 
@@ -1221,81 +1192,50 @@ export const MachineUpgradeResponseSchema = z
   .object({
     type: z.literal('machine/upgrade_response'),
     machineId: MachineIdSchema,
-    requestId: z.string().trim().min(1),
+    requestId: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     accepted: z.boolean(),
     disposition: MachineLifecycleDispositionSchema,
-    currentVersion: z.string().optional(),
-    targetVersion: z.string().optional(),
-    error: z.string().optional(),
+    currentVersion: SharedOptionalStringSchema,
+    targetVersion: SharedOptionalStringSchema,
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
 const AcpModeSchema = z
   .object({
-    id: z.string(),
-    name: z.string(),
-    description: z.string().optional(),
+    id: SharedStringSchema,
+    name: SharedStringSchema,
+    description: SharedOptionalStringSchema,
   })
   .strict();
 
 const AcpModelSchema = z
   .object({
-    modelId: z.string(),
-    name: z.string().optional(),
-    description: z.string().optional(),
+    modelId: SharedStringSchema,
+    name: SharedOptionalStringSchema,
+    description: SharedOptionalStringSchema,
   })
   .strict();
 
 const AcpConfigOptionValueSummarySchema = z
   .object({
-    value: z.string(),
-    name: z.string(),
-    description: z.string().optional(),
-    group: z.string().optional(),
+    value: SharedStringSchema,
+    name: SharedStringSchema,
+    description: SharedOptionalStringSchema,
+    group: SharedOptionalStringSchema,
   })
   .strict();
 
 const AcpConfigOptionSummarySchema = z
   .object({
-    id: z.string(),
-    name: z.string(),
-    description: z.string().optional(),
-    category: z.string().optional(),
+    id: SharedStringSchema,
+    name: SharedStringSchema,
+    description: SharedOptionalStringSchema,
+    category: SharedOptionalStringSchema,
     type: z.enum(['select', 'boolean']),
     currentValue: AcpConfigOptionValueSchema,
     options: z.array(AcpConfigOptionValueSummarySchema),
-  })
-  .strict();
-
-const AcpCapabilityCacheEntrySchema = z
-  .object({
-    cliType: AgentConfigCliTypeSchema,
-    agentType: z.string().trim().min(1),
-    cacheVersion: z.number().optional(),
-    provenance: z.literal('runtime').optional(),
-    sourceVersion: z.string().optional(),
-    modes: z.array(AcpModeSchema),
-    models: z.array(AcpModelSchema),
-    configOptions: z.array(AcpConfigOptionSummarySchema).optional(),
-    modelReasoningEfforts: z.record(z.string(), z.array(z.string())).optional(),
-    availableCommands: z
-      .array(
-        z
-          .object({
-            name: z.string(),
-            description: z.string().optional(),
-          })
-          .strict()
-      )
-      .optional(),
-    sessionFork: z.boolean().optional(),
-    acknowledgedSteer: z.boolean().optional(),
-    sessionTitle: z.boolean().optional(),
-    rateLimits: z.object({ version: z.literal(1), query: z.literal(true).optional() }).optional(),
-    goalActions: z.array(z.enum(SESSION_GOAL_ACTIONS)).optional(),
-    sessionForkWorktree: z.boolean().optional(),
-    fetchedAt: z.number(),
   })
   .strict();
 
@@ -1306,6 +1246,38 @@ const MachineAcpAuthMethodSummarySchema = z
     name: z.string().max(ACP_AUTH_LABEL_MAX_LENGTH).optional(),
     description: z.string().max(ACP_AUTH_TEXT_MAX_LENGTH).optional(),
     args: z.array(z.string().max(ACP_AUTH_LABEL_MAX_LENGTH)).max(64).optional(),
+  })
+  .strict();
+
+const AcpCapabilityCacheEntrySchema = z
+  .object({
+    cliType: AgentConfigCliTypeSchema,
+    agentType: SharedTrimmedNonEmptyStringSchema,
+    cacheVersion: z.number().optional(),
+    provenance: z.literal('runtime').optional(),
+    sourceVersion: SharedOptionalStringSchema,
+    modes: z.array(AcpModeSchema),
+    models: z.array(AcpModelSchema),
+    configOptions: z.array(AcpConfigOptionSummarySchema).optional(),
+    modelReasoningEfforts: z.record(SharedStringSchema, z.array(SharedStringSchema)).optional(),
+    availableCommands: z
+      .array(
+        z
+          .object({
+            name: SharedStringSchema,
+            description: SharedOptionalStringSchema,
+          })
+          .strict()
+      )
+      .optional(),
+    authMethods: z.array(MachineAcpAuthMethodSummarySchema).optional(),
+    sessionFork: z.boolean().optional(),
+    acknowledgedSteer: z.boolean().optional(),
+    sessionTitle: z.boolean().optional(),
+    rateLimits: z.object({ version: z.literal(1), query: z.literal(true).optional() }).optional(),
+    goalActions: z.array(z.enum(SESSION_GOAL_ACTIONS)).optional(),
+    sessionForkWorktree: z.boolean().optional(),
+    fetchedAt: z.number(),
   })
   .strict();
 
@@ -1425,6 +1397,7 @@ export const MachineAcpCapabilitiesRefreshRequestSchema = z
     workspaceId: WorkspaceIdSchema,
     configId: AgentConfigIdSchema,
     force: z.boolean().optional(),
+    readModelOptions: z.literal(true).optional(),
   })
   .strict();
 
@@ -1434,16 +1407,16 @@ export const MachineAcpCapabilitiesRefreshResponseSchema = z
     machineId: MachineIdSchema,
     configId: AgentConfigIdSchema,
     cliType: AgentConfigCliTypeSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     modes: z.array(AcpModeSchema).optional(),
     models: z.array(AcpModelSchema).optional(),
     configOptions: z
       .array(
         z.object({
-          id: z.string(),
-          name: z.string(),
-          category: z.string().optional(),
+          id: SharedStringSchema,
+          name: SharedStringSchema,
+          category: SharedOptionalStringSchema,
           optionCount: z.number(),
         })
       )
@@ -1452,17 +1425,14 @@ export const MachineAcpCapabilitiesRefreshResponseSchema = z
     availableCommands: z
       .array(
         z.object({
-          name: z.string(),
-          description: z.string().optional(),
+          name: SharedStringSchema,
+          description: SharedOptionalStringSchema,
         })
       )
       .optional(),
     authRequired: z.boolean().optional(),
-    authMethods: z
-      .array(MachineAcpAuthMethodSummarySchema)
-      .max(ACP_AUTH_METHOD_MAX_COUNT)
-      .optional(),
-    error: z.string().optional(),
+    authMethods: z.array(MachineAcpAuthMethodSummarySchema).optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1477,6 +1447,8 @@ export const MachineAcpAuthenticateRequestSchema = z.discriminatedUnion('action'
   MachineAcpAuthenticateRequestBaseSchema.extend({
     action: z.literal('start'),
     configId: AgentConfigIdSchema,
+    /** Sign-in method picked from the agent's advertised list. */
+    methodId: z.string().trim().min(1).max(ACP_AUTH_ID_MAX_LENGTH).optional(),
   }).strict(),
   MachineAcpAuthenticateRequestBaseSchema.extend({
     action: z.literal('cancel'),
@@ -1499,8 +1471,8 @@ export const MachineAcpAuthenticateResponseSchema = z
   .object({
     type: z.literal('machine/acp-authenticate_response'),
     machineId: MachineIdSchema,
-    requestId: z.string().trim().min(1),
-    agentType: z.string().trim().min(1),
+    requestId: SharedTrimmedNonEmptyStringSchema,
+    agentType: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     disposition: z.enum([
       'authenticated',
@@ -1512,11 +1484,8 @@ export const MachineAcpAuthenticateResponseSchema = z
     ]),
     capabilitiesRefreshed: z.boolean().optional(),
     authRequired: z.boolean().optional(),
-    authMethods: z
-      .array(MachineAcpAuthMethodSummarySchema)
-      .max(ACP_AUTH_METHOD_MAX_COUNT)
-      .optional(),
-    error: z.string().optional(),
+    authMethods: z.array(MachineAcpAuthMethodSummarySchema).optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1524,8 +1493,8 @@ export const MachineAcpAuthenticationProgressMessageSchema = z
   .object({
     type: z.literal('machine/acp-authentication-progress'),
     machineId: MachineIdSchema,
-    requestId: z.string().trim().min(1),
-    agentType: z.string().trim().min(1),
+    requestId: SharedTrimmedNonEmptyStringSchema,
+    agentType: SharedTrimmedNonEmptyStringSchema,
     status: z.enum([
       'starting',
       'auth-methods',
@@ -1537,10 +1506,7 @@ export const MachineAcpAuthenticationProgressMessageSchema = z
       'cancelled',
       'error',
     ]),
-    authMethods: z
-      .array(MachineAcpAuthMethodSummarySchema)
-      .max(ACP_AUTH_METHOD_MAX_COUNT)
-      .optional(),
+    authMethods: z.array(MachineAcpAuthMethodSummarySchema).optional(),
     interactionId: z.string().trim().min(1).max(ACP_AUTH_ID_MAX_LENGTH).optional(),
     message: z.string().max(ACP_AUTH_TEXT_MAX_LENGTH).optional(),
     form: MachineAcpAuthenticationFormSchema.optional(),
@@ -1622,7 +1588,7 @@ export const MachineAcpBinaryStatusRequestSchema = z
     type: z.literal('machine/acp-binary-status'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
   })
   .strict();
 
@@ -1630,7 +1596,7 @@ export const MachineAcpBinaryStatusResponseSchema = z
   .object({
     type: z.literal('machine/acp-binary-status_response'),
     machineId: MachineIdSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
     status: z.enum([
       'installed',
@@ -1640,13 +1606,13 @@ export const MachineAcpBinaryStatusResponseSchema = z
       'incompatible-host',
       'error',
     ]),
-    command: z.string().optional(),
-    platformArch: z.string().optional(),
-    installPath: z.string().optional(),
-    version: z.string().optional(),
-    current: z.string().optional(),
-    required: z.string().optional(),
-    error: z.string().optional(),
+    command: SharedOptionalStringSchema,
+    platformArch: SharedOptionalStringSchema,
+    installPath: SharedOptionalStringSchema,
+    version: SharedOptionalStringSchema,
+    current: SharedOptionalStringSchema,
+    required: SharedOptionalStringSchema,
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1655,7 +1621,7 @@ export const MachineAcpBinaryInstallRequestSchema = z
     type: z.literal('machine/acp-binary-install'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
   })
   .strict();
 
@@ -1663,12 +1629,12 @@ export const MachineAcpBinaryInstallResponseSchema = z
   .object({
     type: z.literal('machine/acp-binary-install_response'),
     machineId: MachineIdSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
     success: z.boolean(),
-    command: z.string().optional(),
-    installPath: z.string().optional(),
-    version: z.string().optional(),
-    error: z.string().optional(),
+    command: SharedOptionalStringSchema,
+    installPath: SharedOptionalStringSchema,
+    version: SharedOptionalStringSchema,
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1676,7 +1642,7 @@ export const MachineAcpBinaryProgressMessageSchema = z
   .object({
     type: z.literal('machine/acp-binary-progress'),
     machineId: MachineIdSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
     status: z.enum([
       'checking',
       'not-installed',
@@ -1688,16 +1654,22 @@ export const MachineAcpBinaryProgressMessageSchema = z
       'unsupported-platform',
       'incompatible-host',
       'error',
+      'reading-model-options',
     ]),
     downloadedBytes: z.number().int().nonnegative().optional(),
     totalBytes: z.number().int().nonnegative().optional(),
     percent: z.number().min(0).max(100).optional(),
-    platformArch: z.string().optional(),
-    version: z.string().optional(),
-    current: z.string().optional(),
-    required: z.string().optional(),
-    command: z.string().optional(),
-    error: z.string().optional(),
+    platformArch: SharedOptionalStringSchema,
+    version: SharedOptionalStringSchema,
+    current: SharedOptionalStringSchema,
+    required: SharedOptionalStringSchema,
+    command: SharedOptionalStringSchema,
+    error: SharedOptionalStringSchema,
+    configId: AgentConfigIdSchema.optional(),
+    modelId: SharedOptionalStringSchema,
+    modelName: SharedOptionalStringSchema,
+    modelIndex: z.number().int().positive().optional(),
+    modelCount: z.number().int().positive().optional(),
   })
   .strict();
 
@@ -1706,9 +1678,9 @@ export const MachineBugReportRequestSchema = z
     type: z.literal('machine/bug-report'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    description: z.string().trim().min(1),
-    reporterUserId: z.string().trim().min(1),
-    requestToken: z.string().trim().min(1),
+    description: SharedTrimmedNonEmptyStringSchema,
+    reporterUserId: SharedTrimmedNonEmptyStringSchema,
+    requestToken: SharedTrimmedNonEmptyStringSchema,
     clientLog: BugReportClientLogSchema.optional(),
   })
   .strict();
@@ -1718,44 +1690,8 @@ export const MachineBugReportResponseSchema = z
     type: z.literal('machine/bug-report_response'),
     machineId: MachineIdSchema,
     success: z.boolean(),
-    bugReportId: z.string().optional(),
-    error: z.string().optional(),
-  })
-  .strict();
-
-const SessionCodeCollabHostStartStatusSchema = z.enum([
-  'started',
-  'already-running',
-  'disabled',
-  'failed',
-  'stopped',
-]);
-
-/**
- * @deprecated Legacy compatibility only. Code Collab v2 uses machine RPC methods
- * under `code-collab/*`; current CLIs reject this request as unsupported.
- */
-export const SessionCodeCollabHostStartRequestSchema = z
-  .object({
-    type: z.literal('session/code-collab-host-start'),
-    machineId: MachineIdSchema,
-    workspaceId: WorkspaceIdSchema,
-    sessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
-  })
-  .strict();
-
-/**
- * @deprecated Legacy compatibility response for `session/code-collab-host-start`.
- */
-export const SessionCodeCollabHostStartResponseSchema = z
-  .object({
-    type: z.literal('session/code-collab-host-start_response'),
-    sessionId: SessionIdSchema,
-    success: z.boolean(),
-    status: SessionCodeCollabHostStartStatusSchema.optional(),
-    error: z.string().optional(),
-    message: z.string().optional(),
+    bugReportId: SharedOptionalStringSchema,
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1765,7 +1701,7 @@ export const SessionImageUploadRequestSchema = z
     machineId: MachineIdSchema,
     sessionId: SessionIdSchema,
     workspaceId: WorkspaceIdSchema.optional(),
-    paths: z.array(z.string().trim().min(1)).min(1).max(SESSION_IMAGE_MAX_COUNT),
+    paths: z.array(SharedTrimmedNonEmptyStringSchema).min(1).max(SESSION_IMAGE_MAX_COUNT),
   })
   .strict();
 
@@ -1775,9 +1711,9 @@ export const SessionImageUploadResponseSchema = z
     sessionId: SessionIdSchema,
     workspaceId: WorkspaceIdSchema.optional(),
     success: z.boolean(),
-    error: z.string().optional(),
-    message: z.string().optional(),
-    historyEntryId: z.string().optional(),
+    error: SharedOptionalStringSchema,
+    message: SharedOptionalStringSchema,
+    historyEntryId: SharedOptionalStringSchema,
     attachedTo: z.enum(['active_turn', 'new_entry']).optional(),
     content: SessionImageGroupContentSchema.optional(),
     images: z
@@ -1798,7 +1734,7 @@ export const SessionFileUploadRequestSchema = z
     machineId: MachineIdSchema,
     sessionId: SessionIdSchema,
     workspaceId: WorkspaceIdSchema.optional(),
-    paths: z.array(z.string().trim().min(1)).min(1).max(SESSION_FILE_MAX_COUNT),
+    paths: z.array(SharedTrimmedNonEmptyStringSchema).min(1).max(SESSION_FILE_MAX_COUNT),
   })
   .strict();
 
@@ -1808,14 +1744,12 @@ export const SessionFileUploadResponseSchema = z
     sessionId: SessionIdSchema,
     workspaceId: WorkspaceIdSchema.optional(),
     success: z.boolean(),
-    error: z.string().optional(),
-    message: z.string().optional(),
-    historyEntryId: z.string().optional(),
+    error: SharedOptionalStringSchema,
+    message: SharedOptionalStringSchema,
+    historyEntryId: SharedOptionalStringSchema,
     attachedTo: z.enum(['active_turn', 'new_entry']).optional(),
     files: z
       .array(
-        // Cloud uploads are always relay-stored; only the send-local response
-        // may carry transport 'local'.
         SessionFileBlockObjectSchema.extend({
           downloadUrl: z.string().url(),
           transport: z.literal('r2'),
@@ -1827,13 +1761,78 @@ export const SessionFileUploadResponseSchema = z
   })
   .strict();
 
+export const SessionImagePrepareLocalRequestSchema = z
+  .object({
+    type: z.literal('session/image-prepare-local'),
+    machineId: MachineIdSchema,
+    workspaceId: WorkspaceIdSchema,
+    sessionId: SessionIdSchema,
+    imageId: z.string().uuid(),
+    source: z.union([
+      z.object({ path: SharedTrimmedNonEmptyStringSchema }).strict(),
+      z.object({ base64: z.string().min(1).max(27962028) }).strict(),
+    ]),
+    fileName: SharedTrimmedNonEmptyStringSchema,
+    mimeType: z.enum(SESSION_IMAGE_ALLOWED_MIME_TYPES),
+  })
+  .strict();
+export const SessionImagePrepareLocalResponseSchema = z
+  .object({
+    type: z.literal('session/image-prepare-local_response'),
+    sessionId: SessionIdSchema,
+    success: z.boolean(),
+    error: SharedOptionalStringSchema,
+    image: SessionImagePayloadSchema.optional(),
+  })
+  .strict();
+export const SessionImageResolveLocalRequestSchema = z
+  .object({
+    type: z.literal('session/image-resolve-local'),
+    machineId: MachineIdSchema,
+    workspaceId: WorkspaceIdSchema,
+    sessionId: SessionIdSchema,
+    image: SessionImagePayloadSchema,
+  })
+  .strict();
+export const SessionImageResolveLocalResponseSchema = z
+  .object({
+    type: z.literal('session/image-resolve-local_response'),
+    sessionId: SessionIdSchema,
+    success: z.boolean(),
+    error: SharedOptionalStringSchema,
+    path: SharedOptionalStringSchema,
+  })
+  .strict();
+
+export const SessionAttachmentPrepareRequestSchema = z
+  .object({
+    type: z.literal('session/attachment-prepare'),
+    machineId: MachineIdSchema,
+    workspaceId: WorkspaceIdSchema,
+    sessionId: SessionIdSchema,
+    path: SharedTrimmedNonEmptyStringSchema,
+    kind: z.enum(['file', 'image']),
+    fileName: SharedTrimmedNonEmptyStringSchema,
+    mimeType: SharedTrimmedNonEmptyStringSchema,
+  })
+  .strict();
+export const SessionAttachmentPrepareResponseSchema = z
+  .object({
+    type: z.literal('session/attachment-prepare_response'),
+    sessionId: SessionIdSchema,
+    success: z.boolean(),
+    error: z.string().optional(),
+    attachment: SessionLocalAttachmentSchema.optional(),
+  })
+  .strict();
+
 export const SessionFileSendLocalRequestSchema = z
   .object({
     type: z.literal('session/file-send-local'),
     machineId: MachineIdSchema,
     sessionId: SessionIdSchema,
     workspaceId: WorkspaceIdSchema.optional(),
-    paths: z.array(z.string().trim().min(1)).min(1).max(SESSION_FILE_MAX_COUNT),
+    paths: z.array(SharedTrimmedNonEmptyStringSchema).min(1).max(SESSION_FILE_MAX_COUNT),
   })
   .strict();
 
@@ -1843,11 +1842,8 @@ export const SessionFileSendLocalResponseSchema = z
     sessionId: SessionIdSchema,
     workspaceId: WorkspaceIdSchema.optional(),
     success: z.boolean(),
-    error: z.string().optional(),
-    message: z.string().optional(),
-    // Local-transport blocks carry no downloadUrl (bytes not yet in the relay
-    // store). `SessionFileBlockSchema` enforces the transport='local' ⇒
-    // machineId invariant via its superRefine.
+    error: SharedOptionalStringSchema,
+    message: SharedOptionalStringSchema,
     files: z.array(SessionFileBlockSchema).min(1).max(SESSION_FILE_MAX_COUNT).optional(),
   })
   .strict();
@@ -1901,14 +1897,14 @@ const PreviewValidationResultSchema = z
     stage: PreviewValidationStageSchema,
     ok: z.boolean(),
     errorCode: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
 const PreviewCandidateSchema = z
   .object({
     status: z.enum(['none', 'reported', 'validating', 'available', 'invalid']),
-    candidateId: z.string().optional(),
+    candidateId: SharedOptionalStringSchema,
     target: PreviewTargetSchema.optional(),
     source: PreviewCandidateSourceSchema.optional(),
     reportedAt: z.number().int().nonnegative().optional(),
@@ -1921,7 +1917,7 @@ const PreviewConnectionErrorSchema = z
   .object({
     stage: PreviewValidationStageSchema,
     errorCode: PreviewErrorCodeSchema,
-    message: z.string(),
+    message: SharedStringSchema,
     retryable: z.boolean(),
   })
   .strict();
@@ -1929,10 +1925,10 @@ const PreviewConnectionErrorSchema = z
 export const PreviewConnectionSchema = z
   .object({
     status: z.enum(['creating', 'active', 'closed', 'failed']),
-    endpointId: z.string().optional(),
+    endpointId: SharedOptionalStringSchema,
     publicUrl: z.string().url().optional(),
     target: PreviewTargetSchema.optional(),
-    approvedByUserId: z.string().optional(),
+    approvedByUserId: SharedOptionalStringSchema,
     createdAt: z.number().int().nonnegative().optional(),
     updatedAt: z.number().int().nonnegative().optional(),
     idleTimeoutMs: z.number().int().positive().optional(),
@@ -1945,7 +1941,7 @@ export const PreviewConnectionSchema = z
 
 const PreviewEndpointSchema = z
   .object({
-    endpointId: z.string().trim().min(1),
+    endpointId: SharedTrimmedNonEmptyStringSchema,
     kind: z.enum(['local-proxy', 'quick-tunnel']),
     viewerUrl: z.string().url(),
     shareUrl: z.string().url().optional(),
@@ -1979,7 +1975,7 @@ export const PreviewCandidateReportResponseSchema = z
     success: z.boolean(),
     candidate: PreviewCandidateSchema.optional(),
     error: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -1989,14 +1985,14 @@ export const SessionPreviewCreateRequestSchema = z
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     sessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
+    requestedByUserId: SharedTrimmedNonEmptyStringSchema,
     target: PreviewTargetSchema,
     approval: z
       .object({
         source: z.enum(['browser_address', 'share_action']),
         targetClass: z.literal('loopback'),
         target: PreviewTargetSchema,
-        confirmedByUserId: z.string().trim().min(1),
+        confirmedByUserId: SharedTrimmedNonEmptyStringSchema,
         confirmedAt: z.number().int().nonnegative(),
       })
       .strict(),
@@ -2011,7 +2007,7 @@ export const SessionPreviewCreateResponseSchema = z
     success: z.boolean(),
     connection: PreviewConnectionSchema.optional(),
     error: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -2021,7 +2017,7 @@ export const SessionPreviewStatusRequestSchema = z
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     sessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
+    requestedByUserId: SharedTrimmedNonEmptyStringSchema,
     renewEndpointId: z.string().trim().min(1).optional(),
   })
   .strict();
@@ -2034,7 +2030,7 @@ export const SessionPreviewStatusResponseSchema = z
     connection: PreviewConnectionSchema.optional(),
     expiresAt: z.number().int().nonnegative().optional(),
     error: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -2044,8 +2040,9 @@ export const SessionPreviewRevokeRequestSchema = z
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     sessionId: SessionIdSchema,
-    requestedByUserId: z.string().trim().min(1),
+    requestedByUserId: SharedTrimmedNonEmptyStringSchema,
     reason: z.string().trim().min(1).optional(),
+    stopProcess: z.boolean().optional(),
   })
   .strict();
 
@@ -2056,7 +2053,7 @@ export const SessionPreviewRevokeResponseSchema = z
     success: z.boolean(),
     connection: PreviewConnectionSchema.optional(),
     error: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -2067,7 +2064,7 @@ export const SessionPreviewEndpointAcquireResponseSchema = z
     success: z.boolean(),
     endpoint: PreviewEndpointSchema.optional(),
     error: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -2078,30 +2075,62 @@ export const SessionPreviewEndpointReleaseResponseSchema = z
     endpointId: z.string().trim().min(1).optional(),
     success: z.boolean(),
     error: PreviewErrorCodeSchema.optional(),
-    message: z.string().optional(),
+    message: SharedOptionalStringSchema,
   })
   .strict();
 
 export const SESSION_HISTORY_READ_MAX_RANGE = 500;
 export const SESSION_HISTORY_READ_MAX_PAGE = 500;
+export const SESSION_HISTORY_SUBSCRIPTION_LEASE_MS = 45_000;
+export const SESSION_HISTORY_SUBSCRIPTION_TIMEOUT_MS = 55_000;
+export const SESSION_HISTORY_SUBSCRIPTION_MAX_DELTA_BYTES = 16 * 1024;
+export const SESSION_HISTORY_SUBSCRIPTION_MAX_PUBLICATIONS = 64;
 
 export const SessionHistoryReadQuerySchema = z
   .discriminatedUnion('kind', [
+    z.object({ kind: z.literal('readMetadata') }).strict(),
+    z.object({ kind: z.literal('readLatestGoal') }).strict(),
     z
       .object({
-        kind: z.literal('watchChanges'),
-        checkpoint: z.string().min(1).max(1024),
-        includeBodiesFrom: z.number().int().nonnegative().optional(),
-        withPatches: z.literal(true).optional(),
-        waitMs: z.number().int().nonnegative().max(15_000),
+        kind: z.literal('readTranscript'),
+        limit: z.number().int().nonnegative().optional(),
+        reverse: z.boolean().optional(),
       })
       .strict(),
-    z.object({ kind: z.literal('count') }).strict(),
+    z
+      .object({
+        kind: z.literal('readQuerySnapshot'),
+        from: z.number().int().nonnegative().optional(),
+        to: z.number().int().nonnegative().optional(),
+        transcriptVisibility: z.boolean().optional(),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal('readSelection'),
+        positions: z.array(z.number().int().nonnegative()),
+        token: z.string().regex(/^[a-f0-9]{64}$/),
+        transcriptVisibility: z.boolean().optional(),
+      })
+      .strict(),
+    z
+      .object({ kind: z.literal('readReplayPrompt'), excludeTurnId: z.string().optional() })
+      .strict(),
+    z
+      .object({
+        kind: z.literal('readQuery'),
+        from: z.number().int().nonnegative(),
+        to: z.number().int().nonnegative(),
+        transcriptVisibility: z.boolean().optional(),
+        atCheckpoint: z.string().min(1).max(1024).optional(),
+      })
+      .strict(),
+    z.object({ kind: z.literal('count'), withCheckpoint: z.literal(true).optional() }).strict(),
     z.object({ kind: z.literal('readAt'), position: z.number().int().nonnegative() }).strict(),
     z
       .object({
         kind: z.literal('readTurn'),
-        turnId: z.string().trim().min(1),
+        turnId: SharedTrimmedNonEmptyStringSchema,
         atCheckpoint: z.string().min(1).max(1024).optional(),
       })
       .strict(),
@@ -2117,6 +2146,7 @@ export const SessionHistoryReadQuerySchema = z
     z
       .object({
         kind: z.literal('readDirectory'),
+        atCheckpoint: z.string().min(1).max(1024).optional(),
         from: z.number().int().nonnegative(),
         to: z.number().int().nonnegative(),
       })
@@ -2145,10 +2175,18 @@ export const SessionHistoryReadQuerySchema = z
       })
       .strict(),
     z.object({ kind: z.literal('readAll') }).strict(),
-    z.object({ kind: z.literal('readTurnOutput'), userTurnId: z.string().trim().min(1) }).strict(),
+    z
+      .object({ kind: z.literal('readTurnOutput'), userTurnId: SharedTrimmedNonEmptyStringSchema })
+      .strict(),
   ])
   .superRefine((value, ctx) => {
-    if (value.kind !== 'readRange' && value.kind !== 'readDirectory') return;
+    if (value.kind === 'readQuerySnapshot') {
+      if (value.from !== undefined && value.to !== undefined && value.to < value.from)
+        ctx.addIssue({ code: 'custom', path: ['to'], message: 'Invalid history query range' });
+      return;
+    }
+    if (value.kind !== 'readRange' && value.kind !== 'readDirectory' && value.kind !== 'readQuery')
+      return;
     if (value.to < value.from) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -2191,7 +2229,7 @@ export const SessionHistoryChangeSchema = z
     z
       .object({
         kind: z.literal('changed'),
-        ids: z.array(z.string().trim().min(1)),
+        ids: z.array(SharedTrimmedNonEmptyStringSchema),
       })
       .strict(),
   ])
@@ -2211,7 +2249,7 @@ export const SessionHistoryChangesSchema = z.discriminatedUnion('state', [
       state: z.literal('ready'),
       checkpoint: z.string().min(1).max(1024),
       from: z.number().int().nonnegative().optional(),
-      ids: z.array(z.string().trim().min(1)),
+      ids: z.array(SharedTrimmedNonEmptyStringSchema),
       patches: z
         .object({
           baseCheckpoint: z.string().min(1).max(1024),
@@ -2219,7 +2257,7 @@ export const SessionHistoryChangesSchema = z.discriminatedUnion('state', [
             .array(
               z
                 .object({
-                  turnId: z.string().trim().min(1),
+                  turnId: SharedTrimmedNonEmptyStringSchema,
                   operations: z.array(SessionHistoryContentPatchSchema).min(1).max(256),
                 })
                 .strict()
@@ -2256,7 +2294,7 @@ export const SessionHistoryReadResponseSchema = z
     historyCount: z.number().int().nonnegative().optional(),
     historyChange: SessionHistoryChangeSchema.nullable().optional(),
     pageTurns: z.array(z.unknown()).optional(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -2278,6 +2316,64 @@ export const SessionHistoryReadResponseSchema = z
       });
     }
   });
+
+export const SessionHistorySubscriptionSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('open'),
+      id: z.uuid(),
+      checkpoint: z.string().min(1).max(1024).optional(),
+      includeBodiesFrom: z.number().int().nonnegative().optional(),
+      withPatches: z.literal(true).optional(),
+    })
+    .strict(),
+  z.object({ action: z.literal('close'), id: z.uuid() }).strict(),
+]);
+
+export const SessionHistorySubscriptionRequestSchema = z
+  .object({
+    type: z.literal('session/history-subscription'),
+    machineId: MachineIdSchema,
+    workspaceId: WorkspaceIdSchema,
+    sessionId: SessionIdSchema,
+    subscription: SessionHistorySubscriptionSchema,
+  })
+  .strict();
+
+const historySubscriptionResponse = z.object({
+  type: z.literal('session/history-subscription_response'),
+  sessionId: SessionIdSchema,
+  subscriptionId: z.uuid(),
+});
+
+export const SessionHistorySubscriptionResponseSchema = z.discriminatedUnion('event', [
+  historySubscriptionResponse
+    .extend({
+      event: z.literal('publication'),
+      publication: z
+        .object({
+          checkpoint: z.string().min(1).max(1024),
+          revision: z.number().int().nonnegative(),
+          delta: z
+            .object({
+              baseCheckpoint: z.string().min(1).max(1024),
+              includeBodiesFrom: z.number().int().nonnegative(),
+              withPatches: z.literal(true).optional(),
+              response: SessionHistoryReadResponseSchema,
+            })
+            .strict()
+            .optional(),
+        })
+        .strict(),
+    })
+    .strict(),
+  historySubscriptionResponse
+    .extend({
+      event: z.literal('closed'),
+      error: SharedOptionalStringSchema,
+    })
+    .strict(),
+]);
 
 export const SessionHistoryWriteOperationSchema = z.enum([
   'append',
@@ -2312,7 +2408,7 @@ export const SessionHistoryWriteResponseSchema = z
     historyRevision: z.number().int().nonnegative().optional(),
     historyCount: z.number().int().nonnegative().optional(),
     historyChange: z.union([SessionHistoryChangeSchema, z.null()]).optional(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -2345,11 +2441,14 @@ export const LocalSessionControlRequestSchema = z.discriminatedUnion('type', [
   MachineAcpAuthenticateRequestSchema,
   MachineAcpBinaryStatusRequestSchema,
   MachineAcpBinaryInstallRequestSchema,
-  SessionCodeCollabHostStartRequestSchema,
   SessionImageUploadRequestSchema,
   SessionFileUploadRequestSchema,
   SessionFileSendLocalRequestSchema,
+  SessionImagePrepareLocalRequestSchema,
+  SessionImageResolveLocalRequestSchema,
+  SessionAttachmentPrepareRequestSchema,
   SessionHistoryReadRequestSchema,
+  SessionHistorySubscriptionRequestSchema,
   SessionHistoryWriteRequestSchema,
   PreviewCandidateReportRequestSchema,
   SessionPreviewCreateRequestSchema,
@@ -2361,7 +2460,7 @@ export const LocalSessionControlResponseSchema = z.discriminatedUnion('type', [
   z
     .object({
       type: z.literal('machine/dsh-providers_response'),
-      providers: z.array(z.object({ id: z.string().min(1), name: z.string() }).strict()),
+      providers: z.array(z.object({ id: z.string().min(1), name: SharedStringSchema }).strict()),
     })
     .strict(),
   SessionCreateAckSchema,
@@ -2382,11 +2481,14 @@ export const LocalSessionControlResponseSchema = z.discriminatedUnion('type', [
   MachineAcpBinaryStatusResponseSchema,
   MachineAcpBinaryInstallResponseSchema,
   MachineAcpBinaryProgressMessageSchema,
-  SessionCodeCollabHostStartResponseSchema,
   SessionImageUploadResponseSchema,
   SessionFileUploadResponseSchema,
   SessionFileSendLocalResponseSchema,
+  SessionImagePrepareLocalResponseSchema,
+  SessionImageResolveLocalResponseSchema,
+  SessionAttachmentPrepareResponseSchema,
   SessionHistoryReadResponseSchema,
+  SessionHistorySubscriptionResponseSchema,
   SessionHistoryWriteResponseSchema,
   PreviewCandidateReportResponseSchema,
   SessionPreviewCreateResponseSchema,
@@ -2398,7 +2500,7 @@ export const LocalProjectAddRequestSchema = z
   .object({
     type: z.literal('local-project/add'),
     machineId: MachineIdSchema,
-    rootPath: z.string().trim().min(1),
+    rootPath: SharedTrimmedNonEmptyStringSchema,
     workspace: z.string().trim().min(1).optional(),
     allWorkspaces: z.boolean().optional(),
   })
@@ -2409,7 +2511,7 @@ export const LocalProjectPrepareAddRequestSchema = z
     type: z.literal('local-project/prepare-add'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
-    rootPath: z.string().trim().min(1),
+    rootPath: SharedTrimmedNonEmptyStringSchema,
     inspect: z.boolean().optional(),
   })
   .strict();
@@ -2479,6 +2581,19 @@ export const LocalProjectGitStateRequestSchema = z
   })
   .strict();
 
+export const LocalProjectListBranchesRequestSchema = z
+  .object({
+    type: z.literal('local-project/list-branches'),
+    machineId: MachineIdSchema,
+    workspaceId: WorkspaceIdSchema,
+    localProjectId: LocalProjectIdSchema,
+    query: z.string().max(256).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+    cursor: z.string().trim().min(1).max(512).optional(),
+    requestedByUserId: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
 export const LocalProjectListFilesRequestSchema = z
   .object({
     type: z.literal('local-project/list-files'),
@@ -2490,13 +2605,25 @@ export const LocalProjectListFilesRequestSchema = z
   })
   .strict();
 
+export const LocalProjectSearchFilesRequestSchema = z
+  .object({
+    type: z.literal('local-project/search-files'),
+    machineId: MachineIdSchema,
+    workspaceId: WorkspaceIdSchema,
+    localProjectId: LocalProjectIdSchema,
+    query: SharedStringSchema,
+    limit: z.number().int().positive().optional(),
+    requestedByUserId: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
 export const LocalProjectListDirRequestSchema = z
   .object({
     type: z.literal('local-project/list-dir'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     localProjectId: LocalProjectIdSchema,
-    relativePath: z.string(),
+    relativePath: SharedStringSchema,
     limit: z.number().int().positive().optional(),
     requestedByUserId: z.string().trim().min(1).optional(),
   })
@@ -2508,7 +2635,8 @@ export const LocalProjectListSkillsRequestSchema = z
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     localProjectId: LocalProjectIdSchema,
-    skillDirs: z.array(z.string().trim().min(1)),
+    skillDirs: z.array(SharedTrimmedNonEmptyStringSchema),
+    knownFingerprint: SharedOptionalStringSchema,
     requestedByUserId: z.string().trim().min(1).optional(),
   })
   .strict();
@@ -2518,6 +2646,7 @@ export const LocalProjectListGlobalSkillsRequestSchema = z
     type: z.literal('local-project/list-global-skills'),
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
+    knownFingerprint: SharedOptionalStringSchema,
     requestedByUserId: z.string().trim().min(1).optional(),
   })
   .strict();
@@ -2528,7 +2657,7 @@ export const LocalProjectReadFileRequestSchema = z
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     localProjectId: LocalProjectIdSchema,
-    relativePath: z.string(),
+    relativePath: SharedStringSchema,
     maxBytes: z.number().int().positive().optional(),
     requestedByUserId: z.string().trim().min(1).optional(),
   })
@@ -2540,7 +2669,7 @@ export const LocalProjectCheckoutBranchRequestSchema = z
     machineId: MachineIdSchema,
     workspaceId: WorkspaceIdSchema,
     localProjectId: LocalProjectIdSchema,
-    branchName: z.string(),
+    branchName: SharedStringSchema,
   })
   .strict();
 
@@ -2590,7 +2719,7 @@ export const LocalProjectHistoryProviderSchema = z
   .object({
     agentConfigId: AgentConfigIdSchema.refine((id) => id.trim().length > 0).optional(),
     cliType: AgentConfigCliTypeSchema,
-    agentType: z.string().trim().min(1),
+    agentType: SharedTrimmedNonEmptyStringSchema,
   })
   .strict();
 
@@ -2634,7 +2763,7 @@ export const WorktreeListFilesRequestSchema = z
   .object({
     type: z.literal('worktree/list-files'),
     machineId: MachineIdSchema,
-    repoFullName: z.string().trim().min(1),
+    repoFullName: SharedTrimmedNonEmptyStringSchema,
     sessionId: SessionIdSchema,
     maxFiles: z.number().int().positive().optional(),
   })
@@ -2644,9 +2773,9 @@ export const WorktreeReadFileRequestSchema = z
   .object({
     type: z.literal('worktree/read-file'),
     machineId: MachineIdSchema,
-    repoFullName: z.string().trim().min(1),
+    repoFullName: SharedTrimmedNonEmptyStringSchema,
     sessionId: SessionIdSchema,
-    relativePath: z.string(),
+    relativePath: SharedStringSchema,
     maxBytes: z.number().int().positive().optional(),
   })
   .strict();
@@ -2661,7 +2790,9 @@ export const LocalProjectControlRequestSchema = z.discriminatedUnion('type', [
   LocalProjectRemovalPreflightRequestSchema,
   LocalProjectListRequestSchema,
   LocalProjectGitStateRequestSchema,
+  LocalProjectListBranchesRequestSchema,
   LocalProjectListFilesRequestSchema,
+  LocalProjectSearchFilesRequestSchema,
   LocalProjectListDirRequestSchema,
   LocalProjectListSkillsRequestSchema,
   LocalProjectListGlobalSkillsRequestSchema,
@@ -2680,15 +2811,15 @@ export const LocalProjectControlRequestSchema = z.discriminatedUnion('type', [
 
 const LocalProjectFileListResultSchema = z
   .object({
-    paths: z.array(z.string()),
+    paths: z.array(SharedStringSchema),
     truncated: z.boolean(),
   })
   .strict();
 
 const LocalProjectFileReadResultSchema = z
   .object({
-    path: z.string(),
-    content: z.string(),
+    path: SharedStringSchema,
+    content: SharedStringSchema,
     truncated: z.boolean(),
     encoding: z.enum(['utf8', 'base64']).optional(),
   })
@@ -2699,7 +2830,7 @@ const LocalProjectDirectoryListResultSchema = z
     entries: z.array(
       z
         .object({
-          name: z.string(),
+          name: SharedStringSchema,
           type: z.enum(['file', 'directory']),
         })
         .strict()
@@ -2710,34 +2841,35 @@ const LocalProjectDirectoryListResultSchema = z
 
 const ProjectSkillSchema = z
   .object({
-    id: z.string(),
-    name: z.string(),
-    description: z.string().optional(),
-    version: z.string().optional(),
-    author: z.string().optional(),
-    relativePath: z.string(),
-    absolutePath: z.string().optional(),
+    id: SharedStringSchema,
+    name: SharedStringSchema,
+    description: SharedOptionalStringSchema,
+    version: SharedOptionalStringSchema,
+    author: SharedOptionalStringSchema,
+    relativePath: SharedStringSchema,
+    absolutePath: SharedOptionalStringSchema,
     isSymlink: z.boolean(),
-    symlinkTarget: z.string().optional(),
-    content: z.string().optional(),
+    symlinkTarget: SharedOptionalStringSchema,
+    content: SharedOptionalStringSchema,
   })
   .strict();
 
 const ProjectSkillGroupSchema = z
   .object({
     scope: z.enum(['project', 'global', 'system']),
-    dir: z.string(),
+    dir: SharedStringSchema,
     skills: z.array(ProjectSkillSchema),
     truncated: z.boolean(),
     skippedExternalSymlinks: z.number().int().nonnegative().optional(),
-    error: z.string().optional(),
+    error: SharedOptionalStringSchema,
   })
   .strict();
 
 const ProjectSkillsResultSchema = z
   .object({
     groups: z.array(ProjectSkillGroupSchema),
-    contentFingerprint: z.string().optional(),
+    contentFingerprint: SharedOptionalStringSchema,
+    unchanged: z.boolean().optional(),
   })
   .strict();
 
@@ -2745,20 +2877,20 @@ const LocalProjectBrowseRootsResultSchema = z
   .object({
     platform: z.enum(['darwin', 'linux', 'win32']),
     pathSeparator: z.enum(['/', '\\']),
-    homeDir: z.string(),
-    drives: z.array(z.string()).optional(),
+    homeDir: SharedStringSchema,
+    drives: z.array(SharedStringSchema).optional(),
   })
   .strict();
 
 const LocalProjectBrowseDirectoryResultSchema = z
   .object({
-    path: z.string(),
+    path: SharedStringSchema,
     parentPath: z.string().nullable(),
     entries: z.array(
       z
         .object({
-          name: z.string(),
-          absolutePath: z.string(),
+          name: SharedStringSchema,
+          absolutePath: SharedStringSchema,
           isSymlink: z.boolean(),
           hidden: z.boolean(),
           hints: z
@@ -2773,7 +2905,7 @@ const LocalProjectBrowseDirectoryResultSchema = z
         .strict()
     ),
     truncated: z.boolean(),
-    nextCursor: z.string().optional(),
+    nextCursor: SharedOptionalStringSchema,
   })
   .strict();
 
@@ -2781,7 +2913,7 @@ export const LocalProjectGitStateSchema = z.discriminatedUnion('git', [
   z
     .object({
       git: z.literal(true),
-      branches: z.array(z.string()),
+      branches: z.array(SharedStringSchema),
       currentBranch: z.string().nullable(),
       defaultBranch: z.string().nullable(),
       githubRepoFullName: z.string().nullable(),
@@ -2793,7 +2925,28 @@ export const LocalProjectGitStateSchema = z.discriminatedUnion('git', [
           untracked: z.boolean(),
           conflicted: z.boolean(),
         })
-        .strict(),
+        .strict()
+        .optional(),
+    })
+    .strict(),
+  z
+    .object({
+      git: z.literal(false),
+    })
+    .strict(),
+]);
+
+export const LocalProjectBranchListResultSchema = z.discriminatedUnion('git', [
+  z
+    .object({
+      git: z.literal(true),
+      currentBranch: z.string().nullable(),
+      defaultBranch: z.string().nullable(),
+      pinnedBranches: z.array(SharedStringSchema),
+      branches: z.array(SharedStringSchema),
+      truncated: z.boolean(),
+      nextCursor: SharedOptionalStringSchema,
+      totalCount: z.number().int().nonnegative(),
     })
     .strict(),
   z
@@ -2807,13 +2960,13 @@ const LocalProjectCheckoutBranchResultSchema = z.union([
   z
     .object({
       success: z.literal(true),
-      currentBranch: z.string(),
+      currentBranch: SharedStringSchema,
     })
     .strict(),
   z
     .object({
       success: z.literal(false),
-      error: z.string(),
+      error: SharedStringSchema,
     })
     .strict(),
 ]);
@@ -2829,8 +2982,8 @@ const LocalProjectHistorySyncSummarySchema = z
     failures: z.array(
       z
         .object({
-          acpSessionId: z.string(),
-          message: z.string(),
+          acpSessionId: SharedStringSchema,
+          message: SharedStringSchema,
         })
         .strict()
     ),
@@ -2839,10 +2992,10 @@ const LocalProjectHistorySyncSummarySchema = z
 
 const LocalProjectHistoryCatalogItemSchema = z
   .object({
-    acpSessionId: z.string(),
-    title: z.string(),
-    updatedAt: z.string().optional(),
-    importedSessionId: z.string().optional(),
+    acpSessionId: SharedStringSchema,
+    title: SharedStringSchema,
+    updatedAt: SharedOptionalStringSchema,
+    importedSessionId: SharedOptionalStringSchema,
     status: z.enum(['available', 'imported', 'sync_conflict']).optional(),
   })
   .strict();
@@ -2874,13 +3027,13 @@ const LocalProjectHistoryConflictResolveResultSchema = z
 const LocalProjectWorktreeCleanupItemSchema = z
   .object({
     sessionId: SessionIdSchema,
-    title: z.string(),
-    path: z.string(),
+    title: SharedStringSchema,
+    path: SharedStringSchema,
   })
   .strict();
 
 const LocalProjectWorktreeCleanupFailureSchema = LocalProjectWorktreeCleanupItemSchema.extend({
-  message: z.string(),
+  message: SharedStringSchema,
 }).strict();
 
 const LocalProjectWorktreeCleanupPreflightResultSchema = z
@@ -2918,7 +3071,9 @@ const LocalProjectControlErrorResponseSchema = z
       'local-project/removal-preflight',
       'local-project/list',
       'local-project/git-state',
+      'local-project/list-branches',
       'local-project/list-files',
+      'local-project/search-files',
       'local-project/list-dir',
       'local-project/list-skills',
       'local-project/list-global-skills',
@@ -2935,7 +3090,7 @@ const LocalProjectControlErrorResponseSchema = z
       'worktree/read-file',
     ]),
     error: LocalProjectControlErrorCodeSchema,
-    message: z.string(),
+    message: SharedStringSchema,
     data: z.unknown().optional(),
   })
   .strict();
@@ -2948,8 +3103,8 @@ export const LocalProjectControlResponseSchema = z.union([
       result: z
         .object({
           localProjectId: LocalProjectIdSchema,
-          name: z.string(),
-          rootPath: z.string(),
+          name: SharedStringSchema,
+          rootPath: SharedStringSchema,
           workspaceIds: z.array(WorkspaceIdSchema),
         })
         .strict(),
@@ -2962,8 +3117,8 @@ export const LocalProjectControlResponseSchema = z.union([
       result: z
         .object({
           localProjectId: LocalProjectIdSchema,
-          name: z.string(),
-          rootPath: z.string(),
+          name: SharedStringSchema,
+          rootPath: SharedStringSchema,
           alreadyRegistered: z.boolean(),
           inspection: ProjectLocalMemberProbeSchema.optional(),
         })
@@ -2998,8 +3153,8 @@ export const LocalProjectControlResponseSchema = z.union([
       result: z
         .object({
           localProjectId: LocalProjectIdSchema,
-          name: z.string(),
-          rootPath: z.string(),
+          name: SharedStringSchema,
+          rootPath: SharedStringSchema,
           workspaceIds: z.array(WorkspaceIdSchema),
         })
         .strict(),
@@ -3022,13 +3177,13 @@ export const LocalProjectControlResponseSchema = z.union([
             z
               .object({
                 workspaceId: WorkspaceIdSchema,
-                workspaceName: z.string(),
+                workspaceName: SharedStringSchema,
                 projects: z.array(
                   z
                     .object({
                       localProjectId: LocalProjectIdSchema,
-                      name: z.string(),
-                      rootPath: z.string(),
+                      name: SharedStringSchema,
+                      rootPath: SharedStringSchema,
                     })
                     .strict()
                 ),
@@ -3049,7 +3204,21 @@ export const LocalProjectControlResponseSchema = z.union([
   z
     .object({
       ok: z.literal(true),
+      type: z.literal('local-project/list-branches'),
+      result: LocalProjectBranchListResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ok: z.literal(true),
       type: z.literal('local-project/list-files'),
+      result: LocalProjectFileListResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ok: z.literal(true),
+      type: z.literal('local-project/search-files'),
       result: LocalProjectFileListResultSchema,
     })
     .strict(),
@@ -3288,13 +3457,8 @@ export const ServerSendMessageSchema = z.discriminatedUnion('type', [
   MachineAcpBinaryProgressMessageSchema,
 ]);
 
-// ============================================
-// MESSAGE CONTENT SCHEMAS
-// ============================================
-
 export const RoleSchema = z.enum(['user', 'assistant', 'system']);
 
-// Match @agentclientprotocol/sdk ToolCallStatus type
 export const ToolCallStatusSchema = z.enum(['pending', 'in_progress', 'completed', 'failed']);
 
 export const ToolKindSchema = z.enum([
@@ -3318,8 +3482,8 @@ export const WorktreeScriptPhaseSchema = z.enum(['setup', 'cleanup']);
 
 export const PlanEntrySchema = z
   .object({
-    id: z.string().optional(),
-    content: z.string(),
+    id: SharedOptionalStringSchema,
+    content: SharedStringSchema,
     priority: z.enum(['high', 'medium', 'low']).optional(),
     status: z.enum(['pending', 'in_progress', 'completed', 'cancelled']).optional(),
   })
@@ -3336,29 +3500,29 @@ const KnownStandardToolContentSchema = z.discriminatedUnion('type', [
   z
     .object({
       type: z.literal('text'),
-      text: z.string(),
+      text: SharedStringSchema,
     })
     .loose(),
   z
     .object({
       type: z.literal('image'),
-      data: z.string(),
-      mimeType: z.string(),
+      data: SharedStringSchema,
+      mimeType: SharedStringSchema,
       uri: z.string().nullable().optional(),
     })
     .loose(),
   z
     .object({
       type: z.literal('audio'),
-      data: z.string(),
-      mimeType: z.string(),
+      data: SharedStringSchema,
+      mimeType: SharedStringSchema,
     })
     .loose(),
   z
     .object({
       type: z.literal('resource_link'),
-      uri: z.string(),
-      name: z.string(),
+      uri: SharedStringSchema,
+      name: SharedStringSchema,
       title: z.string().nullable().optional(),
       description: z.string().nullable().optional(),
       mimeType: z.string().nullable().optional(),
@@ -3368,13 +3532,11 @@ const KnownStandardToolContentSchema = z.discriminatedUnion('type', [
   z
     .object({
       type: z.literal('resource'),
-      resource: z.record(z.string(), z.unknown()),
+      resource: z.record(SharedStringSchema, z.unknown()),
     })
     .loose(),
 ]);
 
-// ACP extension blocks remain opaque JSON. Known discriminators must still pass
-// their own schema; malformed known blocks cannot fall through as extensions.
 const unknownProtocolBlock = (known: z.ZodUnion) => {
   const types = new Set(
     known.options.flatMap((option) =>
@@ -3391,11 +3553,10 @@ const StandardToolContentSchema = z.union([
 ]);
 
 const KnownToolCallContentSchema = z.union([
-  // Legacy blocks used by older history entries
   z
     .object({
       type: z.literal('input'),
-      input: z.record(z.string(), z.unknown()),
+      input: z.record(SharedStringSchema, z.unknown()),
     })
     .loose(),
   z
@@ -3407,10 +3568,9 @@ const KnownToolCallContentSchema = z.union([
   z
     .object({
       type: z.literal('text'),
-      text: z.string(),
+      text: SharedStringSchema,
     })
     .loose(),
-  // ACP blocks
   z
     .object({
       type: z.literal('content'),
@@ -3420,25 +3580,24 @@ const KnownToolCallContentSchema = z.union([
   z
     .object({
       type: z.literal('terminal'),
-      terminalId: z.string(),
+      terminalId: SharedStringSchema,
     })
     .loose(),
-  // Stable terminal snapshots stored in history (do not depend on ACP rawOutput structure)
   z
     .object({
       type: z.literal('terminal_command'),
-      command: z.string(),
-      args: z.array(z.string()).optional(),
-      cwd: z.string().optional(),
+      command: SharedStringSchema,
+      args: z.array(SharedStringSchema).optional(),
+      cwd: SharedOptionalStringSchema,
       truncated: z.boolean().optional(),
     })
     .loose(),
   z
     .object({
       type: z.literal('terminal_output'),
-      output: z.string(),
+      output: SharedStringSchema,
       stream: z.enum(['combined', 'stdout', 'stderr']).optional(),
-      terminalId: z.string().optional(),
+      terminalId: SharedOptionalStringSchema,
       truncated: z.boolean().optional(),
       exitStatus: TerminalExitStatusSchema.optional(),
     })
@@ -3446,9 +3605,9 @@ const KnownToolCallContentSchema = z.union([
   z
     .object({
       type: z.literal('diff'),
-      path: z.string(),
+      path: SharedStringSchema,
       oldText: z.string().nullable().optional(),
-      newText: z.string(),
+      newText: SharedStringSchema,
     })
     .loose(),
 ]);
@@ -3459,7 +3618,7 @@ export const ToolCallContentSchema = z.union([
 
 export const ToolCallLocationSchema = z
   .object({
-    path: z.string(),
+    path: SharedStringSchema,
     line: z.number().nullable().optional(),
     _meta: PermissionMetaSchema.optional(),
     startLine: z.number().optional(),
@@ -3470,58 +3629,51 @@ export const ToolCallLocationSchema = z
   .catchall(z.json());
 
 export const AvailableCommandSchema = z.object({
-  name: z.string(),
-  description: z.string().optional(),
+  name: SharedStringSchema,
+  description: SharedOptionalStringSchema,
   input: z
-    .object({ hint: z.string(), _meta: PermissionMetaSchema.optional() })
+    .object({ hint: SharedStringSchema, _meta: PermissionMetaSchema.optional() })
     .nullable()
     .optional(),
   _meta: PermissionMetaSchema.optional(),
 });
 
 export const PermissionRequestInfoSchema = z.object({
-  requestId: z.string(),
+  requestId: SharedStringSchema,
   options: z.array(PermissionOptionSchema),
   _meta: PermissionMetaSchema.optional(),
   outcome: PermissionOutcomeSchema.optional(),
 });
 
-// System notice name schema
 export const SystemNoticeNameSchema = z.enum([
   'resume_from_external_chat_history',
   'chat_failed',
   'agent_warning',
 ]);
 
-// Metadata for resume_from_external_chat_history system notice
 export const ResumeFromExternalChatHistoryMetaSchema = z.object({
   truncated: z.boolean().optional(),
   terminalOmitted: z.boolean().optional(),
   thinkingOmitted: z.boolean().optional(),
 });
 
-// Metadata for agent_warning system notice: a warning issued by the agent
-// runtime (e.g. Codex app-server `warning`/`configWarning` notifications),
-// carried structured via ACP session_info_update `_meta` instead of agent text.
 export const AgentWarningMetaSchema = z.object({
-  message: z.string(),
-  source: z.string().optional(),
+  message: SharedStringSchema,
+  source: SharedOptionalStringSchema,
 });
 
-// Who authored a history item; agent-authored content cannot use turn-level userId.
 export const MessageItemActorSchema = z.object({
   kind: z.enum(['human', 'agent']),
-  agentConfigId: z.string().optional(),
-  name: z.string().optional(),
+  agentConfigId: SharedOptionalStringSchema,
+  name: SharedOptionalStringSchema,
 });
 
-// Metadata for the task_proposal system notice
 export const TaskProposalMetaSchema = z.object({
-  proposalId: z.string().trim().min(1),
-  title: z.string(),
-  body: z.string().optional(),
+  proposalId: SharedTrimmedNonEmptyStringSchema,
+  title: SharedStringSchema,
+  body: SharedOptionalStringSchema,
   outcome: z.enum(['created', 'dismissed']).optional(),
-  taskId: z.string().optional(),
+  taskId: SharedOptionalStringSchema,
   proposedBy: MessageItemActorSchema.optional(),
 });
 
@@ -3530,10 +3682,31 @@ const proposalTimeOfDay = {
   minute: z.number().int().min(0).max(59),
   timeZone: z.string().min(1).max(100).optional(),
 };
+/**
+ * Largest "every N minutes / hours" step, shared by the editor's Custom field,
+ * agent proposals, the CLI and the mobile runtimes. It is the 32-bit signed
+ * maximum because Android carries `every` as a Kotlin `Int`; it also keeps
+ * `every × unit` an exact JS integer whose first run, from any anchor before
+ * year 29,000, stays inside the JS Date range the planner and ledger store.
+ * A step that does not divide the clock is stored as an anchored interval.
+ */
+export const SCHEDULE_CUSTOM_STEP_MAX = 2_147_483_647;
+export const SCHEDULE_CUSTOM_MINUTES_MAX = SCHEDULE_CUSTOM_STEP_MAX;
+export const SCHEDULE_CUSTOM_HOURS_MAX = SCHEDULE_CUSTOM_STEP_MAX;
 export const ScheduleProposalRuleSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('manual') }).strict(),
-  z.object({ kind: z.literal('minutes'), every: z.number().int().min(1).max(59) }).strict(),
-  z.object({ kind: z.literal('hours'), every: z.number().int().min(1).max(23) }).strict(),
+  z
+    .object({
+      kind: z.literal('minutes'),
+      every: z.number().int().min(1).max(SCHEDULE_CUSTOM_MINUTES_MAX),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('hours'),
+      every: z.number().int().min(1).max(SCHEDULE_CUSTOM_HOURS_MAX),
+    })
+    .strict(),
   z.object({ kind: z.literal('daily'), ...proposalTimeOfDay }).strict(),
   z.object({ kind: z.literal('weekdays'), ...proposalTimeOfDay }).strict(),
   z
@@ -3569,18 +3742,17 @@ export const ScheduleProposalTargetSchema = z
   .strict();
 
 export const ScheduleProposalMetaSchema = z.object({
-  proposalId: z.string().trim().min(1),
+  proposalId: SharedTrimmedNonEmptyStringSchema,
   title: z.string().trim().min(1).max(200),
   prompt: z.string().min(1).max(32768),
   rule: ScheduleProposalRuleSchema,
   destination: ScheduleProposalDestinationSchema.optional(),
   target: ScheduleProposalTargetSchema.optional(),
   outcome: z.enum(['created', 'dismissed']).optional(),
-  scheduleId: z.string().optional(),
+  scheduleId: SharedOptionalStringSchema,
   proposedBy: MessageItemActorSchema.optional(),
 });
 
-// Reason codes for chat_failed system notice
 export const ChatFailedReasonSchema = z.enum([
   'session_archived',
   'agent_type_mismatch',
@@ -3610,43 +3782,81 @@ export const ChatFailedReasonSchema = z.enum([
 
 export const ChatFailedCodeSchema = z.enum(['git_executable_not_found']);
 
-// Metadata for chat_failed system notice
 export const ChatFailedMetaSchema = z.object({
   reason: ChatFailedReasonSchema,
   code: ChatFailedCodeSchema.optional(),
-  message: z.string().optional(),
+  message: SharedOptionalStringSchema,
+  resetAt: SharedOptionalStringSchema,
+  resetAtEpochSeconds: z.number().int().positive().optional(),
 });
+
+/**
+ * The newest `chat_failed` notice among history entries, read leniently so notices
+ * written by older or newer clients still yield their reason and message.
+ */
+export function readChatFailureNotice(
+  entries: ReadonlyArray<{ role?: string; timestamp?: string; items?: ReadonlyArray<unknown> }>
+): { reason?: string; message?: string; at?: string; resetAt?: string } | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.role !== 'system' || !Array.isArray(entry.items)) continue;
+    for (const item of entry.items as Array<{ type?: unknown; name?: unknown; meta?: unknown }>) {
+      if (item?.type !== 'system_notice' || item.name !== 'chat_failed') continue;
+      const meta = (item.meta ?? {}) as {
+        reason?: unknown;
+        message?: unknown;
+        resetAt?: unknown;
+        resetAtEpochSeconds?: unknown;
+      };
+      const message = typeof meta.message === 'string' ? meta.message.trim() : '';
+      const explicitReset = typeof meta.resetAt === 'string' ? meta.resetAt.trim() : '';
+      const resetAtEpochSeconds =
+        typeof meta.resetAtEpochSeconds === 'number' &&
+        Number.isFinite(meta.resetAtEpochSeconds) &&
+        meta.resetAtEpochSeconds > 0
+          ? meta.resetAtEpochSeconds
+          : undefined;
+      const resetAt =
+        explicitReset ||
+        (resetAtEpochSeconds !== undefined
+          ? new Date(resetAtEpochSeconds * 1000).toISOString()
+          : '');
+      return {
+        ...(typeof meta.reason === 'string' ? { reason: meta.reason } : {}),
+        ...(message ? { message } : {}),
+        ...(typeof entry.timestamp === 'string' ? { at: entry.timestamp } : {}),
+        ...(resetAt ? { resetAt } : {}),
+      };
+    }
+  }
+  return undefined;
+}
 
 export const ToolCallMessageSchema = z.object({
   type: z.literal('tool_call'),
   _meta: PermissionMetaSchema.optional(),
-  toolCallId: z.string(),
+  toolCallId: SharedStringSchema,
   title: z.string().nullable().optional(),
   status: ToolCallStatusSchema,
   kind: ToolKindSchema.optional(),
   content: z.array(ToolCallContentSchema).optional(),
   locations: z.array(ToolCallLocationSchema).optional(),
-  rawInput: z.record(z.string(), z.unknown()).optional(),
-  rawOutput: z.record(z.string(), z.unknown()).optional(),
+  rawInput: z.record(SharedStringSchema, z.unknown()).optional(),
+  rawOutput: z.record(SharedStringSchema, z.unknown()).optional(),
   activityKind: z.enum(['context_compaction', 'codex_retry']).optional(),
-  // Canonical tool name, when the agent published one (ACP `title` is human-facing).
-  toolName: z.string().optional(),
-  // IANA timezone of the machine that ran a scheduling tool (cron is local-time to it).
-  schedulingTimeZone: z.string().optional(),
-  // Epoch ms when a scheduling tool call was first persisted (true creation moment;
-  // turn-level timestamps are not a safe proxy — see `recordedAtMs` in ai.ts).
+  toolName: SharedOptionalStringSchema,
+  schedulingTimeZone: SharedOptionalStringSchema,
   recordedAtMs: z.number().optional(),
   permissionRequest: PermissionRequestInfoSchema.optional(),
 });
 
-// Non-system notice MessageContent discriminated union
 const SubagentItemIdentityShape = {
-  nativeTurnId: z.string().optional(),
-  messageId: z.string().optional(),
+  nativeTurnId: SharedOptionalStringSchema,
+  messageId: SharedOptionalStringSchema,
 };
 export const OperationCompletionContentSchema = z.object({
   type: z.literal('operation_completion'),
-  deliveryId: z.string().trim().min(1),
+  deliveryId: SharedTrimmedNonEmptyStringSchema,
   operationId: LodyOperationIdSchema,
   operationKind: z.enum([
     'session_create',
@@ -3661,7 +3871,8 @@ export const OperationCompletionContentSchema = z.object({
 export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('text'),
-    text: z.string(),
+    text: SharedStringSchema,
+    messagePhase: z.enum(['commentary', 'final_answer']).optional(),
     spans: z.array(MessageTextSpanSchema).optional(),
   }),
   SubagentTaskPayloadSchema.extend({
@@ -3676,13 +3887,14 @@ export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', 
             z.object({
               ...SubagentItemIdentityShape,
               type: z.literal('text'),
-              text: z.string(),
+              text: SharedStringSchema,
+              messagePhase: z.enum(['commentary', 'final_answer']).optional(),
               spans: z.array(MessageTextSpanSchema).optional(),
             }),
             z.object({
               ...SubagentItemIdentityShape,
               type: z.literal('thought'),
-              text: z.string(),
+              text: SharedStringSchema,
             }),
             z.object({
               ...SubagentItemIdentityShape,
@@ -3700,9 +3912,10 @@ export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', 
   SessionImageInputBlockSchema,
   SessionImageGroupContentSchema,
   SessionFileBlockObjectSchema,
+  SessionLocalAttachmentSchema,
   z.object({
     type: z.literal('thought'),
-    text: z.string(),
+    text: SharedStringSchema,
   }),
   z.object({
     type: z.literal('plan'),
@@ -3710,16 +3923,16 @@ export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', 
   }),
   z.object({
     type: z.literal('proposed_plan'),
-    turnId: z.string(),
-    markdown: z.string(),
+    turnId: SharedStringSchema,
+    markdown: SharedStringSchema,
     status: z.enum(['delta', 'completed', 'cleared']),
     isLatest: z.boolean(),
   }),
   z.object({
     type: z.literal('goal'),
-    threadId: z.string(),
+    threadId: SharedStringSchema,
     turnId: z.string().nullable().optional(),
-    objective: z.string(),
+    objective: SharedStringSchema,
     status: z.enum([
       'active',
       'paused',
@@ -3760,10 +3973,10 @@ export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', 
           target: z
             .object({
               sessionId: SessionIdSchema,
-              userTurnId: z.string().trim().min(1),
+              userTurnId: SharedTrimmedNonEmptyStringSchema,
             })
             .strict(),
-          label: z.string().optional(),
+          label: SharedOptionalStringSchema,
           status: z.enum(['created', 'running', 'succeeded', 'failed', 'cancelled']),
         })
         .strict()
@@ -3771,11 +3984,10 @@ export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', 
   }),
 ]);
 
-// System notice message content schema
 export const SessionForkOriginMetaSchema = z.object({
   sourceSessionId: SessionIdSchema,
-  sourceTurnId: z.string(),
-  sourceTitle: z.string(),
+  sourceTurnId: SharedStringSchema,
+  sourceTitle: SharedStringSchema,
 });
 
 export const SystemNoticeSchema = z.discriminatedUnion('name', [
@@ -3817,9 +4029,9 @@ export const SystemNoticeSchema = z.discriminatedUnion('name', [
 ]);
 
 export const WorktreeScriptStepSchema = z.object({
-  command: z.string(),
+  command: SharedStringSchema,
   status: z.enum(['in_progress', 'completed', 'failed']),
-  output: z.string(),
+  output: SharedStringSchema,
   truncated: z.boolean().optional(),
   exitStatus: TerminalExitStatusSchema.optional(),
   startedAt: z.number().optional(),
@@ -3835,7 +4047,6 @@ export const WorktreeScriptContentSchema = z.object({
   endedAt: z.number().optional(),
 });
 
-// MessageContent union
 export const MessageContentSchema = z
   .union([NonSystemNoticeMessageContentSchema, SystemNoticeSchema, WorktreeScriptContentSchema])
   .superRefine((item, ctx) => {
@@ -3844,17 +4055,9 @@ export const MessageContentSchema = z
 
 export const MessageContentArraySchema = z.array(MessageContentSchema);
 
-// ============================================
-// TYPE EXPORTS (inferred from schemas)
-// ============================================
-
-// Use original ServerToMachine type for compatibility with branded types
-// Zod validates structure at runtime, original types provide compile-time safety
 export type MessageContentValidated = z.infer<typeof MessageContentSchema>;
 export type MessageContentArrayValidated = z.infer<typeof MessageContentArraySchema>;
 
-// Individual message types - re-export original types from message.ts
-// Zod validates at runtime, then we use original types for type safety
 import type {
   ClientToServer,
   MachineToServer,
@@ -3904,15 +4107,12 @@ import type {
   MachineAcpBinaryInstallRequest,
   MachineAcpBinaryInstallResponse,
   MachineAcpBinaryProgressMessage,
-  SessionCodeCollabHostStartRequest,
-  SessionCodeCollabHostStartResponse,
   LocalProjectControlRequest,
   LocalProjectControlResponse,
   LocalSessionControlRequest,
   LocalSessionControlResponse,
 } from './message';
 
-// Re-export original types for handlers to use after validation
 export type {
   SessionCreateRequest as SessionCreateRequestValidated,
   SessionCreateResponse as SessionCreateResponseValidated,
@@ -3956,8 +4156,6 @@ export type {
   MachineAcpBinaryInstallRequest as MachineAcpBinaryInstallRequestValidated,
   MachineAcpBinaryInstallResponse as MachineAcpBinaryInstallResponseValidated,
   MachineAcpBinaryProgressMessage as MachineAcpBinaryProgressMessageValidated,
-  SessionCodeCollabHostStartRequest as SessionCodeCollabHostStartRequestValidated,
-  SessionCodeCollabHostStartResponse as SessionCodeCollabHostStartResponseValidated,
 };
 
 export type ClientToServerValidated = ClientToServer;
@@ -3970,10 +4168,6 @@ export type LocalSessionControlRequestValidated = LocalSessionControlRequest;
 export type LocalSessionControlResponseValidated = LocalSessionControlResponse;
 export type LocalProjectControlRequestValidated = LocalProjectControlRequest;
 export type LocalProjectControlResponseValidated = LocalProjectControlResponse;
-
-// ============================================
-// VALIDATION HELPERS
-// ============================================
 
 type UnknownRecord = Record<string, unknown>;
 const LEGACY_DEFAULT_BRANCH = 'main';
@@ -4008,9 +4202,7 @@ function isAgentConfigCliTypeString(
  * - Current schemas are strict and reject unknown keys.
  * - Older senders may still send `project.project` as a branch alias.
  *
- * Release policy:
- * - This is temporary and must be removed for the formal release cleanup.
- * - Keep the lifecycle documented in docs/backward-compatibility.md.
+ * Remove it once no supported sender can still produce `project.project`.
  */
 function normalizeLegacyProjectRef(value: unknown): unknown {
   if (!isRecord(value)) {
@@ -4110,10 +4302,7 @@ function normalizeLegacySessionProject(message: UnknownRecord): UnknownRecord {
     ? getTrimmedString(projectRecord.githubRepoFullName)
     : undefined;
   const localUseWorktree = projectRecord?.useWorktree;
-  const branch =
-    explicitBranch ??
-    // Legacy payloads could carry repo identity but no branch before branch-aware startup.
-    (repoFullName ? LEGACY_DEFAULT_BRANCH : undefined);
+  const branch = explicitBranch ?? (repoFullName ? LEGACY_DEFAULT_BRANCH : undefined);
 
   if (branch && repoFullName) {
     normalized.project = { kind: 'github', repoFullName, branch };
@@ -4172,26 +4361,22 @@ export function normalizeLegacyAcpSessionConfig(value: unknown): unknown {
     return normalized;
   }
 
-  // Keep invalid non-legacy cliType untouched so schema validation can reject it.
   if (cliType && !isLegacyBuiltinCliType(cliType)) {
     return normalized;
   }
 
-  // Legacy payload before #1221: only `agentType=claude|codex`.
   if (!cliType && isLegacyBuiltinCliType(agentType)) {
     normalized.cliType = 'builtin';
     normalized.agentType = agentType;
     return normalized;
   }
 
-  // Transitional payload from old session meta: `cliType=claude|codex` and missing `agentType`.
   if (isLegacyBuiltinCliType(cliType) && !agentType) {
     normalized.cliType = 'builtin';
     normalized.agentType = cliType;
     return normalized;
   }
 
-  // If both legacy fields exist, prefer `agentType` to align with local-session-control parser.
   if (isLegacyBuiltinCliType(cliType) && isLegacyBuiltinCliType(agentType)) {
     normalized.cliType = 'builtin';
     normalized.agentType = agentType;

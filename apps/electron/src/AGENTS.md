@@ -34,9 +34,14 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
   become a runtime dependency. Shared push/send maps remain in
   `@lody/shared/electron-ipc`. Preload exposes only `{ invoke, on, send }`, permits invoke
   channels by the service groups in `preload/ipc-invoke-policy.ts`, and keeps push/send
-  allowlists. The IPC registration test keeps that policy aligned with the registered
-  service constructors. There is no `window.api`. Validate foreign input at the IPC class
-  boundary.
+  allowlists. The `e2ee` group alone admits an explicit method list; every `E2eeIpc`
+  `@IpcMethod()` must be on it, which `e2ee-account-runtime.test.mjs` derives from the
+  class. There is no `window.api`. Validate foreign input at the IPC class boundary.
+- The E2E client-loss probe (`e2ee.inspectClientLoss` and `e2ee.clientLossEffects`) is the
+  only channel pair outside the service classes. Main registers it, and preload admits it,
+  only for unpackaged `LODY_E2E=1` windows through the main-supplied argument. It stays
+  read-only and returns counts, booleans and sequences without content, tokens or error text.
+  [Decision](../../../.agents/notes/implemented/testing/2026-10-30-e2ee-client-loss-probe.md).
 - Preload runs under the renderer CSP. Zod schemas used there must pass
   `{ jitless: true }`; do not add `unsafe-eval` to accommodate Zod's JIT path.
 
@@ -93,6 +98,13 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
 
 ## Local file resources
 
+- Local attachments carry machine identity, a path and display metadata; Electron
+  must not register, resolve or inherit reference IDs or submission bindings.
+  Original files use their paths directly without preparation IPC. Only generated
+  bytes enter attachment preparation and remain staged until it returns the durable path.
+  Read paths through the existing machine-authorized local file boundary. Image
+  snapshots keep their separate preparation and resolution protocol.
+
 - Markdown link discovery uses the shared resolver after disk-machine validation.
   It returns identities without resources; the selected path is reauthorized on read.
 
@@ -109,3 +121,8 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
   cross-origin readers can inspect `Accept-Ranges` and `Content-Range`.
   Raster header dimensions bound decode cost.
   The scheme never bypasses CSP, executes file content, or authorizes a remote RPC.
+- Direct HTML preview (`local-html-preview.ts`) is the one exception: after user
+  consent it serves the file’s folder or its explicitly authorized workspace from a random per-preview
+  `lody-html-preview://` origin. Scripts run only when the user allowed them. Preview frames
+  cannot navigate off that scheme and receive no permissions. It never
+  serves dot-files or paths outside the authorized folder, including through symlinks, and its tokens share the resource owner's lifetime.

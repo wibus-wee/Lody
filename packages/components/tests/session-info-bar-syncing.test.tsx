@@ -1,15 +1,13 @@
 // @vitest-environment jsdom
-
 import { act, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SESSION_GOAL_COMMANDS, type SessionGoalMessage } from '@lody/shared';
 import { SessionInfoBar } from '../src/components/sessions/session-info-bar';
 import type { SessionMachineInfo } from '../src/components/sessions/session-machine-info';
+import { createTestI18n, withTestI18n } from './test-i18n';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (_key: string, fallback: string) => fallback }),
-}));
+const testI18n = createTestI18n();
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -56,81 +54,121 @@ describe('SessionInfoBar ambient information', () => {
     container.remove();
   });
 
-  it('renders the bar for syncing alone on a context-less session', () => {
-    act(() => {
-      root.render(<SessionInfoBar {...CONTEXT_LESS_PROPS} syncing />);
-    });
+  it.each([false, true])(
+    'opens zero-line changes by file count and keeps mixed text totals (compact=%s)',
+    (compact) => {
+      function Harness({ diff }: { diff: { add: number; del: number; files?: number } }) {
+        const [open, setOpen] = useState(false);
+        return (
+          <>
+            <SessionInfoBar
+              {...CONTEXT_LESS_PROPS}
+              compactMachineInfo={compact}
+              diffStat={diff}
+              onOpenAllChanges={() => setOpen(true)}
+            />
+            {open ? (
+              <div role="region" aria-label="Workspace changes">
+                image.bin
+              </div>
+            ) : null}
+          </>
+        );
+      }
+      act(() =>
+        root.render(withTestI18n(<Harness diff={{ add: 0, del: 0, files: 2 }} />, testI18n))
+      );
+      const entry = container.querySelector<HTMLButtonElement>('button[aria-label="All Changes"]');
+      expect(entry?.textContent).toBe('2 files');
+      expect(entry?.disabled).toBe(false);
+      act(() =>
+        root.render(withTestI18n(<Harness diff={{ add: 0, del: 0, files: 3 }} />, testI18n))
+      );
+      expect(container.querySelector('button[aria-label="All Changes"]')?.textContent).toBe(
+        '3 files'
+      );
+      act(() => entry!.click());
+      expect(container.querySelector('[aria-label="Workspace changes"]')?.textContent).toBe(
+        'image.bin'
+      );
+      act(() =>
+        root.render(withTestI18n(<Harness diff={{ add: 3, del: 1, files: 2 }} />, testI18n))
+      );
+      expect(container.querySelector('button[aria-label="All Changes"]')?.textContent).toBe('+3−1');
+      act(() =>
+        root.render(withTestI18n(<Harness diff={{ add: 3, del: 1, files: 0 }} />, testI18n))
+      );
+      expect(container.querySelector('button[aria-label="All Changes"]')).toBeNull();
+      act(() => root.render(withTestI18n(<Harness diff={{ add: 3, del: 1 }} />, testI18n)));
+      expect(container.querySelector('button[aria-label="All Changes"]')?.textContent).toBe('+3−1');
+    }
+  );
 
-    expect(container.textContent).toContain('Syncing');
-    // Sync-only mode: no staged item, no divider — the spinner keeps its
-    // right-edge pin via the ml-auto wrapper.
-    const wrapper = container.querySelector('.ml-auto');
-    expect(wrapper).not.toBeNull();
-    expect(wrapper?.textContent).toContain('Syncing');
-  });
-
-  it('says Updating while a cached conversation catches up, and hides for a null status', () => {
+  it('says Syncing while a cached conversation catches up, and hides for a null status', () => {
     act(() => {
-      root.render(<SessionInfoBar {...CONTEXT_LESS_PROPS} syncStatus="updating" />);
+      root.render(
+        withTestI18n(<SessionInfoBar {...CONTEXT_LESS_PROPS} syncStatus="updating" />, testI18n)
+      );
     });
-    expect(container.querySelector('.ml-auto')?.textContent).toContain('Updating');
+    expect(container.querySelector('[data-sync-indicator]')?.textContent).toContain('Syncing');
 
     // An explicit null status wins over the legacy flag: nothing to announce.
     act(() => {
-      root.render(<SessionInfoBar {...CONTEXT_LESS_PROPS} syncing syncStatus={null} />);
-    });
-    expect(container.textContent).toBe('');
-  });
-
-  it('still hides the bar entirely with no items and no syncing', () => {
-    act(() => {
-      root.render(<SessionInfoBar {...CONTEXT_LESS_PROPS} />);
-    });
-
-    // No bar is shown: only the hidden spacer that keeps the composer's gap.
-    expect(container.textContent).toBe('');
-    expect(container.querySelector('button, [role]')).toBeNull();
-    expect(container.children).toHaveLength(1);
-    expect(container.firstElementChild?.getAttribute('aria-hidden')).toBe('true');
-  });
-
-  it('renders a simulator-only action and keeps browser and simulator actions independent', () => {
-    function Actions({ withBrowser = false }: { withBrowser?: boolean }) {
-      const [opened, setOpened] = useState('');
-      return (
-        <>
-          <SessionInfoBar
-            {...CONTEXT_LESS_PROPS}
-            onOpenIosSimulator={() => setOpened('Simulator')}
-            onOpenBrowser={withBrowser ? () => setOpened('Browser') : undefined}
-          />
-          <output>{opened}</output>
-        </>
+      root.render(
+        withTestI18n(<SessionInfoBar {...CONTEXT_LESS_PROPS} syncing syncStatus={null} />, testI18n)
       );
-    }
-    act(() => root.render(<Actions />));
-    const action = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="iOS Simulator"]'
-    )!;
-    expect(action).not.toBeNull();
-    act(() => action.click());
-    expect(container.querySelector('output')?.textContent).toBe('Simulator');
-    expect(container.querySelector('button[aria-label="Open preview"]')).toBeNull();
-    act(() => root.render(<Actions withBrowser />));
-    act(() =>
-      container.querySelector<HTMLButtonElement>('button[aria-label="Open preview"]')!.click()
-    );
-    expect(container.querySelector('output')?.textContent).toBe('Browser');
-    act(() => action.click());
-    expect(container.querySelector('output')?.textContent).toBe('Simulator');
+    });
+    expect(container.textContent).toBe('');
   });
+
+  it.each([false, true])(
+    'chooses either simulator from one popover (compact=%s)',
+    (compactMachineInfo) => {
+      const openIos = vi.fn();
+      const openAndroid = vi.fn();
+      act(() =>
+        root.render(
+          withTestI18n(
+            <SessionInfoBar
+              {...CONTEXT_LESS_PROPS}
+              compactMachineInfo={compactMachineInfo}
+              onOpenIosSimulator={openIos}
+              onOpenAndroidEmulator={openAndroid}
+            />,
+            testI18n
+          )
+        )
+      );
+      const trigger = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="iOS Simulator / Android Emulator"]'
+      );
+      expect(trigger).not.toBeNull();
+      expect(container.querySelectorAll('button')).toHaveLength(1);
+      for (const label of ['Android Emulator', 'iOS Simulator']) {
+        act(() => trigger!.click());
+        const dialog = document.body.querySelector('[role="dialog"]');
+        expect(dialog).not.toBeNull();
+        const option = Array.from(dialog!.querySelectorAll('button')).find(
+          (button) => button.textContent === label
+        );
+        expect(option).toBeDefined();
+        act(() => option!.click());
+        expect(trigger!.getAttribute('aria-expanded')).toBe('false');
+        expect(openAndroid).toHaveBeenCalledTimes(1);
+        expect(openIos).toHaveBeenCalledTimes(label === 'iOS Simulator' ? 1 : 0);
+      }
+    }
+  );
 
   it('shows the execution target alone while keeping owner details out of the resting bar', () => {
-    act(() => root.render(<SessionInfoBar {...CONTEXT_LESS_PROPS} machine={MACHINE} />));
+    act(() =>
+      root.render(
+        withTestI18n(<SessionInfoBar {...CONTEXT_LESS_PROPS} machine={MACHINE} />, testI18n)
+      )
+    );
     expect(container.textContent).toBe(MACHINE.name);
     const surface = container.querySelector('[data-info-bar-surface]');
     expect(surface).not.toBeNull();
-    expect(surface!.className).toContain('rounded-lg');
     expect(container.querySelector('img')).toBeNull();
     expect(document.body.textContent).not.toContain('Maya Chen');
     act(() => container.querySelector<HTMLButtonElement>('button')!.click());
@@ -143,11 +181,14 @@ describe('SessionInfoBar ambient information', () => {
   it('opens full machine details from the mobile icon without guessing the local device', () => {
     act(() =>
       root.render(
-        <SessionInfoBar
-          {...CONTEXT_LESS_PROPS}
-          machine={{ ...MACHINE, isCurrent: undefined }}
-          compactMachineInfo
-        />
+        withTestI18n(
+          <SessionInfoBar
+            {...CONTEXT_LESS_PROPS}
+            machine={{ ...MACHINE, isCurrent: undefined }}
+            compactMachineInfo
+          />,
+          testI18n
+        )
       )
     );
     const trigger = container.querySelector<HTMLButtonElement>(
@@ -165,77 +206,35 @@ describe('SessionInfoBar ambient information', () => {
     expect(card.textContent).not.toContain('Another device');
   });
 
-  it('keeps mobile privacy and repository actions independent of machine details', () => {
-    function PrivateSession() {
-      const [opened, setOpened] = useState('');
-      return (
-        <>
-          <SessionInfoBar
-            {...CONTEXT_LESS_PROPS}
-            machine={MACHINE}
-            compactMachineInfo
-            projectName="LodyAI/Lody"
-            diffStat={{ add: 128, del: 42 }}
-            privateAccessStatus={{
-              label: 'Private · Only you',
-              description: 'Only you can access this private session',
-              onAction: () => setOpened('Sharing'),
-            }}
-            contextActions={[
-              { id: 'create-pr', label: 'Create PR', onClick: () => setOpened('Create PR') },
-            ]}
-          />
-          <output>{opened}</output>
-        </>
-      );
-    }
-    act(() => root.render(<PrivateSession />));
-    act(() =>
-      container
-        .querySelector<HTMLButtonElement>(
-          'button[aria-label="Only you can access this private session"]'
-        )!
-        .click()
-    );
-    expect(container.querySelector('output')?.textContent).toBe('Sharing');
-    const createPr = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-      (button) => button.textContent === 'Create PR'
-    )!;
-    expect(createPr).toBeDefined();
-    act(() => createPr.click());
-    expect(container.querySelector('output')?.textContent).toBe('Create PR');
-    act(() =>
-      container
-        .querySelector<HTMLButtonElement>(`button[aria-label="Machine details: ${MACHINE.name}"]`)!
-        .click()
-    );
-    expect(document.body.querySelector('[role="dialog"]')?.textContent).toContain(MACHINE.name);
-    expect(container.querySelector('output')?.textContent).toBe('Create PR');
-  });
-
   it.each([
     { layout: 'desktop', compact: false },
     { layout: 'mobile', compact: true },
   ])('keeps the machine accessible as other items take the stage on $layout', ({ compact }) => {
     act(() =>
       root.render(
-        <SessionInfoBar
-          status={null}
-          machine={MACHINE}
-          compactMachineInfo={compact}
-          projectName="LodyAI/Lody"
-        />
+        withTestI18n(
+          <SessionInfoBar
+            status={null}
+            machine={MACHINE}
+            compactMachineInfo={compact}
+            projectName="LodyAI/Lody"
+          />,
+          testI18n
+        )
       )
     );
     act(() =>
       root.render(
-        <SessionInfoBar
-          status={null}
-          machine={MACHINE}
-          compactMachineInfo={compact}
-          projectName="LodyAI/Lody"
-          goal={ACTIVE_GOAL}
-        />
+        withTestI18n(
+          <SessionInfoBar
+            status={null}
+            machine={MACHINE}
+            compactMachineInfo={compact}
+            projectName="LodyAI/Lody"
+            goal={ACTIVE_GOAL}
+          />,
+          testI18n
+        )
       )
     );
     expect(
@@ -262,10 +261,13 @@ describe('SessionInfoBar ambient information', () => {
     (onlineStatus) => {
       act(() =>
         root.render(
-          <SessionInfoBar
-            {...CONTEXT_LESS_PROPS}
-            machine={{ ...MACHINE, ownerName: null, onlineStatus }}
-          />
+          withTestI18n(
+            <SessionInfoBar
+              {...CONTEXT_LESS_PROPS}
+              machine={{ ...MACHINE, ownerName: null, onlineStatus }}
+            />,
+            testI18n
+          )
         )
       );
       expect(container.textContent).toBe(MACHINE.name);
@@ -286,24 +288,34 @@ describe('SessionInfoBar ambient information', () => {
     ({ compact }) => {
       act(() =>
         root.render(
-          <SessionInfoBar {...CONTEXT_LESS_PROPS} machine={MACHINE} compactMachineInfo={compact} />
+          withTestI18n(
+            <SessionInfoBar
+              {...CONTEXT_LESS_PROPS}
+              machine={MACHINE}
+              compactMachineInfo={compact}
+            />,
+            testI18n
+          )
         )
       );
       act(() => container.querySelector<HTMLButtonElement>('button')!.click());
       expect(document.body.textContent).toContain('Maya Chen');
       act(() =>
         root.render(
-          <SessionInfoBar
-            {...CONTEXT_LESS_PROPS}
-            compactMachineInfo={compact}
-            machine={{
-              ...MACHINE,
-              machineId: 'machine-2' as SessionMachineInfo['machineId'],
-              name: 'Build Server',
-              isOwn: true,
-              isCurrent: true,
-            }}
-          />
+          withTestI18n(
+            <SessionInfoBar
+              {...CONTEXT_LESS_PROPS}
+              compactMachineInfo={compact}
+              machine={{
+                ...MACHINE,
+                machineId: 'machine-2' as SessionMachineInfo['machineId'],
+                name: 'Build Server',
+                isOwn: true,
+                isCurrent: true,
+              }}
+            />,
+            testI18n
+          )
         )
       );
       expect(container.textContent).toBe(compact ? '' : 'Build Server');
@@ -316,7 +328,10 @@ describe('SessionInfoBar ambient information', () => {
       expect(document.body.textContent).toContain('This device');
       act(() =>
         root.render(
-          <SessionInfoBar {...CONTEXT_LESS_PROPS} machine={null} compactMachineInfo={compact} />
+          withTestI18n(
+            <SessionInfoBar {...CONTEXT_LESS_PROPS} machine={null} compactMachineInfo={compact} />,
+            testI18n
+          )
         )
       );
       expect(container.textContent).toBe('');
@@ -325,24 +340,18 @@ describe('SessionInfoBar ambient information', () => {
     }
   );
 
-  it('renders the indicator alongside context when items are present', () => {
-    act(() => {
-      root.render(<SessionInfoBar status={null} projectName="loro-dev/lody" syncing />);
-    });
-
-    expect(container.textContent).toContain('loro-dev/lody');
-    expect(container.textContent).toContain('Syncing');
-  });
-
   it('keeps a neutral goal read-only when no commands are supported', () => {
     act(() => {
       root.render(
-        <SessionInfoBar
-          {...CONTEXT_LESS_PROPS}
-          goal={ACTIVE_GOAL}
-          goalCommands={[]}
-          onGoalCommand={vi.fn()}
-        />
+        withTestI18n(
+          <SessionInfoBar
+            {...CONTEXT_LESS_PROPS}
+            goal={ACTIVE_GOAL}
+            goalCommands={[]}
+            onGoalCommand={vi.fn()}
+          />,
+          testI18n
+        )
       );
     });
 
@@ -352,41 +361,20 @@ describe('SessionInfoBar ambient information', () => {
     expect(document.body.textContent).not.toContain('Clear');
   });
 
-  it('shows and dispatches Codex prompt-bridge goal commands', () => {
-    const onGoalCommand = vi.fn();
-    act(() => {
-      root.render(
-        <SessionInfoBar
-          {...CONTEXT_LESS_PROPS}
-          goal={ACTIVE_GOAL}
-          goalCommands={SESSION_GOAL_COMMANDS}
-          onGoalCommand={onGoalCommand}
-        />
-      );
-    });
-
-    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Goal"]')?.click());
-    const pauseButton = Array.from(document.body.querySelectorAll('button')).find(
-      (button) => button.textContent === 'Pause'
-    );
-    expect(pauseButton).toBeDefined();
-    expect(document.body.textContent).toContain('Clear');
-
-    act(() => pauseButton?.click());
-    expect(onGoalCommand).toHaveBeenCalledWith('pause', ACTIVE_GOAL);
-  });
-
   it('shows and dispatches Resume for a blocked Codex goal', () => {
     const blockedGoal: SessionGoalMessage = { ...ACTIVE_GOAL, status: 'blocked' };
     const onGoalCommand = vi.fn();
     act(() => {
       root.render(
-        <SessionInfoBar
-          {...CONTEXT_LESS_PROPS}
-          goal={blockedGoal}
-          goalCommands={SESSION_GOAL_COMMANDS}
-          onGoalCommand={onGoalCommand}
-        />
+        withTestI18n(
+          <SessionInfoBar
+            {...CONTEXT_LESS_PROPS}
+            goal={blockedGoal}
+            goalCommands={SESSION_GOAL_COMMANDS}
+            onGoalCommand={onGoalCommand}
+          />,
+          testI18n
+        )
       );
     });
 

@@ -43,6 +43,8 @@ export function makeDesktopLocalPairing(input: {
   current: () => Effect.Effect<LedgerView, unknown>
 }) {
   const pairingTable = input.journal === 'remote' ? 'remote_local_pairing' : 'local_pairing'
+  const archivedTable =
+    input.journal === 'remote' ? 'remote_archived_local_pairings' : 'archived_local_pairings'
   const retiredTable =
     input.journal === 'remote' ? 'retired_remote_local_pairings' : 'retired_local_pairings'
   function sql<A>(work: () => A) {
@@ -53,7 +55,13 @@ export function makeDesktopLocalPairing(input: {
         typeof error === 'object' &&
         'code' in error &&
         typeof error.code === 'string' &&
-        ['conflict', 'corrupt', 'invalid-input', 'local-evidence-conflict'].includes(error.code)
+        [
+          'conflict',
+          'corrupt',
+          'invalid-input',
+          'local-evidence-conflict',
+          'pairing_key_revoked'
+        ].includes(error.code)
           ? error
           : failure('storage', error)
     })
@@ -129,7 +137,9 @@ export function makeDesktopLocalPairing(input: {
     // The CLI uses prepareDeviceAdmission; this core gate independently checks
     // its possession proof, membership and the approver's current authority.
     const proposal = prepareLedgerCommand(view, input.signer.publicKey, command)
-    if (Result.isFailure(proposal)) throw failure('invalid-input')
+    // Core never readmits a key from device history: the machine must create a new identity.
+    if (Result.isFailure(proposal))
+      throw failure(proposal.failure.code === 'replay' ? 'pairing_key_revoked' : 'invalid-input')
     return {
       value,
       admitted: false,
@@ -330,16 +340,14 @@ export function makeDesktopLocalPairing(input: {
     yield* input.current()
     yield* sql(() => {
       input.db.exec(
-        'CREATE TABLE IF NOT EXISTS archived_local_pairings(reset_id TEXT PRIMARY KEY, session TEXT, material TEXT, request_id TEXT, record BLOB)'
+        `CREATE TABLE IF NOT EXISTS ${archivedTable}(reset_id TEXT PRIMARY KEY, session TEXT, material TEXT, request_id TEXT, record BLOB)`
       )
       input.db.exec('BEGIN IMMEDIATE')
       try {
-        if (
-          !input.db.prepare('SELECT 1 FROM archived_local_pairings WHERE reset_id=?').get(resetId)
-        ) {
+        if (!input.db.prepare(`SELECT 1 FROM ${archivedTable} WHERE reset_id=?`).get(resetId)) {
           const row = read()
           input.db
-            .prepare('INSERT INTO archived_local_pairings VALUES(?,?,?,?,?)')
+            .prepare(`INSERT INTO ${archivedTable} VALUES(?,?,?,?,?)`)
             .run(
               resetId,
               row?.session ?? null,
@@ -349,7 +357,7 @@ export function makeDesktopLocalPairing(input: {
             )
           input.db
             .prepare(
-              'UPDATE local_pairing SET session=?,material=NULL,request_id=NULL,record=NULL WHERE id=1'
+              `UPDATE ${pairingTable} SET session=?,material=NULL,request_id=NULL,record=NULL WHERE id=1`
             )
             .run(randomBytes(16).toString('hex'))
         }

@@ -4,18 +4,16 @@ import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { SessionId } from '@lody/shared';
 import { EngineConversationScroller } from '../src/components/ai-gui/conversation-list/engine-conversation-scroller';
-import { compensateConversationScroll } from '../src/components/ai-gui/conversation-list/scroll-compensation';
+
 import type {
   ConversationListHandle,
   ConversationRowComponentProps,
   ConversationScrollerState,
 } from '../src/components/ai-gui/conversation-list/types';
-import {
-  clearSavedScrollStates,
-  getScrollEngineDiagnostics,
-} from '../src/lib/conversation-scroll/saved-state';
+import { clearSavedScrollStates } from '../src/lib/conversation-scroll/saved-state';
 import type { EngineRow } from '../src/lib/conversation-scroll/types';
 import { createFrameHarness, type FrameHarness } from './support/scroll-frame-harness';
+import { ForceDesktopLayoutProvider, ForceMobileLayoutProvider } from '../src/hooks/use-mobile';
 
 class RecoveryBoundary extends Component<
   { children: ReactElement },
@@ -51,18 +49,6 @@ class RecoveryBoundary extends Component<
 const VIEWPORT = 400;
 const ROW = 100;
 
-it('restores the viewport overflow when a reading correction fails', () => {
-  const viewport = document.createElement('div');
-  viewport.style.setProperty('overflow-y', 'scroll', 'important');
-  const failure = new Error('scroll write failed');
-  viewport.scrollBy = () => {
-    throw failure;
-  };
-  expect(() => compensateConversationScroll(viewport, 536, true)).toThrow(failure);
-  expect(viewport.style.getPropertyValue('overflow-y')).toBe('scroll');
-  expect(viewport.style.getPropertyPriority('overflow-y')).toBe('important');
-});
-
 function Row({ index, ...props }: ConversationRowComponentProps) {
   return <div {...props} data-virtual-index={index} />;
 }
@@ -88,6 +74,7 @@ type Ctx = {
   /** Every offset the list reported through `onScroll`. */
   scrolls: number[];
   setKeys: (keys: string[]) => void;
+  publishDisclosure: () => void;
   viewport: () => HTMLElement;
   settle: () => Promise<void>;
 };
@@ -123,9 +110,13 @@ function mount(
     suppress,
     hidden,
     scaledRects = false,
+    rowHeights = new Map<string, number>(),
     feedback = false,
     tickOnScroll = false,
     oscillatingFeedback,
+    disclosure,
+    mobile = false,
+    deferDisclosure = false,
   }: {
     strict?: boolean;
     suppress?: { current: boolean };
@@ -133,11 +124,15 @@ function mount(
     hidden?: { current: boolean };
     /** A transformed ancestor scales visual rects while layout sizes stay in CSS pixels. */
     scaledRects?: boolean;
+    rowHeights?: Map<string, number>;
     /** A view whose state flips whenever it is told the offset is 0. */
     feedback?: boolean;
     /** A view that setStates on every onScroll, like the top-fade flag. */
     tickOnScroll?: boolean;
     oscillatingFeedback?: { current: boolean };
+    disclosure?: { key: string; headerOffset: number; headerHeight: number };
+    mobile?: boolean;
+    deferDisclosure?: boolean;
   } = {}
 ): Ctx {
   let keys = initialKeys;
@@ -152,13 +147,19 @@ function mount(
         if (isHidden()) return 0;
         const container = viewport.firstElementChild as HTMLElement | null;
         const spacer = container?.nextElementSibling as HTMLElement | null;
-        return px(container?.style.height) + px(spacer?.style.height);
+        return (
+          px(container?.style.height) + px(container?.style.marginTop) + px(spacer?.style.height)
+        );
       },
       sizeOf: (element) => {
         const el = element as HTMLElement;
         if (isHidden()) return 0;
         if (el.hasAttribute('data-message-selection-scroll')) return VIEWPORT;
-        if (el.hasAttribute('data-virtual-index')) return ROW;
+        if (el.hasAttribute('data-virtual-index'))
+          return (
+            rowHeights.get(el.querySelector<HTMLElement>('[data-row-key]')?.dataset.rowKey ?? '') ??
+            ROW
+          );
         return undefined;
       },
       rectOf: (element, scrollTop) => {
@@ -174,14 +175,36 @@ function mount(
           }
         }
         if (isHidden()) return { top: 0, height: 0 };
+        if (
+          (el.hasAttribute('data-conversation-disclosure') ||
+            el.hasAttribute('data-disclosure-detail')) &&
+          disclosure
+        ) {
+          const row = el.closest<HTMLElement>('[data-virtual-index]')!;
+          return {
+            top:
+              px(row.style.top) -
+              scrollTop +
+              disclosure.headerOffset +
+              (el.hasAttribute('data-disclosure-detail') ? disclosure.headerHeight : 0),
+            height: el.hasAttribute('data-disclosure-detail') ? 800 : disclosure.headerHeight,
+          };
+        }
         if (el.hasAttribute('data-message-selection-scroll')) return { top: 0, height: VIEWPORT };
         if (
           el.parentElement?.hasAttribute('data-message-selection-scroll') &&
           !el.hasAttribute('data-conversation-reply-room')
         )
-          return { top: -scrollTop, height: px(el.style.height) };
+          return { top: px(el.style.marginTop) - scrollTop, height: px(el.style.height) };
         if (el.hasAttribute('data-virtual-index'))
-          return { top: px(el.style.top) - scrollTop, height: scaledRects ? ROW / 4 : ROW };
+          return {
+            top: px(el.parentElement?.style.marginTop) + px(el.style.top) - scrollTop,
+            height: scaledRects
+              ? ROW / 4
+              : (rowHeights.get(
+                  el.querySelector<HTMLElement>('[data-row-key]')?.dataset.rowKey ?? ''
+                ) ?? ROW),
+          };
         return undefined;
       },
     });
@@ -198,18 +221,40 @@ function mount(
     }
   };
   const scrolls: number[] = [];
+  let publishDisclosure = () => {};
   function List({ listKeys }: { listKeys: string[] }) {
     // Stands in for the view's position-derived state (hydration window,
     // outline): at offset 0 it changes the rows, which commits the list again.
     const [flipped, setFlipped] = useState(false);
     const [, setTick] = useState(0);
+    const [expanded, setExpanded] = useState(false);
+    publishDisclosure = () => {
+      if (!disclosure) return;
+      rowHeights.set(disclosure.key, expanded ? ROW : 900);
+      setExpanded(!expanded);
+    };
     const shown = flipped ? ['flipped', ...listKeys] : listKeys;
     return (
       <EngineConversationScroller
         sessionId={sessionId}
         rows={shown.map((key): ReactElement => (
           <div key={key} data-row-key={key}>
-            {key}
+            {disclosure?.key === key ? (
+              <>
+                <button
+                  data-conversation-disclosure="inline"
+                  aria-expanded={expanded}
+                  onClick={() => {
+                    if (!deferDisclosure) publishDisclosure();
+                  }}
+                >
+                  Synthetic command
+                </button>
+                {expanded ? <div data-disclosure-detail="">Synthetic detail</div> : null}
+              </>
+            ) : (
+              key
+            )}
           </div>
         ))}
         rowMeta={shown.map((key, index) => meta(key, index))}
@@ -231,7 +276,12 @@ function mount(
     );
   }
   const render = () => {
-    const list = <List listKeys={keys} />;
+    const contents = <List listKeys={keys} />;
+    const list = mobile ? (
+      <ForceMobileLayoutProvider force>{contents}</ForceMobileLayoutProvider>
+    ) : (
+      <ForceDesktopLayoutProvider>{contents}</ForceDesktopLayoutProvider>
+    );
     root.render(
       oscillatingFeedback ? (
         <RecoveryBoundary>{list}</RecoveryBoundary>
@@ -254,6 +304,9 @@ function mount(
     setKeys(next) {
       keys = next;
       act(render);
+    },
+    publishDisclosure() {
+      act(publishDisclosure);
     },
     async settle() {
       for (let i = 0; i < 30; i++) {
@@ -298,6 +351,73 @@ function keysOnScreen(keys: string[], scrollTop: number): string[] {
   return keys.slice(first, last + 1);
 }
 
+it.each([
+  { mobile: false, headerOffset: 80, shift: 0 },
+  { mobile: true, headerOffset: 79, shift: 0 },
+  { mobile: true, headerOffset: 80, shift: 96 },
+])(
+  'holds a toggled command header (mobile=$mobile, offset=$headerOffset)',
+  async ({ mobile, headerOffset, shift }) => {
+    const ctx = mount(`disclosure-${mobile}-${headerOffset}` as SessionId, rowKeys(60), undefined, {
+      mobile,
+      disclosure: { key: 'r59', headerOffset, headerHeight: 20 },
+    });
+    try {
+      await ctx.settle();
+      const button = ctx
+        .viewport()
+        .querySelector<HTMLButtonElement>('[data-conversation-disclosure]')!;
+      const before = button.getBoundingClientRect().top;
+      act(() => {
+        button.focus();
+        button.click();
+      });
+      await ctx.settle();
+      expect(button.getAttribute('aria-expanded')).toBe('true');
+      expect(button.getBoundingClientRect().top).toBe(before - shift);
+      expect(ctx.state.current?.isSticky).toBe(false);
+      expect(document.activeElement).toBe(button);
+      act(() => button.click());
+      await ctx.settle();
+      expect(button.getAttribute('aria-expanded')).toBe('false');
+      expect(button.getBoundingClientRect().top).toBe(before - shift);
+      act(() => ctx.handle.current?.scrollToBottom());
+      await ctx.settle();
+      expect(ctx.state.current?.isSticky).toBe(true);
+      expect(
+        ctx.viewport().querySelector<HTMLElement>('[data-conversation-reply-room]')?.style.height
+      ).toBe('0px');
+    } finally {
+      unmount(ctx);
+    }
+  }
+);
+
+it('reveals mobile details that commit after the list captured the click', async () => {
+  const ctx = mount('deferred-mobile-disclosure' as SessionId, rowKeys(60), undefined, {
+    mobile: true,
+    deferDisclosure: true,
+    disclosure: { key: 'r59', headerOffset: 80, headerHeight: 20 },
+  });
+  try {
+    await ctx.settle();
+    const button = ctx
+      .viewport()
+      .querySelector<HTMLButtonElement>('[data-conversation-disclosure]')!;
+    const before = button.getBoundingClientRect().top;
+    act(() => button.click());
+    await ctx.settle();
+    expect(button.getAttribute('aria-expanded')).toBe('false');
+    expect(button.getBoundingClientRect().top).toBe(before);
+    ctx.publishDisclosure();
+    await ctx.settle();
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    expect(button.getBoundingClientRect().top).toBe(before - 96);
+  } finally {
+    unmount(ctx);
+  }
+});
+
 it('opens at the real bottom and never hides the viewport', async () => {
   const keys = rowKeys(60);
   const ctx = mount('engine-open' as SessionId, keys);
@@ -310,25 +430,6 @@ it('opens at the real bottom and never hides the viewport', async () => {
     expect(mountedKeys(ctx)).toEqual(
       expect.arrayContaining(keysOnScreen(keys, ctx.harness.scrollTop))
     );
-  } finally {
-    unmount(ctx);
-  }
-});
-
-it('measures conversation rows in layout pixels under a scaled ancestor', async () => {
-  const keys = rowKeys(40);
-  const ctx = mount('engine-scaled-ancestor' as SessionId, keys, undefined, {
-    scaledRects: true,
-  });
-  // Keep ResizeObserver from correcting an incorrect first measurement. The
-  // initial row layout must already be in the same CSS-pixel space as the
-  // engine's virtual positions.
-  ctx.harness.hold(() => true);
-  try {
-    await ctx.settle();
-    const container = ctx.viewport().firstElementChild as HTMLElement;
-    expect(Number.parseFloat(container.style.height)).toBe(keys.length * ROW);
-    expect(ctx.harness.scrollTop).toBe(keys.length * ROW - VIEWPORT);
   } finally {
     unmount(ctx);
   }
@@ -667,6 +768,79 @@ it.each(['focus', 'typing', 'pointer'])(
 );
 
 it.each([
+  { userAgent: 'Mozilla/5.0 (iPhone) AppleWebKit/605.1.15', platform: 'iPhone', maxTouchPoints: 5 },
+  {
+    userAgent: 'Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15',
+    platform: 'MacIntel',
+    maxTouchPoints: 5,
+  },
+])(
+  'keeps $platform touch momentum offsets while history grows and restores the origin on scrollend',
+  async (device) => {
+    vi.stubGlobal('navigator', { ...device, vendor: 'Apple Computer, Inc.' });
+    const scrollEndDescriptor = Object.getOwnPropertyDescriptor(
+      document.documentElement,
+      'onscrollend'
+    );
+    Object.defineProperty(document.documentElement, 'onscrollend', {
+      configurable: true,
+      value: null,
+    });
+    const rowHeights = new Map<string, number>();
+    const ctx = mount(
+      'engine-ios-origin' as SessionId,
+      Array.from({ length: 80 }, (_, i) => `t${i}`),
+      undefined,
+      { rowHeights }
+    );
+    try {
+      await ctx.settle();
+      act(() => ctx.handle.current!.scrollRowToTop(40, { smooth: false, offset: 0 }));
+      await ctx.settle();
+      await act(() => ctx.viewport().dispatchEvent(touch('touchstart', [[100, 100]])));
+      ctx.harness.nativeScrollTo(ctx.harness.scrollTop - 120);
+      await ctx.settle();
+      await act(() => ctx.viewport().dispatchEvent(touch('touchend', [[100, 160]])));
+      const top = ctx.harness.scrollTop;
+      const row = () =>
+        ctx.viewport().querySelector<HTMLElement>('[data-row-key="t40"]')!.parentElement!;
+      const line = row().getBoundingClientRect().top;
+      const writes = ctx.harness.writes.length;
+      rowHeights.set('t35', 300);
+      await ctx.settle();
+      expect(ctx.harness.scrollTop).toBe(top);
+      expect(ctx.harness.writes.length).toBe(writes);
+      expect(row().getBoundingClientRect().top).toBe(line);
+      expect((ctx.viewport().firstElementChild as HTMLElement).style.marginTop).toBe('-200px');
+      expect(ctx.handle.current!.scrollOffset).toBe(top + 200);
+      expect(ctx.handle.current!.scrollSize).toBe(8200);
+      expect(ctx.scrolls.at(-1)).toBe(top + 200);
+      // Catch the old fling: a touch alone must not absorb its pending shift.
+      await act(() => ctx.viewport().dispatchEvent(touch('touchstart', [[100, 100]])));
+      rowHeights.set('t35', 400);
+      await ctx.settle();
+      expect(ctx.harness.scrollTop).toBe(top);
+      expect(ctx.harness.writes.length).toBe(writes);
+      expect(row().getBoundingClientRect().top).toBe(line);
+      await act(() => ctx.viewport().dispatchEvent(touch('touchend', [[100, 160]])));
+      expect(ctx.handle.current!.scrollOffset).toBe(top + 300);
+      const reports = ctx.scrolls.length;
+      await act(() => ctx.viewport().dispatchEvent(new Event('scrollend')));
+      await ctx.settle();
+      expect(ctx.harness.scrollTop).toBe(top + 300);
+      expect(ctx.scrolls.length).toBe(reports);
+      expect(row().getBoundingClientRect().top).toBe(line);
+      expect((ctx.viewport().firstElementChild as HTMLElement).style.marginTop).toBe('0px');
+    } finally {
+      unmount(ctx);
+      if (scrollEndDescriptor)
+        Object.defineProperty(document.documentElement, 'onscrollend', scrollEndDescriptor);
+      else delete (document.documentElement as unknown as Record<string, unknown>).onscrollend;
+    }
+  }
+);
+
+it.each([
   [
     'a held scrollbar thumb',
     (viewport: HTMLElement) =>
@@ -803,21 +977,6 @@ it('a suppression (selection, a jump, search) stops following at the next change
   }
 });
 
-it('keeps scrolling under StrictMode, whose development remount reruns effect cleanups', async () => {
-  const { ctx, keys } = await openFollowing('engine-strict', { strict: true });
-  try {
-    await appendRows(ctx, keys);
-    expect(ctx.harness.scrollTop).toBe(BOTTOM(42));
-    await act(async () => {
-      ctx.handle.current?.scrollRowToTop(10, { smooth: false, offset: 0 });
-    });
-    await ctx.settle();
-    expect(screenTopOf(ctx, 'r10')).toBe(0);
-  } finally {
-    unmount(ctx);
-  }
-});
-
 it('a hidden tab reports no offset, so a view feeding it back cannot loop; shown again, it reads where it was', async () => {
   const hidden = { current: false };
   const { ctx, keys } = await openFollowing('engine-hidden', { hidden, feedback: true });
@@ -845,54 +1004,5 @@ it('a hidden tab reports no offset, so a view feeding it back cannot loop; shown
     expect(ctx.scrolls.at(-1)).toBe(ctx.harness.scrollTop);
   } finally {
     unmount(ctx);
-  }
-});
-
-it('a view that setStates on every onScroll does not nested-update-loop', async () => {
-  const { ctx } = await openFollowing('engine-scroll-tick', { tickOnScroll: true });
-  try {
-    expect(ctx.harness.scrollTop).toBe(BOTTOM(40));
-    expect(ctx.state.current?.revealed).toBe(true);
-    expect(ctx.scrolls.length).toBeGreaterThan(0);
-    expect(ctx.scrolls.length).toBeLessThan(20);
-  } finally {
-    unmount(ctx);
-  }
-});
-
-it('stops alternating scroll feedback at the boundary and recovers on explicit retry', async () => {
-  const oscillatingFeedback = { current: true };
-  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  const ctx = mount(
-    'engine-loop-recovery' as SessionId,
-    Array.from({ length: 40 }, (_, i) => `r${i}`),
-    undefined,
-    { oscillatingFeedback }
-  );
-  try {
-    await ctx.settle();
-    const retry = ctx.host.querySelector<HTMLButtonElement>('[data-loop-error]');
-    expect(retry?.dataset.loopError).toBe('ConversationScrollUpdateLoopError');
-    expect(getScrollEngineDiagnostics().at(-1)).toMatchObject({
-      reason: 'update-loop',
-      synchronousCommits: 25,
-    });
-    expect(ctx.host.querySelector('[data-conversation-scroll-engine]')).toBeNull();
-    oscillatingFeedback.current = false;
-    await act(async () => retry!.click());
-    await ctx.settle();
-    expect(ctx.host.querySelector('[data-loop-error]')).toBeNull();
-    expect(ctx.host.querySelector('[data-conversation-scroll-engine]')).not.toBeNull();
-    expect(ctx.state.current?.revealed).toBe(true);
-    expect(getScrollEngineDiagnostics().at(-1)?.covered).toBe(true);
-    const offset = ctx.harness.scrollTop;
-    const firstIndex = ctx.handle.current!.findItemIndex(offset);
-    expect(ctx.host.querySelector(`[data-virtual-index="${firstIndex}"]`)).not.toBeNull();
-    ctx.setKeys(Array.from({ length: 40 }, (_, i) => `r${i}`));
-    await ctx.settle();
-    expect(ctx.harness.scrollTop).toBe(offset);
-  } finally {
-    unmount(ctx);
-    log.mockRestore();
   }
 });

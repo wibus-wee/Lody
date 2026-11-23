@@ -7,13 +7,17 @@
 
 **Before dispatch/sync read context/message-flow.md; before catalog/Fleet changes read [E2EE rules](e2ee/AGENTS.md).** WS/DO is deprecated; do not extend it.
 
+Credential JSON publication creates an exclusive 0600 temporary file and atomically
+replaces its destination on POSIX. New state roots use 0700; existing custom
+directories keep their permissions. Windows retains direct file writes.
+
 ## Composition and transports
 
+- `session-command-environment.ts` `resolveDaemonTarget` is the sole binding and local-authority gate for daemon-hosted commands (`sameReplica`, `localHost`, `authority`, `nativeOwnerAccess`): bound ordinary daemon owners act on same-machine Sessions locally, while other accounts, remote targets, and `revoked`/`unauthorized`/`unknown` daemon states require cloud checks or fail closed.
+
 - Daemon commands borrow its replica; command cleanup failures never fence.
-- GitHub auth: conversation-owner personal → matching-owner machine → repo App,
-  once per source. Failures advance without a policy RPC; local context grants
-  machine eligibility. Never persist managed tokens or replay uncertain writes.
-  Checkout/LFS share the pinned helper context. Contract: [identity fallback](../../../../specs/github-identity-fallback.md).
+- Before changing GitHub authentication or agent PATH merging, read the
+  [credential broker rules](../session/worktree/AGENTS.md#git-credential-broker).
 
 - `cloud-cli-port.ts` is the sole official-build composition root for cloud clients and
   endpoint-derived adapters. Daemon runtime modules must not construct cloud SDK
@@ -22,6 +26,9 @@
   fail at their public boundary, and only contractually
   best-effort background effects may skip. Both halves are enforced by
   `scripts/check-platform-boundaries.mjs` + `tests/local-platform-zero-cloud.test.ts`.
+- A `--paired-workspace` machine port reads only its own workspace plan, with its device
+  credential (`e2eeMachinePairing.workspaceEntitlement`), for the cooperative quotas;
+  it never borrows an account API key.
 - Client-visible RPC references come from public `@lody/cloud-api`; generated server
   declarations and private workspace packages are forbidden. Prime the token provider
   before reading `getGatewayBaseUrl()`, and never let runtime transports or Machine RPC
@@ -47,8 +54,21 @@
   Local dispatch triggers off the renderer-authored `latestUserMsgId` doc-meta write
   plus the local Machine RPC fast path.
 
-- INVARIANT: agent PATH merges keep the session's `gh` shim dir first
-  ([note](../../../../.agents/notes/implemented/bug-fix/2026-09-26-gh-shim-broker-and-path.md)).
+## Encrypted workspace catalog
+
+- `local-workspace-catalog.ts` keeps encrypted discovery in account/machine-bound
+  `workspace-catalog.json.e2ee`, ordinary rows only in v1 `workspaces`; lock both writes.
+  Ordinary-only mutations never rewrite encrypted rows. Old v1 writers cannot erase
+  the sidecar or account/machine-bound `.e2ee-invalid` marker.
+- A failing workspace list detaches encrypted runtimes only on explicit refusal or revocation, or after 24 unconfirmed hours until reconfirmed.
+- Offline/ordinary writes never replace unreadable sidecars. Only authenticated online-list
+  reconciliation may archive a corrupt `.e2ee` file before rebuilding; permission and marker
+  errors stay errors. Retain originals, failure receipts and usable ordinary rows.
+  Persist ordinary remote-list results; return degraded receipts with current auth/revocation
+  checks. Atomically publish `.e2ee-invalid` BEFORE encrypted updates; retain through failed
+  writes/cleanup until healthy publication. Derive unavailable from the marker, never unknown
+  v1 fields; stale sidecars cannot bootstrap. Fleet keeps scoped recoverable issues, bounded
+  retries and pending signature until healthy receipt.
 
 ## Local Loro data plane
 
@@ -59,11 +79,20 @@ writing machine Flock rows, or reacting to reconnection. Before changing
 `LoroDocumentManager` options, scheduler and bulk-writer limits, sender-enforced
 framing, the RAW-chunk `createJsonLineSplitter` requirement, renderer room lifetime.
 The room engine remains explicitly Legacy; outbound work uses the single native
-process writer facade, and cleanup awaits its release receipt. Two are never negotiable: a renderer joining a Session Doc room must not call
+process writer facade, and cleanup awaits its release receipt. Workspace engines share that
+writer, so Fleet shutdown closes it only after every workspace runtime and data-plane
+connection owner has released, and a retained failed owner keeps it open for recovery
+([ordering](../../../../.agents/notes/implemented/architecture/2026-10-12-effect-local-presence-writer.md)).
+Two are never negotiable: a renderer joining a Session Doc room must not call
 `getOrCreateSessionDoc` or retain a live cloud room, and the CLI's cloud room status is
 never pushed to renderers as local room health.
 
 ## Sessions and turns
+
+- Manual terminal PTYs belong to Fleet, not the agent runtime. Agent termination,
+  cancellation, and idle or memory-pressure GC must preserve them. Close them on
+  explicit terminal close, conversation archive/delete, or Fleet shutdown. ACP
+  agent-owned terminals retain their separate execution lifecycle.
 
 - `session-gc-manager.ts`: `evaluateMemoryPressure` returns TWO verdicts, `evict` and
   `block`, sharing no threshold. Probes fail OPEN; `null` Windows commit growth
@@ -74,10 +103,19 @@ never pushed to renderers as local room health.
   native work: never clean `running`, cap background waits. Post-turn output resets
   it only for `sessionActivity` agents.
   Eligibility read failures retain only that session; foreground reclamation waits at most 10s.
+  Candidates include every cached Session doc (`combineGCSessionSources`): an untracked
+  doc idles from its last hand-out, unloads with status preserved, and GC checks peek
+  rather than open it. A Loro heap past 3 GiB shortens the idle timeout until restart.
 - **Session attachments**: before changing preparation, transfer, materialization,
   or backfill, read the [lifecycle rules](../../../../.agents/docs/cli-lib-session-files.md).
   CLI/MCP input preparation must finish before history/dispatch; recovery uses frozen
   references, never source paths. [Input contract](../../../../specs/cli-session-attachments.md).
+  Local attachments carry machine-local paths. Prepare generated bytes through local control; authorize actual reads against the machine owner or the existing workspace-contained file RPC. A payload path is never a remote file-read grant.
+  Local images use source paths and upload receipts;
+  retain their local identity after upload for frozen inputs and offline reads.
+  Reconcile durable image receipts into history items, stored input blocks, and
+  queued configs, including references arriving after the upload completes.
+  Never enroll existing `local_attachment` references in image backfill.
   Keep ACP `resource_link` file URIs, workspace-contained agent output, and
   MessageHandler-owned authorization-generation/AbortController backfill fencing.
 - [acp/AGENTS.md](acp/AGENTS.md) specifies ACP buffering/flush in `message-handler.ts`,

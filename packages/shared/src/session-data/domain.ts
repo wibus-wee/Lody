@@ -47,9 +47,12 @@ export type SessionTurn = {
   readonly modelInfo?: ModelInfo;
   readonly tokenUsage?: SessionTurnTokenUsage;
   readonly scheduleRun?: unknown;
+  readonly derivedFrom?: unknown;
+  readonly queuedInput?: boolean;
+  readonly e2eeIntent?: string;
   readonly fileDiff?: readonly unknown[];
   readonly status?: SessionTurnStatus;
-  readonly cancellationReason?: 'user_stop';
+  readonly cancellationReason?: 'user_stop' | 'machine_update';
   readonly inputConfig?: unknown;
   readonly startedAt?: number;
   readonly endedAt?: number;
@@ -75,7 +78,7 @@ export interface SessionTurnWritableValues {
   tokenUsage: SessionTurnTokenUsage | undefined;
   fileDiff: readonly unknown[] | undefined;
   status: SessionTurnStatus | undefined;
-  cancellationReason: 'user_stop' | undefined;
+  cancellationReason: 'user_stop' | 'machine_update' | undefined;
   inputConfig: unknown;
   startedAt: number | undefined;
   endedAt: number | undefined;
@@ -99,6 +102,8 @@ export type SessionTurnRead =
 
 /** A shallow directory row: identity and state without the turn body. */
 export type SessionDirectoryRow = {
+  /** Marks a complete v1 attribution/config/schedule projection. */
+  readonly metadataVersion?: 1;
   readonly position: number;
   readonly state: 'ready' | 'invalid' | 'missing' | 'unavailable';
   /** Business id when the slot declares one; absent for invalid/unknown slots. */
@@ -115,6 +120,8 @@ export type SessionDirectoryRow = {
    * the body is hydrated.
    */
   readonly inputConfig?: unknown;
+  readonly userId?: string;
+  readonly scheduleRun?: unknown;
   /** Item / plan counts when cheaply available; omitted rather than guessed. */
   readonly itemCount?: number;
   readonly planCount?: number;
@@ -128,7 +135,7 @@ export type SessionDirectoryScalars = {
   readonly status?: SessionTurnStatus;
   /** Legacy dispatch eligibility, read without materializing the body. */
   readonly read?: boolean;
-  readonly cancellationReason?: 'user_stop';
+  readonly cancellationReason?: 'user_stop' | 'machine_update';
   readonly finished?: boolean;
   readonly endedAt?: number;
   readonly sendStatus?: 'timeout';
@@ -137,6 +144,10 @@ export type SessionDirectoryScalars = {
   readonly startedAt?: number;
   readonly permissionWaitMs?: number;
 };
+
+/** Detached identity, state and configuration fields. */
+export type SessionHistoryMetadata = SessionDirectoryScalars &
+  Pick<SessionTurn, 'userId' | 'scheduleRun'> & { readonly inputConfig?: SessionTurnInputConfig };
 
 /**
  * The body-independent send-config keys a directory row may carry. Kept here so

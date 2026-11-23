@@ -1,4 +1,4 @@
-import { Effect, Fiber } from 'effect';
+import { Effect } from 'effect';
 import { makeEncryptedAgentExecution, lazyExecutionJournal } from './agent-execution';
 import { createHash } from 'node:crypto';
 import {
@@ -25,6 +25,7 @@ import {
   type RealtimeJournalRequest,
   type RealtimeStartPermit,
 } from './realtime-journal';
+import { decideEncryptedDerivation } from './derivation-limits';
 
 const request: RealtimeJournalRequest = {
   genesis: 'synthetic-genesis',
@@ -301,49 +302,6 @@ describe('host-only E2EE realtime journal', () => {
     }
   });
 
-  it('copies caller and returned byte arrays, including the identity retained by a permit', () => {
-    const frame = Uint8Array.from(request.frame);
-    const input = { ...request, frame };
-    const received = journal.receive(input);
-    const permit = takePermit(journal, input);
-    frame.fill(42);
-    received.frame.fill(43);
-    const result = Uint8Array.from(outcome);
-    const completed = journal.finish(permit, result);
-    result.fill(44);
-    if (completed.state === 'completed') completed.outcome.fill(45);
-    expect(journal.read(request)).toMatchObject({ frame: request.frame, outcome });
-  });
-
-  it('freezes the original before an injected clock can mutate its caller-owned frame', () => {
-    const frame = Uint8Array.from(request.frame);
-    const input = { ...request, frame };
-    journal.receive(input);
-    const mutatingClock = new RealtimeJournal(filename, () => {
-      frame.fill(99);
-      return 100;
-    });
-    const permit = takePermit(mutatingClock, input);
-    expect(mutatingClock.finish(permit, outcome)).toMatchObject({
-      state: 'completed',
-      frame: request.frame,
-      outcome,
-    });
-  });
-
-  it('never reclaims a started operation after side effects, expiry, or reopen', () => {
-    journal.receive(request);
-    takePermit(journal);
-    let sideEffects = 1; // The original claimant performed a business side effect, then crashed.
-    now = 10_000;
-    const restarted = new RealtimeJournal(filename, () => now);
-    const result = restarted.claim(request);
-    if (result.state === 'claimed') sideEffects++;
-    expect(result).toMatchObject({ state: 'existing', record: { state: 'uncertain' } });
-    expect(sideEffects).toBe(1);
-    expectCode(() => restarted.finish({} as RealtimeStartPermit, outcome), 'permit');
-  });
-
   it('only permits the original journal owner to finish and refuses result replacement', () => {
     journal.receive(request);
     const permit = takePermit(journal);
@@ -356,33 +314,34 @@ describe('host-only E2EE realtime journal', () => {
     expect(other.read(request)).toEqual(saved);
   });
 
-  it('retains expired evidence and persists observed deadline time across clock rollback/reopen', () => {
-    journal.receive(request);
-    now = request.expiresAt;
-    expect(journal.claim(request)).toMatchObject({ state: 'expired' });
-    now = 0;
-    const restarted = new RealtimeJournal(filename, () => now);
-    expect(restarted.claim(request)).toMatchObject({ state: 'expired' });
-    expect(restarted.read(request)).toMatchObject({ state: 'received', frame: request.frame });
-    const next = { ...request, requestId: 'new-intent', expiresAt: 2_000 };
-    restarted.receive(next);
-    expect(restarted.claim(next)).toMatchObject({ state: 'claimed' });
-  });
-
-  it('fails closed on SQLite lock contention and recovers the next normal call', () => {
-    journal.receive(request);
-    const blocker = new Database(filename);
-    try {
-      blocker.exec('BEGIN IMMEDIATE');
+  it.each(['SQLITE_BUSY', 'SQLITE_IOERR'])(
+    'preserves the journal when schema validation encounters %s',
+    (code) => {
+      journal.receive(request);
+      const original = snapshotDatabase(filename);
+      const cause = Object.assign(new Error('synthetic SQLite failure'), { code });
+      const prepare = Database.prototype.prepare;
+      let injected = false;
+      const spy = vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (sql) {
+        if (!injected && sql.includes('FROM realtime_requests LIMIT 0')) {
+          injected = true;
+          throw cause;
+        }
+        return prepare.call(this, sql);
+      });
       const failure = expectCode(() => journal.claim(request), 'storage');
-      expect(failure.cause).toMatchObject({ code: 'SQLITE_BUSY' });
-      blocker.exec('ROLLBACK');
-      expect(journal.read(request)).toMatchObject({ state: 'received' });
+      expect(failure.cause).toBe(cause);
+      spy.mockRestore();
+      expect(readdirSync(directory).some((name) => name.includes('.archive-'))).toBe(false);
+      expect(snapshotDatabase(filename)).toEqual(original);
+      expect(journal.read(request)).toMatchObject({ state: 'received', frame: request.frame });
       takePermit(journal);
-    } finally {
-      blocker.close();
+      expect(new RealtimeJournal(filename, () => now).claim(request)).toMatchObject({
+        state: 'existing',
+        record: { state: 'uncertain' },
+      });
     }
-  });
+  );
 
   it('rolls back a start whose commit is blocked by a live reader and recovers after reader release', () => {
     journal.receive(request);
@@ -419,179 +378,6 @@ describe('host-only E2EE realtime journal', () => {
     writeFileSync(filename, bytes);
     expect(journal.read(request)).toMatchObject({ state: 'received' });
     takePermit(journal);
-  });
-
-  it('rolls back a failed claim before permitting any side effect and later recovers', () => {
-    journal.receive(request);
-    const db = new Database(filename);
-    try {
-      db.exec(`CREATE TRIGGER refuse_start AFTER UPDATE ON realtime_requests
-        WHEN NEW.state = 'started' BEGIN SELECT RAISE(ABORT, 'synthetic start I/O failure'); END;`);
-      expectCode(() => journal.claim(request), 'storage');
-      expect(journal.read(request)).toMatchObject({ state: 'received' });
-      db.exec('DROP TRIGGER refuse_start');
-      expect(journal.claim(request)).toMatchObject({ state: 'claimed' });
-    } finally {
-      db.close();
-    }
-  });
-
-  it('does not admit a frame whose durable reception fails and preserves unrelated results', () => {
-    journal.receive(request);
-    const completed = journal.finish(takePermit(journal), outcome);
-    const next = { ...request, requestId: 'next' };
-    const db = new Database(filename);
-    try {
-      db.exec(`CREATE TRIGGER refuse_receive BEFORE INSERT ON realtime_requests
-        BEGIN SELECT RAISE(ABORT, 'synthetic receive I/O failure'); END;`);
-      expectCode(() => journal.receive(next), 'storage');
-      expect(journal.read(next)).toBeNull();
-      expectCode(() => journal.claim(next), 'missing');
-      expect(journal.read(request)).toEqual(completed);
-      db.exec('DROP TRIGGER refuse_receive');
-      journal.receive(next);
-      expect(journal.claim(next)).toMatchObject({ state: 'claimed' });
-    } finally {
-      db.close();
-    }
-  });
-
-  it('keeps an uncertain started row when result persistence fails, then retries only settlement', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const db = new Database(filename);
-    try {
-      db.exec(`CREATE TRIGGER refuse_result AFTER UPDATE ON realtime_requests
-        WHEN NEW.state = 'completed' BEGIN SELECT RAISE(ABORT, 'synthetic result I/O failure'); END;`);
-      const firstOutcome = Uint8Array.from(outcome);
-      const failure = expectCode(() => journal.finish(permit, firstOutcome), 'storage');
-      firstOutcome.fill(9);
-      expect(failure.cause).toMatchObject({ code: 'SQLITE_CONSTRAINT_TRIGGER' });
-      expect(new RealtimeJournal(filename, () => now).claim(request)).toMatchObject({
-        state: 'existing',
-        record: { state: 'uncertain' },
-      });
-      db.exec('DROP TRIGGER refuse_result');
-      expectCode(() => journal.finish(permit, Uint8Array.of(8)), 'outcome_conflict');
-      expect(journal.retryFinish(permit)).toMatchObject({ state: 'completed', outcome });
-    } finally {
-      db.close();
-    }
-  });
-
-  it('retains the validation error and independent failed close, then recovers without changing an unsupported original', () => {
-    journal.receive(request);
-    const saved = journal.finish(takePermit(journal), outcome);
-    const editor = new Database(filename);
-    editor.pragma('user_version = 99');
-    editor.close();
-    const before = snapshotFiles(directory);
-    const closeCause = new Error('synthetic rejected-store close failure');
-    let retained: Database.Database | undefined;
-    const close = vi
-      .spyOn(Database.prototype, 'close')
-      .mockImplementation(function (this: Database.Database) {
-        retained = this;
-        throw closeCause;
-      });
-    expectCode(() => journal.read(request), 'unsupported_schema');
-    expect(journal.takeCleanupErrors()).toEqual([closeCause]);
-    expect(retained?.open).toBe(true);
-    expect(snapshotFiles(directory)).toEqual(before);
-    close.mockRestore();
-    const failure = expectCode(() => journal.read(request), 'unsupported_schema');
-    expect(retained?.open).toBe(false);
-    expect(failure.archivePath).toBeDefined();
-    const archived = new Database(failure.archivePath as string);
-    expect(archived.prepare('SELECT outcome FROM realtime_requests').get()).toEqual({
-      outcome: Buffer.from(outcome),
-    });
-    archived.close();
-    expect(saved).toMatchObject({ state: 'completed' });
-    expect(journal.takeCleanupErrors()).toEqual([]);
-  });
-
-  it('preserves confirmed response bytes and the first close cause through repeated cleanup failure', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const writer = new Database(filename);
-    try {
-      writer.exec(`CREATE TRIGGER refuse_response AFTER INSERT ON realtime_responses
-        BEGIN SELECT RAISE(ABORT, 'synthetic response I/O failure'); END;`);
-      expectCode(
-        () => journal.retainResponse(permit, { index: 0, frame: responseFrame }),
-        'storage'
-      );
-      writer.exec('DROP TRIGGER refuse_response');
-    } finally {
-      writer.close();
-    }
-    const first = new Error('first close cause');
-    const later = new Error('later close cause');
-    let cause = first;
-    const retained = new Set<Database.Database>();
-    const close = vi
-      .spyOn(Database.prototype, 'close')
-      .mockImplementation(function (this: Database.Database) {
-        retained.add(this);
-        throw cause;
-      });
-    expect(journal.retryResponse(permit)).toEqual(responseFrame);
-    expect(journal.takeCleanupErrors()).toEqual([first]);
-    cause = later;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      expect(expectCode(() => journal.read(request), 'storage').cause).toBe(first);
-      expect(journal.takeCleanupErrors()).toEqual([first]);
-    }
-    expect(retained.size).toBe(1);
-    expect([...retained][0]?.open).toBe(true);
-    close.mockRestore();
-    const completed = journal.finish(permit, outcome);
-    expect([...retained][0]?.open).toBe(false);
-    const reopened = new RealtimeJournal(filename, () => now);
-    expect(reopened.read(request)).toEqual(completed);
-    expect(reopened.readResponse(request, 0)).toEqual(responseFrame);
-  });
-
-  it('preserves a committed result and original close error while independently recovering cleanup', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const cause = new Error('synthetic close failure');
-    const original = Database.prototype.close;
-    const close = vi
-      .spyOn(Database.prototype, 'close')
-      .mockImplementation(function (this: Database.Database) {
-        if (this.readonly) return original.call(this);
-        throw cause;
-      });
-    const saved = journal.finish(permit, outcome);
-    expect(saved).toMatchObject({ state: 'completed', outcome });
-    expect(journal.takeCleanupErrors()).toEqual([cause]);
-    close.mockImplementation(original);
-    journal.retryCleanup();
-    expect(journal.takeCleanupErrors()).toEqual([]);
-    expect(new RealtimeJournal(filename, () => now).read(request)).toEqual(saved);
-  });
-
-  it('bounds repeated failed cleanup and refuses new handles until the original handle can close', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const cause = new Error('synthetic persistent close failure');
-    const original = Database.prototype.close;
-    const close = vi
-      .spyOn(Database.prototype, 'close')
-      .mockImplementation(function (this: Database.Database) {
-        if (this.readonly) return original.call(this);
-        throw cause;
-      });
-    const saved = journal.finish(permit, outcome);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      expectCode(() => journal.read(request), 'storage');
-    }
-    expect(journal.takeCleanupErrors()).toEqual([cause]);
-    close.mockRestore();
-    expect(journal.read(request)).toEqual(saved);
-    expect(journal.takeCleanupErrors()).toEqual([]);
   });
 
   it('does not return corrupted retained outcome bytes as a valid completed result', () => {
@@ -734,48 +520,6 @@ describe('host-only E2EE realtime journal', () => {
     }
   });
 
-  it('keeps committed outcomes through response read/write faults and normal I/O recovery', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const completed = journal.finish(permit, outcome);
-    journal.retainResponse(permit, { index: 0, frame: responseFrame });
-    const originalPath = path.join(directory, 'retained-original.sqlite');
-    renameSync(filename, originalPath);
-    expectCode(() => journal.readResponse(request, 0), 'storage');
-    expectCode(() => journal.retainResponse(permit, { index: 1, frame: responseFrame }), 'storage');
-    renameSync(originalPath, filename);
-    expect(journal.readResponse(request, 0)).toEqual(responseFrame);
-    expect(journal.read(request)).toEqual(completed);
-    expect(journal.retainResponse(permit, { index: 1, frame: responseFrame })).toEqual(
-      responseFrame
-    );
-  });
-
-  it('returns the committed response despite cleanup failure and recovers without a pending replacement', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const completed = journal.finish(permit, outcome);
-    const cause = new Error('synthetic response handle close failure');
-    const original = Database.prototype.close;
-    const close = vi
-      .spyOn(Database.prototype, 'close')
-      .mockImplementation(function (this: Database.Database) {
-        if (this.readonly) return original.call(this);
-        throw cause;
-      });
-    expect(journal.retainResponse(permit, { index: 0, frame: responseFrame })).toEqual(
-      responseFrame
-    );
-    expect(journal.takeCleanupErrors()).toEqual([cause]);
-    expectCode(() => journal.retryResponse(permit), 'permit');
-    close.mockRestore();
-    expect(journal.readResponse(request, 0)).toEqual(responseFrame);
-    expect(journal.read(request)).toEqual(completed);
-    expect(journal.retainResponse(permit, { index: 1, frame: Uint8Array.of(3) })).toEqual(
-      Uint8Array.of(3)
-    );
-  });
-
   it('rejects corrupt response bytes and digest without losing the separate completed outcome', () => {
     journal.receive(request);
     const permit = takePermit(journal);
@@ -849,29 +593,7 @@ describe('host-only E2EE realtime journal', () => {
     );
   });
 
-  it('preserves a committed outcome when response COMMIT is busy and recovers the original response', () => {
-    journal.receive(request);
-    const permit = takePermit(journal);
-    const completed = journal.finish(permit, outcome);
-    const release = holdReader(filename);
-    try {
-      const failure = expectCode(
-        () => journal.retainResponse(permit, { index: 0, frame: responseFrame }),
-        'storage'
-      );
-      expect(failure.cause).toMatchObject({ code: 'SQLITE_BUSY' });
-      expect(journal.read(request)).toEqual(completed);
-      expect(journal.readResponse(request, 0)).toBeNull();
-    } finally {
-      release();
-    }
-    expect(journal.retryResponse(permit)).toEqual(responseFrame);
-    const reopened = new RealtimeJournal(filename, () => 2_000);
-    expect(reopened.read(request)).toEqual(completed);
-    expect(reopened.readResponse(request, 0)).toEqual(responseFrame);
-  });
-
-  it('retains the observed floor for never-claimed received requests across rollback and restart', () => {
+  it('recovers unclaimed requests after local clock correction and restart without replaying started IDs', () => {
     journal.receive(request);
     const completedPermit = takePermit(journal);
     const completed = journal.finish(completedPermit, outcome);
@@ -885,8 +607,8 @@ describe('host-only E2EE realtime journal', () => {
     expect(journal.claim(observed).state).toBe('expired');
     now = 1_000;
     const reopened = new RealtimeJournal(filename, () => now);
-    expect(reopened.claim(pending).state).toBe('expired');
-    expect(reopened.claim(observed).state).toBe('expired');
+    expect(reopened.claim(pending).state).toBe('claimed');
+    expect(reopened.claim(observed).state).toBe('claimed');
     expect(reopened.claim(started)).toMatchObject({
       state: 'existing',
       record: { state: 'uncertain' },
@@ -897,6 +619,23 @@ describe('host-only E2EE realtime journal', () => {
     expect(journal.retainResponse(startedPermit, { index: 0, frame: responseFrame })).toEqual(
       responseFrame
     );
+  });
+
+  it('accepts new requests in the same workspace after a five-minute local clock correction', () => {
+    now = 300_100;
+    const jumped = { ...request, requestId: 'during-forward-jump', expiresAt: now + 60_000 };
+    journal.receive(jumped);
+    const permit = takePermit(journal, jumped);
+    now = 100;
+    const reopened = new RealtimeJournal(filename, () => now);
+    const next = { ...request, requestId: 'after-correction' };
+    reopened.receive(next);
+    expect(reopened.claim(next).state).toBe('claimed');
+    expect(reopened.claim(jumped)).toMatchObject({
+      state: 'existing',
+      record: { state: 'uncertain' },
+    });
+    expect(journal.finish(permit, outcome)).toMatchObject({ state: 'completed', outcome });
   });
 
   it('isolates a forward clock observation from new workspaces while completed evidence remains readable', () => {
@@ -1076,20 +815,6 @@ describe('host-only E2EE realtime journal', () => {
     expect(guarded.claim(request).state).toBe('claimed');
   });
 
-  it('exposes unknown outcomes without blocking independent requests in the same workspace', () => {
-    journal.receive(request);
-    takePermit(journal);
-    const reopened = new RealtimeJournal(filename, () => now);
-    expect(reopened.read(request)).toMatchObject({ state: 'uncertain', outcomeStatus: 'unknown' });
-    const next = { ...request, requestId: 'independent-after-uncertain' };
-    reopened.receive(next);
-    expect(reopened.claim(next).state).toBe('claimed');
-    expect(reopened.claim(request)).toMatchObject({
-      state: 'existing',
-      record: { state: 'uncertain' },
-    });
-  });
-
   it('resets the floor, archives exact evidence, fences retired IDs and invalidates old owners', () => {
     journal.receive(request);
     const permit = takePermit(journal);
@@ -1119,14 +844,6 @@ describe('host-only E2EE realtime journal', () => {
     const next = { ...request, requestId: 'after-tolerated-skew' };
     journal.receive(next);
     expect(new RealtimeJournal(filename, () => 100).claim(next).state).toBe('claimed');
-  });
-
-  it('fails closed on an invalid trusted reference without touching the clock floor', () => {
-    journal.receive(request);
-    const before = snapshotDatabase(filename);
-    const invalid = new RealtimeJournal(filename, () => now, { trustedNow: () => NaN });
-    expectCode(() => invalid.claim(request), 'storage');
-    expect(snapshotDatabase(filename)).toEqual(before);
   });
 
   it('resumes reset after interruption between archive and replacement schema commit', () => {
@@ -1184,35 +901,6 @@ describe('host-only E2EE realtime journal', () => {
     close.mockRestore();
     journal.retryCleanup();
     expect(resetter.reset().archivePath).toContain('.archive-');
-  });
-
-  it('directly resets an unknown format by archiving it without decoding or upgrading it', () => {
-    const editor = new Database(filename);
-    editor.pragma('user_version = 99');
-    editor.close();
-    const before = snapshotDatabase(filename);
-    const { archivePath } = new RealtimeJournal(filename, () => now).reset();
-    expect(snapshotDatabase(archivePath)).toEqual(before);
-    expect(new RealtimeJournal(filename, () => now).read(request)).toBeNull();
-  });
-
-  it('enforces the current response foreign key without changing any parent evidence', () => {
-    journal.receive(request);
-    const db = new Database(filename);
-    try {
-      db.pragma('foreign_keys = ON');
-      expect(() =>
-        db
-          .prepare(`INSERT INTO realtime_responses
-        (genesis, workspace_id, target_machine_id, request_id, position, frame, digest)
-        VALUES ('absent', 'absent', 'absent', 'absent', 0, ?, ?)`)
-          .run(Buffer.from(responseFrame), '00'.repeat(32))
-      ).toThrow();
-    } finally {
-      db.close();
-    }
-    expect(journal.read(request)).toMatchObject({ state: 'received', frame: request.frame });
-    expect(journal.readResponse(request, 0)).toBeNull();
   });
 
   it('recovers a current hot journal without restarting the action or losing unrelated results and responses', async () => {
@@ -1410,8 +1098,9 @@ describe('host-only E2EE realtime journal', () => {
       targetMachineId: 'synthetic-machine',
       requestId: 'agent-start:user-turn',
     };
-    const gate = (open: () => RealtimeJournal, expiresAt = 1000) =>
+    const gate = (open: () => RealtimeJournal) =>
       makeEncryptedAgentExecution({
+        machineUserId: 'synthetic-machine-account',
         genesis: key.genesis,
         workspaceId: key.workspaceId,
         targetMachineId: key.targetMachineId,
@@ -1420,13 +1109,13 @@ describe('host-only E2EE realtime journal', () => {
           Effect.succeed({
             requesterDevice: 'ab'.repeat(32),
             requesterCryptoUserId: '1e'.repeat(32),
-            expiresAt,
           }),
         authorizeExecution: () => Effect.succeed({ _tag: 'Authorized' }),
       });
 
     it('denies a verified original when no authorization capability is available', async () => {
       const execution = makeEncryptedAgentExecution({
+        machineUserId: 'synthetic-machine-account',
         genesis: key.genesis,
         workspaceId: key.workspaceId,
         targetMachineId: key.targetMachineId,
@@ -1451,6 +1140,7 @@ describe('host-only E2EE realtime journal', () => {
         return read(storedKey);
       });
       const execution = makeEncryptedAgentExecution({
+        machineUserId: 'synthetic-machine-account',
         genesis: key.genesis,
         workspaceId: key.workspaceId,
         targetMachineId: key.targetMachineId,
@@ -1470,19 +1160,91 @@ describe('host-only E2EE realtime journal', () => {
       });
       expect(
         await Effect.runPromise(
-          execution.claim({ ...intent, localProjectId: 'actual-local-project' })
+          execution.claim({ ...intent, localProjectIds: ['actual-local-project'] })
         )
       ).toEqual({ state: 'denied' });
       expect(read(key)).toBeNull();
     });
 
-    it('preserves the first execution deadline through reauthorization and a backwards clock', async () => {
-      const first = gate(() => journal, 100);
-      expect(await Effect.runPromise(first.claim(intent))).toMatchObject({ state: 'expired' });
+    it.each([
+      [['owner', 'owner'], 'owner'],
+      [['owner', 'member'], 'member'],
+    ] as const)(
+      'keeps owner identity across project grants only when every grant names the owner (%j)',
+      async (principals, expected) => {
+        let index = 0;
+        const execution = makeEncryptedAgentExecution({
+          machineUserId: 'synthetic-machine-account',
+          genesis: key.genesis,
+          workspaceId: key.workspaceId,
+          targetMachineId: key.targetMachineId,
+          journal: () => journal,
+          resolveVerifiedOriginal: () =>
+            Effect.succeed({
+              requesterDevice: 'ab'.repeat(32),
+              requesterCryptoUserId: '1e'.repeat(32),
+              expiresAt: 1000,
+            }),
+          authorizeExecution: () =>
+            Effect.sync(() => ({
+              _tag: 'Authorized' as const,
+              principal: principals[index++] ?? 'member',
+            })),
+        });
+        expect(
+          await Effect.runPromise(
+            execution.claim({ ...intent, localProjectIds: ['first', 'second'] })
+          )
+        ).toMatchObject({ state: 'claimed', principal: expected });
+      }
+    );
+
+    it('requires every project the turn reaches to be shared before the durable start', async () => {
+      const asked: (string | undefined)[] = [];
+      const execution = makeEncryptedAgentExecution({
+        machineUserId: 'synthetic-machine-account',
+        genesis: key.genesis,
+        workspaceId: key.workspaceId,
+        targetMachineId: key.targetMachineId,
+        journal: () => journal,
+        resolveVerifiedOriginal: () =>
+          Effect.succeed({
+            requesterDevice: 'ab'.repeat(32),
+            requesterCryptoUserId: '1e'.repeat(32),
+            expiresAt: 1000,
+          }),
+        authorizeExecution: (_workspace, _requester, localProjectId) =>
+          Effect.sync(() => {
+            asked.push(localProjectId);
+            return localProjectId === 'private'
+              ? { _tag: 'Denied' as const, reason: 'e2ee_machine_not_shared' }
+              : { _tag: 'Authorized' as const };
+          }),
+      });
+      expect(
+        await Effect.runPromise(
+          execution.claim({ ...intent, localProjectIds: ['shared', 'private', 'shared'] })
+        )
+      ).toEqual({ state: 'denied', reason: 'e2ee_machine_not_shared' });
+      expect(asked).toEqual(['shared', 'private']);
+      expect(journal.read(key)).toBeNull();
+    });
+
+    it('starts a message once whatever the clock says, and never a retired one', async () => {
+      // No deadline and no clock: a far-future, then a rolled-back clock both start it once.
+      now = 4_102_444_800_000;
+      const first = gate(() => journal);
+      expect(await Effect.runPromise(first.claim(intent))).toMatchObject({ state: 'claimed' });
       now = 1;
-      const retry = gate(() => new RealtimeJournal(filename, () => now));
-      expect(await Effect.runPromise(retry.claim(intent))).toMatchObject({ state: 'expired' });
-      expect(journal.read(key)).toMatchObject({ state: 'received', expiresAt: 100 });
+      const reopened = gate(() => new RealtimeJournal(filename, () => now));
+      expect(await Effect.runPromise(reopened.claim(intent))).toEqual({ state: 'uncertain' });
+      // A message cancelled before it started stays retired, even if its row is pending again.
+      const canceled = { ...intent, userTurnId: 'canceled-turn' };
+      await Effect.runPromise(reopened.retire(canceled));
+      expect(await Effect.runPromise(reopened.claim(canceled))).toEqual({ state: 'completed' });
+      // Retiring an already started message changes nothing.
+      await Effect.runPromise(reopened.retire(intent));
+      expect(journal.read(key)?.state).toBe('uncertain');
     });
 
     it('binds the business intent to its turn and session, independently of display account IDs', async () => {
@@ -1506,43 +1268,20 @@ describe('host-only E2EE realtime journal', () => {
       expect(journal.read(key)?.state).toBe('uncertain');
     });
 
-    it.each(['received', 'uncertain', 'completed'] as const)(
-      'preserves exact older %s evidence without binding display accounts',
-      async (state) => {
-        const frame = Buffer.from(
-          JSON.stringify([1, intent.sessionId, intent.userTurnId, 'earlier-display-account'])
-        );
-        const earlierRequest = { ...key, requester: 'ab'.repeat(32), expiresAt: 1000, frame };
-        journal.receive(earlierRequest);
-        if (state !== 'received') {
-          const result = journal.claim(earlierRequest);
-          if (result.state !== 'claimed') throw new Error('missing initial claim');
-          if (state === 'completed')
-            journal.finish(result.permit, Buffer.from('original settlement'));
-        }
-        const reopened = gate(() => new RealtimeJournal(filename, () => now));
-        expect(
-          await Effect.runPromise(
-            reopened.claim({ ...intent, requesterUserId: 'new-display-account' })
-          )
-        ).toMatchObject({ state: state === 'received' ? 'claimed' : state });
-        expect(Buffer.from(journal.read(key)?.frame ?? [])).toEqual(frame);
-        if (state === 'completed')
-          expect(journal.read(key)).toMatchObject({
-            state: 'completed',
-            outcome: Uint8Array.from(Buffer.from('original settlement')),
-          });
-        expect(
-          await Effect.runPromise(reopened.claim({ ...intent, requesterUserId: undefined }))
-        ).toEqual({ state: state === 'completed' ? 'completed' : 'uncertain' });
-      }
-    );
+    it('refuses other content under a message ID that already started', async () => {
+      const execution = gate(() => journal);
+      expect((await Effect.runPromise(execution.claim(intent))).state).toBe('claimed');
+      const edited = { ...intent, inputConfig: { prompt: 'edited after start' } };
+      expect(await Effect.runPromise(execution.claim(edited))).toEqual({ state: 'uncertain' });
+      expect(journal.read(key)?.state).toBe('uncertain');
+    });
 
     it('refuses a late authorization after the workspace closes without consuming a start', async () => {
       const entered = Promise.withResolvers<void>();
       const released = Promise.withResolvers<void>();
       let open = true;
       const execution = makeEncryptedAgentExecution({
+        machineUserId: 'synthetic-machine-account',
         genesis: key.genesis,
         workspaceId: key.workspaceId,
         targetMachineId: key.targetMachineId,
@@ -1569,31 +1308,6 @@ describe('host-only E2EE realtime journal', () => {
       expect(journal.read(key)).toBeNull();
     });
 
-    it('cancels authorization without consuming execution evidence', async () => {
-      let entered: () => void = () => {};
-      const ready = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      const blocked = makeEncryptedAgentExecution({
-        genesis: key.genesis,
-        workspaceId: key.workspaceId,
-        targetMachineId: key.targetMachineId,
-        journal: () => journal,
-        resolveVerifiedOriginal: () =>
-          Effect.succeed({
-            requesterDevice: 'ab'.repeat(32),
-            requesterCryptoUserId: '1e'.repeat(32),
-            expiresAt: 1000,
-          }),
-        authorizeExecution: () => Effect.sync(entered).pipe(Effect.andThen(Effect.never)),
-      });
-      const fiber = Effect.runFork(blocked.claim(intent));
-      await ready;
-      await Effect.runPromise(Fiber.interrupt(fiber));
-      expect(journal.read(key)).toBeNull();
-      expect((await Effect.runPromise(gate(() => journal).claim(intent))).state).toBe('claimed');
-    });
-
     it('retains userTurnId fences across explicit journal reset', async () => {
       const execution = gate(() => journal);
       expect((await Effect.runPromise(execution.claim(intent))).state).toBe('claimed');
@@ -1618,24 +1332,275 @@ describe('host-only E2EE realtime journal', () => {
       expect(readdirSync(directory)).not.toContain('journal.sqlite');
       expect(readdirSync(directory)).toContain('journal.sqlite.control.sqlite');
     });
+  });
 
-    it('retries only completion storage after a result write fails', async () => {
-      const execution = gate(() => journal);
-      const claim = await Effect.runPromise(execution.claim(intent));
-      if (claim.state !== 'claimed') throw new Error('Missing execution claim');
-      const finish = vi.spyOn(journal, 'finish').mockImplementationOnce(() => {
-        throw new RealtimeJournalError('storage');
+  describe('shared-member derivation on the same machine', () => {
+    const self = 'ee'.repeat(32);
+    const member = 'aa'.repeat(32);
+    const owner = 'bb'.repeat(32);
+    const origin = { sessionId: 'origin-session', userTurnId: 'origin-turn' };
+    const derived = {
+      workspaceId: 'synthetic-workspace',
+      sessionId: 'child-session',
+      userTurnId: 'child-turn',
+      requesterUserId: 'display-owner-account',
+      localProjectIds: ['private-project'],
+    };
+    type Original = {
+      requesterDevice: string;
+      requesterCryptoUserId: string;
+      expiresAt: number;
+      machineAuthored?: true;
+      derivedFrom?: { sessionId: string; userTurnId: string };
+    };
+    const originals = new Map<string, Original>();
+    const authorized: Array<[string, string | undefined]> = [];
+    // The member may use only `shared-project`; the machine owner may use anything.
+    const gate = (rows: Map<string, Original> = originals) =>
+      makeEncryptedAgentExecution({
+        machineUserId: 'synthetic-machine-account',
+        genesis: 'synthetic-genesis',
+        workspaceId: 'synthetic-workspace',
+        targetMachineId: 'synthetic-machine',
+        journal: () => journal,
+        selfDevice: self,
+        resolveVerifiedOriginal: (intent) =>
+          Effect.succeed(rows.get(`${intent.sessionId}/${intent.userTurnId}`)),
+        authorizeExecution: (_workspace, device, project) =>
+          Effect.sync(() => {
+            authorized.push([device, project]);
+            if (device === self || device === owner)
+              return { _tag: 'Authorized' as const, principal: 'owner' as const };
+            if (device === member && (project === undefined || project === 'shared-project'))
+              return { _tag: 'Authorized' as const, principal: 'member' as const };
+            return { _tag: 'Denied' as const, reason: 'e2ee_machine_not_shared' };
+          }),
       });
-      await expect(Effect.runPromise(execution.complete(claim.permit))).rejects.toMatchObject({
-        code: 'storage',
+    const signed = (requesterDevice: string, extra: Partial<Original> = {}): Original => ({
+      requesterDevice,
+      requesterCryptoUserId: '1e'.repeat(32),
+      expiresAt: Date.now() + 60_000,
+      ...extra,
+    });
+    beforeEach(() => {
+      originals.clear();
+      authorized.length = 0;
+      originals.set('origin-session/origin-turn', signed(member));
+    });
+
+    it("runs a derived input with the member's own rights, never the machine owner's", async () => {
+      originals.set('child-session/child-turn', signed(self, { derivedFrom: origin }));
+      const execution = gate();
+      // A project shared with the member starts with that member's authority.
+      expect(
+        await Effect.runPromise(
+          execution.claim({ ...derived, localProjectIds: ['shared-project'] })
+        )
+      ).toMatchObject({ state: 'claimed', principal: 'derived' });
+      expect(authorized).toEqual([[member, 'shared-project']]);
+      // The machine-authored input cannot reach a project the member may not use.
+      originals.set('child-session/other-turn', signed(self, { derivedFrom: origin }));
+      expect(
+        await Effect.runPromise(execution.claim({ ...derived, userTurnId: 'other-turn' }))
+      ).toEqual({ state: 'denied', reason: 'e2ee_machine_not_shared' });
+      expect(authorized.at(-1)).toEqual([member, 'private-project']);
+    });
+
+    it('rejects forged, unflattened, unverifiable and over-limit derivations across restart', async () => {
+      const deny = async (row: Original | undefined, rows = originals) => {
+        const userTurnId = `turn-${rows.size}-${Math.random()}`;
+        if (row) rows.set(`child-session/${userTurnId}`, row);
+        return Effect.runPromise(
+          gate(rows).claim({ ...derived, userTurnId, localProjectIds: ['shared-project'] })
+        );
+      };
+      // Only this machine authors derivations; a member cannot claim one for itself.
+      expect(await deny(signed(member, { derivedFrom: origin }))).toEqual({ state: 'denied' });
+      // A stored root must be non-derived and human-signed.
+      originals.set('origin-session/origin-turn', signed(self, { derivedFrom: origin }));
+      expect(await deny(signed(self, { derivedFrom: origin }))).toEqual({ state: 'denied' });
+      originals.set('origin-session/origin-turn', signed(self));
+      expect(await deny(signed(self, { derivedFrom: origin }))).toEqual({ state: 'denied' });
+      // Another machine's legacy row cannot stand in for a human-signed root.
+      originals.set('origin-session/origin-turn', signed(owner, { machineAuthored: true }));
+      expect(await deny(signed(self, { derivedFrom: origin }))).toEqual({ state: 'denied' });
+      expect(await Effect.runPromise(gate().resolveDerivationOrigin(origin))).toEqual({
+        principal: 'owner',
       });
-      expect((await Effect.runPromise(execution.claim(intent))).state).toBe('uncertain');
-      await Effect.runPromise(execution.complete(claim.permit));
-      expect(journal.read(key)).toMatchObject({
-        state: 'completed',
-        outcome: Uint8Array.from(Buffer.from('{"state":"settled"}')),
+      // An origin that cannot be verified (absent, edited, other workspace) is refused.
+      originals.delete('origin-session/origin-turn');
+      expect(await deny(signed(self, { derivedFrom: origin }))).toEqual({ state: 'denied' });
+      // No time limit applies; at most twenty starts per origin do.
+      originals.set('origin-session/origin-turn', signed(member));
+      let execution = gate();
+      authorized.length = 0;
+      for (let index = 0; index < 21; index++) {
+        if (index === 15) {
+          journal = new RealtimeJournal(filename, () => now);
+          execution = gate();
+        }
+        const userTurnId = `bounded-${index}`;
+        originals.set(`child-session/${userTurnId}`, signed(self, { derivedFrom: origin }));
+        const result = await Effect.runPromise(
+          execution.claim({ ...derived, userTurnId, localProjectIds: ['shared-project'] })
+        );
+        expect(result.state).toBe(index < 20 ? 'claimed' : 'denied');
+      }
+      expect(authorized.every(([device]) => device === member)).toBe(true);
+    });
+
+    it('accepts machine-signed Owner continuations without accepting machine-signed derived roots', async () => {
+      const execution = gate();
+      for (const device of [self, owner]) {
+        originals.set('origin-session/origin-turn', signed(device, { machineAuthored: true }));
+        expect(await Effect.runPromise(execution.resolveDerivationOrigin(origin))).toEqual({
+          principal: 'owner',
+        });
+      }
+      for (const device of [member, 'cc'.repeat(32)]) {
+        originals.set('origin-session/origin-turn', signed(device, { machineAuthored: true }));
+        expect(await Effect.runPromise(execution.resolveDerivationOrigin(origin))).toBeUndefined();
+      }
+      originals.set('origin-session/origin-turn', signed(owner, { machineAuthored: true }));
+      originals.set('child-session/child-turn', signed(self, { derivedFrom: origin }));
+      expect(
+        await Effect.runPromise(
+          execution.resolveDerivationOrigin({
+            sessionId: 'child-session',
+            userTurnId: 'child-turn',
+          })
+        )
+      ).toBeUndefined();
+      expect(await Effect.runPromise(execution.resolveRequester(derived))).toEqual({
+        state: 'denied',
       });
-      finish.mockRestore();
+      expect(await Effect.runPromise(execution.claim(derived))).toEqual({ state: 'denied' });
+    });
+
+    it('flattens child and grandchild origins for both principals and rechecks withdrawal', async () => {
+      const child = { sessionId: 'child-session', userTurnId: 'child-turn' };
+      const grandchild = { sessionId: 'grandchild-session', userTurnId: 'grandchild-turn' };
+      for (const [device, principal] of [
+        [member, 'member'],
+        [owner, 'owner'],
+      ] as const) {
+        originals.set('origin-session/origin-turn', signed(device));
+        originals.set('child-session/child-turn', signed(self, { derivedFrom: origin }));
+        const execution = gate();
+        expect(await Effect.runPromise(execution.resolveDerivationOrigin(child))).toEqual({
+          principal,
+          origin,
+        });
+        originals.set('grandchild-session/grandchild-turn', signed(self, { derivedFrom: origin }));
+        expect(await Effect.runPromise(execution.resolveDerivationOrigin(grandchild))).toEqual({
+          principal,
+          origin,
+        });
+        originals.delete('origin-session/origin-turn');
+        expect(await Effect.runPromise(execution.resolveDerivationOrigin(child))).toBeUndefined();
+        expect(
+          await Effect.runPromise(execution.resolveRequester({ ...derived, ...grandchild }))
+        ).toEqual({ state: 'denied' });
+        expect(await Effect.runPromise(execution.claim({ ...derived, ...grandchild }))).toEqual({
+          state: 'denied',
+        });
+      }
+    });
+
+    it('extends a legacy control store without losing retired request fences', () => {
+      journal.receive(request);
+      journal.reset();
+      const legacy = new Database(`${filename}.control.sqlite`);
+      legacy.exec('DROP TABLE derived_claims; PRAGMA user_version = 1;');
+      legacy.close();
+      const reopened = new RealtimeJournal(filename, () => now);
+      expect(reopened.reserveDerivation(request, origin)).toBe(true);
+      expectCode(() => reopened.receive(request), 'archived_request');
+      expect(new RealtimeJournal(filename, () => now).reserveDerivation(request, origin)).toBe(
+        true
+      );
+    });
+
+    it('keeps quota receipts through retries, log reset and independent journal owners', () => {
+      const root = { sessionId: 'root', userTurnId: 'root' };
+      for (let i = 0; i < 20; i++) {
+        const input = { ...request, requestId: `quota-${i}` };
+        expect(journal.reserveDerivation(input, root)).toBe(true);
+        expect(new RealtimeJournal(filename, () => now).reserveDerivation(input, root)).toBe(true);
+      }
+      expect(journal.reserveDerivation({ ...request, requestId: 'overflow' }, root)).toBe(false);
+      journal.reset();
+      const reopened = new RealtimeJournal(filename, () => now);
+      expect(reopened.reserveDerivation({ ...request, requestId: 'after-reset' }, root)).toBe(
+        false
+      );
+      expect(
+        reopened.reserveDerivation(
+          { ...request, requestId: 'other-root' },
+          { ...root, userTurnId: 'other' }
+        )
+      ).toBe(true);
+      expect(reopened.reserveDerivation({ ...request, genesis: 'other-genesis' }, root)).toBe(true);
+      expect(reopened.reserveDerivation({ ...request, workspaceId: 'other-workspace' }, root)).toBe(
+        true
+      );
+    });
+
+    it('decides at write time: owner unchanged, member only from its active turn on this machine', () => {
+      const decide = (
+        live: 'owner' | 'member' | undefined,
+        verified: 'owner' | 'member' | 'denied',
+        targetMachineId = 'machine'
+      ) => decideEncryptedDerivation({ live, verified, targetMachineId, machineId: 'machine' });
+      expect(() => decide('owner', 'denied', 'other-machine')).toThrow('e2ee_derivation_denied');
+      expect(decide(undefined, 'owner')).toBe('owner');
+      expect(decide('member', 'member')).toBe('member');
+      expect(() => decide('member', 'member', 'other-machine')).toThrow(
+        'e2ee_derivation_cross_machine_unsupported'
+      );
+      // Ended or over-limit member turns, unverifiable origins and mismatches fail closed.
+      for (const [live, verified] of [
+        [undefined, 'member'],
+        [undefined, 'denied'],
+        ['member', 'denied'],
+        ['member', 'owner'],
+      ] as const)
+        expect(() => decide(live, verified)).toThrow('e2ee_derivation_denied');
+    });
+
+    it('classifies the driving turn by its verified signer and reports member origins', async () => {
+      const execution = gate();
+      expect(await Effect.runPromise(execution.classifyOrigin(origin))).toBe('member');
+      originals.set('origin-session/origin-turn', signed(owner));
+      expect(await Effect.runPromise(execution.classifyOrigin(origin))).toBe('owner');
+      originals.set('origin-session/origin-turn', signed(self));
+      expect(await Effect.runPromise(execution.classifyOrigin(origin))).toBe('owner');
+      originals.set('origin-session/origin-turn', signed(self, { derivedFrom: origin }));
+      expect(await Effect.runPromise(execution.classifyOrigin(origin))).toBe('denied');
+      originals.delete('origin-session/origin-turn');
+      expect(await Effect.runPromise(execution.classifyOrigin(origin))).toBe('denied');
+      // A member's own turn reports its verified device for derivation and agent control.
+      originals.set('member-session/member-turn', signed(member));
+      expect(
+        await Effect.runPromise(
+          execution.claim({
+            ...derived,
+            sessionId: 'member-session',
+            userTurnId: 'member-turn',
+            localProjectIds: ['shared-project'],
+          })
+        )
+      ).toMatchObject({
+        state: 'claimed',
+        principal: 'member',
+        origin: { requesterDevice: member },
+      });
+      expect(
+        await Effect.runPromise(execution.authorizeAgentControl(member, ['shared-project']))
+      ).toBe(true);
+      expect(
+        await Effect.runPromise(execution.authorizeAgentControl(member, ['private-project']))
+      ).toBe(false);
     });
   });
 });

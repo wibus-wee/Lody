@@ -1,14 +1,20 @@
+import { DevicePreviewPlatformContext } from './device-preview-platform';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAtomValue } from 'jotai';
 import { useTranslation } from 'react-i18next';
 import {
   machineSupportsIosSimulatorControls,
+  machineSupportsIosSimulatorShutdown,
+  machineSupportsAndroidEmulatorProtocol,
+  machineSupportsAndroidEmulatorQuality,
+  machineSupportsAndroidEmulatorShutdown,
+  type AndroidEmulatorQuality,
   machineSupportsIosSimulatorExterior,
   IosSimulatorExteriorAssetSchema,
   isIosSimulatorBezelPng,
   type IosSimulatorExterior,
   type IosSimulatorCommand,
-  type IosSimulatorDeviceControl,
+  type DevicePreviewControl as IosSimulatorDeviceControl,
   type IosSimulatorResponse,
   type SessionMeta,
 } from '@lody/shared';
@@ -17,7 +23,7 @@ import { localMachineIdAtom } from '@/atoms/local-probe';
 import { getMachineMetaByIdAtomFamily } from '@/atoms/machines';
 import { machineOnlineStatusAtomFamily } from '@/atoms/presence';
 import { writeTextToClipboard } from '@/lib/clipboard';
-import { downloadBytesAsFile } from '@/lib/download-file';
+import { saveBytesAsFile } from '@/lib/download-file';
 import {
   getIosSimulatorScreenshotFileName,
   type IosSimulatorCaptureError,
@@ -30,6 +36,7 @@ import {
 } from '@/lib/ios-simulator/ios-simulator-hardware';
 import { toast } from '@/lib/toast';
 import {
+  androidEmulatorResponseForPanel,
   IOS_SIMULATOR_PREPARING_MAX_POLLS,
   IOS_SIMULATOR_PREPARING_POLL_MS,
   buildIosSimulatorDiagnostics,
@@ -52,6 +59,12 @@ import type {
 import type { IosSimulatorPendingAction } from './ios-simulator-connection-status';
 import type { IosSimulatorScreenshotTarget, IosSimulatorViewMode } from './ios-simulator-controls';
 import { IosSimulatorInputDialog, type IosSimulatorInputKind } from './ios-simulator-input-dialog';
+import {
+  clearDevicePreviewFrame,
+  devicePreviewCacheKey,
+  readDevicePreviewSnapshot,
+  rememberDevicePreviewSnapshot,
+} from './device-preview-cache';
 import type { IosSimulatorViewerHandle } from './ios-simulator-viewer';
 import {
   IosSimulatorPanelView,
@@ -60,6 +73,7 @@ import {
 } from './ios-simulator-panel-view';
 
 type SessionIosSimulatorPanelProps = {
+  platform?: 'ios' | 'android';
   session: Pick<SessionMeta, 'id' | 'machineId'>;
   /** On screen: the only state in which it polls; the viewer is told otherwise. */
   active?: boolean;
@@ -94,19 +108,22 @@ const appOrigin = (): string => (typeof window === 'undefined' ? '' : window.loc
  * across an in-place switch. Unmounting never stops a preview: panel mount is
  * not preview ownership.
  */
-export function SessionIosSimulatorPanel(props: SessionIosSimulatorPanelProps) {
+export function SessionDevicePreviewPanel(props: SessionIosSimulatorPanelProps) {
   const user = useAtomValue(userAtom);
   const runtime = useAtomValue(activeWorkspaceRuntimeAtom);
   return (
-    <SessionIosSimulatorPanelController
-      key={`${user?.id}:${runtime?.workspaceId}:${props.session.id}:${props.session.machineId}`}
-      {...props}
-    />
+    <DevicePreviewPlatformContext.Provider value={props.platform ?? 'ios'}>
+      <SessionIosSimulatorPanelController
+        key={`${props.platform ?? 'ios'}:${user?.id}:${runtime?.workspaceId}:${props.session.id}:${props.session.machineId}`}
+        {...props}
+      />
+    </DevicePreviewPlatformContext.Provider>
   );
 }
 
 function SessionIosSimulatorPanelController({
   session,
+  platform = 'ios',
   active = true,
   leadingSlot,
   controlsLayout = 'toolbar',
@@ -119,7 +136,14 @@ function SessionIosSimulatorPanelController({
   const machineOnline = useAtomValue(machineOnlineStatusAtomFamily(session.machineId));
   const localMachineId = useAtomValue(localMachineIdAtom);
   const isLocalMachine = localMachineId === session.machineId;
-  const availability = getIosSimulatorPanelAvailability(machine);
+  const availability =
+    platform === 'android'
+      ? runtime?.contentMode === 'e2ee' && !isLocalMachine
+        ? 'hidden'
+        : machineSupportsAndroidEmulatorProtocol(machine)
+          ? 'available'
+          : 'upgrade-required'
+      : getIosSimulatorPanelAvailability(machine, runtime?.contentMode);
   // Same-machine Electron talks to the local daemon directly, so cloud presence
   // going offline does not cut it off.
   const blocker: IosSimulatorPanelBlocker | null =
@@ -136,25 +160,47 @@ function SessionIosSimulatorPanelController({
             accountId: user?.id,
             workspaceId: runtime.workspaceId,
             machineId: session.machineId,
-            sessionId: session.id,
+            sessionId: platform === 'android' ? `android:${session.id}` : session.id,
           }
         : null,
-    [runtime, session.id, session.machineId, user?.id]
+    [platform, runtime, session.id, session.machineId, user?.id]
   );
 
-  const [catalog, setCatalog] = useState<IosSimulatorCatalogState>({ phase: 'loading' });
+  const cacheKey = useMemo(
+    () =>
+      devicePreviewCacheKey({
+        platform,
+        userId: user?.id,
+        workspaceId: runtime?.workspaceId,
+        sessionId: session.id,
+        machineId: session.machineId,
+      }),
+    [platform, runtime?.workspaceId, session.id, session.machineId, user?.id]
+  );
+  const [initialSnapshot] = useState(() => readDevicePreviewSnapshot(cacheKey));
+  const defaultQuality: AndroidEmulatorQuality = isLocalMachine ? 'clear' : 'balanced';
+  const supportsQuality = platform === 'android' && machineSupportsAndroidEmulatorQuality(machine);
+  const [catalog, setCatalog] = useState<IosSimulatorCatalogState>(
+    () => initialSnapshot?.catalog ?? { phase: 'loading' }
+  );
   const [refreshing, setRefreshing] = useState(false);
-  const [status, setStatus] = useState<IosSimulatorPanelStatus>(IDLE);
+  const [status, setStatus] = useState<IosSimulatorPanelStatus>(
+    () => initialSnapshot?.status ?? IDLE
+  );
   const statusRef = useRef(status);
   statusRef.current = status;
-  const [viewerState, setViewerState] = useState<IosSimulatorViewerState | null>(null);
+  const [viewerState, setViewerState] = useState<IosSimulatorViewerState | null>(
+    () => initialSnapshot?.viewerState ?? null
+  );
   const [viewerDiagnostics, setViewerDiagnostics] = useState<IosSimulatorViewerDiagnostics | null>(
-    null
+    () => initialSnapshot?.viewerDiagnostics ?? null
   );
   const [viewerReloadKey, setViewerReloadKey] = useState(0);
   const [pendingAction, setPendingAction] = useState<IosSimulatorPendingAction>(null);
   const [bootExpected, setBootExpected] = useState(false);
-  const [chosenUdid, setChosenUdid] = useState<string | null>(null);
+  const [chosenUdid, setChosenUdid] = useState<string | null>(
+    () => initialSnapshot?.chosenUdid ?? null
+  );
   const [preferredUdid] = useState(() => readIosSimulatorSelectedDevice(preferenceScope));
 
   // Every status read takes a ticket; an answer to an older ticket is stale.
@@ -165,8 +211,28 @@ function SessionIosSimulatorPanelController({
 
   const requesterUserId = user?.id ?? null;
   const request = useCallback(
-    async (command: IosSimulatorCommand): Promise<IosSimulatorResponse | null> => {
+    async (
+      command: IosSimulatorCommand,
+      requestedQuality: AndroidEmulatorQuality = defaultQuality
+    ): Promise<IosSimulatorResponse | null> => {
       if (!runtime || !requesterUserId) return null;
+      if (platform === 'android') {
+        if (command.action === 'exterior') return null;
+        const result = await runtime.requestAndroidEmulatorControl({
+          machineId: session.machineId,
+          sessionId: session.id,
+          requestedByUserId: requesterUserId,
+          command:
+            command.action === 'start'
+              ? {
+                  action: 'start',
+                  id: command.udid,
+                  ...(supportsQuality ? { quality: requestedQuality } : {}),
+                }
+              : command,
+        });
+        return androidEmulatorResponseForPanel(result);
+      }
       return runtime.requestIosSimulatorControl({
         machineId: session.machineId,
         sessionId: session.id,
@@ -175,7 +241,15 @@ function SessionIosSimulatorPanelController({
         timeoutMs: command.action === 'exterior' ? 45000 : undefined,
       });
     },
-    [requesterUserId, runtime, session.id, session.machineId]
+    [
+      defaultQuality,
+      platform,
+      requesterUserId,
+      runtime,
+      session.id,
+      session.machineId,
+      supportsQuality,
+    ]
   );
 
   const refreshCatalog = useCallback(async () => {
@@ -228,8 +302,8 @@ function SessionIosSimulatorPanelController({
   );
 
   const connected = Boolean(runtime && requesterUserId);
-  const live = active && blocker === null && connected;
-  const loadedRef = useRef(false);
+  const live = active && availability !== 'hidden' && blocker === null && connected;
+  const loadedRef = useRef(initialSnapshot?.catalog.phase === 'ready');
   useEffect(() => {
     if (!live) return;
     if (!loadedRef.current) {
@@ -270,11 +344,26 @@ function SessionIosSimulatorPanelController({
     return () => clearTimeout(timer);
   }, [operationId, pollTick, polling, refreshStatus]);
 
-  // A new operation has a new viewer, which has not said anything yet.
+  // Only a genuinely new operation resets viewer state; resuming a cached
+  // operation keeps its live viewer state and orientation intact.
+  const previousOperationIdRef = useRef<string | null>(operationId);
   useEffect(() => {
+    if (previousOperationIdRef.current === operationId) return;
+    previousOperationIdRef.current = operationId;
     setViewerState(null);
     setViewerDiagnostics(null);
+    setTurns(0);
+    controlTicket.current = null;
+    setPendingControl(null);
   }, [operationId]);
+
+  // Any non-ready phase (explicit stop, close, failure, or idle) tears down a
+  // parked viewer frame so stopped previews never linger in memory.
+  useEffect(() => {
+    if (status.phase !== 'ready') {
+      clearDevicePreviewFrame(cacheKey);
+    }
+  }, [cacheKey, status.phase]);
 
   // A preview that settles changes what the list says (booted, held by us).
   const previousPhase = useRef(status.phase);
@@ -297,7 +386,11 @@ function SessionIosSimulatorPanelController({
     imageUrl: string;
   }>();
   const exteriorUdid = selectedUdid;
-  const supportsExterior = machineSupportsIosSimulatorExterior(machine);
+  const supportsExterior = platform === 'ios' && machineSupportsIosSimulatorExterior(machine);
+  const supportsShutdown =
+    platform === 'android'
+      ? machineSupportsAndroidEmulatorShutdown(machine)
+      : machineSupportsIosSimulatorShutdown(machine);
   useEffect(() => {
     if (!live || !exteriorUdid || !supportsExterior) return undefined;
     let cancelled = false;
@@ -332,7 +425,8 @@ function SessionIosSimulatorPanelController({
     async (
       kind: Exclude<IosSimulatorPendingAction, null>,
       udid: string | undefined,
-      command: IosSimulatorCommand
+      command: IosSimulatorCommand,
+      requestedQuality: AndroidEmulatorQuality = defaultQuality
     ) => {
       // Only a newer action supersedes this one. A poll never does: it would
       // drop the answer and leave the action pending forever.
@@ -340,7 +434,7 @@ function SessionIosSimulatorPanelController({
       statusEpoch.current += 1;
       setPendingAction(kind);
       try {
-        const response = await request(command);
+        const response = await request(command, requestedQuality);
         if (!response || actionId !== actionEpoch.current) return;
         // Polls issued before this answer are older than it.
         statusEpoch.current += 1;
@@ -354,7 +448,7 @@ function SessionIosSimulatorPanelController({
         void refreshCatalog();
       }
     },
-    [refreshCatalog, request]
+    [defaultQuality, refreshCatalog, request]
   );
 
   const startPreview = useCallback(
@@ -368,12 +462,27 @@ function SessionIosSimulatorPanelController({
   );
 
   const statusUdid = getIosSimulatorStatusUdid(status) ?? undefined;
-  const stopOperation = useCallback(
-    (kind: 'cancel' | 'stop') => {
-      if (!operationId) return;
-      void runAction(kind, statusUdid, { action: 'stop', operationId });
+  const changeQuality = useCallback(
+    (next: AndroidEmulatorQuality) => {
+      if (!supportsQuality || pendingAction || status.phase !== 'ready' || !statusUdid) return;
+      setBootExpected(false);
+      setStatus({ phase: 'preparing', udid: statusUdid, stage: 'connecting' });
+      void runAction('start', statusUdid, { action: 'start', udid: statusUdid }, next);
     },
-    [operationId, runAction, statusUdid]
+    [supportsQuality, pendingAction, status.phase, statusUdid, runAction]
+  );
+
+  const stopOperation = useCallback(
+    (kind: 'cancel' | 'stop', options?: { shutdownDevice?: boolean }) => {
+      if (!operationId) return;
+      const shutdownDevice = options?.shutdownDevice === true && supportsShutdown;
+      void runAction(kind, statusUdid, {
+        action: 'stop',
+        operationId,
+        ...(shutdownDevice ? { shutdownDevice: true } : {}),
+      });
+    },
+    [operationId, runAction, statusUdid, supportsShutdown]
   );
 
   const startAgain = useCallback(
@@ -390,6 +499,7 @@ function SessionIosSimulatorPanelController({
   );
 
   const handleRestore = useCallback(() => {
+    clearDevicePreviewFrame(cacheKey);
     if (status.phase === 'ready') {
       // The stream dropped but the preview may still stand: reload the viewer
       // page and ask the machine where things are.
@@ -400,7 +510,7 @@ function SessionIosSimulatorPanelController({
       return;
     }
     if (statusUdid) startAgain(statusUdid);
-  }, [refreshStatus, startAgain, status.phase, statusUdid]);
+  }, [cacheKey, refreshStatus, startAgain, status.phase, statusUdid]);
 
   const handleRetry = useCallback(() => {
     if (statusUdid) {
@@ -428,29 +538,39 @@ function SessionIosSimulatorPanelController({
     [live, refreshCatalog]
   );
 
-  // ---------------------------------------------------------------------------
   // Native controls, screenshots and the view. All of it acts on this Session's
   // ready preview, through its exact operation.
 
   const viewerRef = useRef<IosSimulatorViewerHandle>(null);
-  const [turns, setTurns] = useState<IosSimulatorQuarterTurns>(0);
-  const [viewMode, setViewMode] = useState<IosSimulatorViewMode>('device');
+  const [turns, setTurns] = useState<IosSimulatorQuarterTurns>(() => initialSnapshot?.turns ?? 0);
+  const [viewMode, setViewMode] = useState<IosSimulatorViewMode>(
+    () => initialSnapshot?.viewMode ?? (platform === 'android' ? 'screen' : 'device')
+  );
   const [fullscreen, setFullscreen] = useState(false);
   const controlTicket = useRef<object | null>(null);
   const [pendingControl, setPendingControl] = useState<IosSimulatorControlId | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [inputKind, setInputKind] = useState<IosSimulatorInputKind | null>(null);
-  const machineName = machine?.name ?? t('sessions.iosSimulator.thisMac', 'this Mac');
+  const machineName = machine?.name ?? t('sessions.devicePreview.thisMachine', 'this machine');
 
-  // A new operation is a new stream in its own orientation.
-  useEffect(() => {
-    setTurns(0);
-    controlTicket.current = null;
-    setPendingControl(null);
-    return () => {
+  useEffect(
+    () => () => {
       controlTicket.current = null;
-    };
-  }, [operationId]);
+    },
+    []
+  );
+
+  useEffect(() => {
+    rememberDevicePreviewSnapshot(cacheKey, {
+      catalog,
+      status,
+      viewerState,
+      viewerDiagnostics,
+      chosenUdid,
+      turns,
+      viewMode,
+    });
+  }, [cacheKey, catalog, chosenUdid, status, turns, viewMode, viewerDiagnostics, viewerState]);
 
   const readyOperationId = status.phase === 'ready' ? status.operationId : null;
   const statusDevice = statusUdid
@@ -465,7 +585,10 @@ function SessionIosSimulatorPanelController({
       ),
     [statusDevice?.deviceType, statusDevice?.family, statusDevice?.name]
   );
-  const controlsSupported = machineSupportsIosSimulatorControls(machine);
+  const controlsSupported =
+    platform === 'android'
+      ? machineSupportsAndroidEmulatorProtocol(machine)
+      : machineSupportsIosSimulatorControls(machine);
 
   const sendControl = useCallback(
     async (control: IosSimulatorDeviceControl): Promise<boolean> => {
@@ -545,7 +668,7 @@ function SessionIosSimulatorPanelController({
           new Date()
         );
         if (target === 'save') {
-          downloadBytesAsFile(fileName, new Uint8Array(result.bytes));
+          await saveBytesAsFile(fileName, new Uint8Array(result.bytes));
           return;
         }
         const file = new File([result.bytes], fileName, { type: 'image/png' });
@@ -567,6 +690,8 @@ function SessionIosSimulatorPanelController({
             )
           );
         }
+      } catch {
+        toast.error(t('sessions.fileActions.downloadFailed', 'Could not download that file.'));
       } finally {
         setCapturing(false);
       }
@@ -583,7 +708,28 @@ function SessionIosSimulatorPanelController({
           'Update Lody on {{machine}} to use simulator controls',
           { machine: machineName }
         ),
-        availability: getIosSimulatorControlAvailability(hardware),
+        availability:
+          platform === 'android'
+            ? {
+                home: true,
+                back: true,
+                'app-switcher': true,
+                lock: false,
+                'rotate-left': false,
+                'rotate-right': true,
+                shake: false,
+                'volume-up': false,
+                'volume-down': false,
+                'software-keyboard': false,
+                action: false,
+                text: true,
+                appearance: true,
+                'open-url': false,
+              }
+            : getIosSimulatorControlAvailability(
+                hardware,
+                !!statusDevice && machineSupportsIosSimulatorControls(machine, 2)
+              ),
         pendingControl,
         capturing,
         canAttach: Boolean(onAttachScreenshot),
@@ -659,9 +805,12 @@ function SessionIosSimulatorPanelController({
     viewerDiagnostics,
   ]);
 
+  if (availability === 'hidden') return null;
+
   return (
     <>
       <IosSimulatorPanelView
+        quality={supportsQuality ? { onChange: changeQuality } : undefined}
         deviceExterior={deviceExterior}
         machineName={machineName}
         blocker={blocker}
@@ -673,6 +822,7 @@ function SessionIosSimulatorPanelController({
         viewerReloadKey={viewerReloadKey}
         pendingAction={pendingAction}
         bootExpected={bootExpected}
+        cacheKey={cacheKey}
         active={active}
         leadingSlot={leadingSlot}
         onSelectDevice={handleSelectDevice}
@@ -684,6 +834,9 @@ function SessionIosSimulatorPanelController({
         onStart={startPreview}
         onCancel={() => stopOperation('cancel')}
         onStop={() => stopOperation('stop')}
+        onStopAndShutdown={
+          supportsShutdown ? () => stopOperation('stop', { shutdownDevice: true }) : undefined
+        }
         onRestore={handleRestore}
         onRetry={handleRetry}
         onCopyDiagnostics={() => void handleCopyDiagnostics()}
@@ -712,4 +865,8 @@ function SessionIosSimulatorPanelController({
       />
     </>
   );
+}
+
+export function SessionIosSimulatorPanel(props: SessionIosSimulatorPanelProps) {
+  return <SessionDevicePreviewPanel {...props} platform="ios" />;
 }

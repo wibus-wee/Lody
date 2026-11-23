@@ -1,8 +1,6 @@
 import {
-  getCurrentPullRequestsByRepository,
-  resolveSessionPullRequests,
+  resolveSessionPullRequestViews,
   type SessionPullRequestLifecycleFields,
-  parseGitHubPullRequestUrl,
   type PrStatus,
   type ProjectMemberId,
   type SessionMeta,
@@ -11,6 +9,7 @@ import {
   type MachineId,
   type LocalProjectId,
   type LocalProjectMeta,
+  type LineChange,
 } from '@lody/shared';
 
 /** One repository of a multi-repository conversation, as the Info Bar lists it. */
@@ -33,7 +32,7 @@ export type SessionProjectMemberRow = {
   repoFullName?: string;
   branch?: string;
   /** Observed line changes for this Member, when the daemon has them. */
-  diff?: { add: number; del: number };
+  diff?: LineChange;
   pr?: { url: string; number: number; status: PrStatus; ciState?: SessionPullRequestCiState };
 };
 
@@ -63,16 +62,15 @@ export function buildSessionProjectMemberRows(
 ): SessionProjectMemberRow[] {
   const run = meta.projectRun;
   if (!run) return [];
-  const currentByRepo = new Map<string, { url: string; status: PrStatus; number: number }>();
-  for (const pr of getCurrentPullRequestsByRepository(resolveSessionPullRequests(meta))) {
-    const parsed = parseGitHubPullRequestUrl(pr.url);
-    if (parsed) {
-      currentByRepo.set(parsed.repoFullName.toLowerCase(), {
-        url: pr.url,
-        status: pr.status,
-        number: parsed.prNumber,
-      });
-    }
+  const currentByRepo = new Map<string, NonNullable<SessionProjectMemberRow['pr']>>();
+  for (const view of resolveSessionPullRequestViews(meta)) {
+    if (!view.current || !view.repoFullName || view.number === null) continue;
+    currentByRepo.set(view.repoFullName.toLowerCase(), {
+      url: view.url,
+      status: view.status,
+      number: view.number,
+      ...(view.ci ? { ciState: view.ci } : {}),
+    });
   }
 
   const entries = Object.entries(run.members).sort(([, left], [, right]) => left.o - right.o);
@@ -92,7 +90,6 @@ export function buildSessionProjectMemberRows(
     const memberId = id as ProjectMemberId;
     const repoFullName = getSessionProjectMemberRepository(member);
     const pr = repoFullName ? currentByRepo.get(repoFullName.toLowerCase()) : undefined;
-    const ciState = pr ? meta.pullRequestState?.[pr.url]?.s : undefined;
     const localRootPath =
       (member.access === 'additional' || member.access === 'link') &&
       member.src.kind === 'local' &&
@@ -110,7 +107,7 @@ export function buildSessionProjectMemberRows(
       ...(repoFullName ? { repoFullName } : {}),
       ...(member.branch ? { branch: member.branch } : {}),
       ...(member.diff ? { diff: member.diff } : {}),
-      ...(pr ? { pr: { ...pr, ...(ciState ? { ciState } : {}) } } : {}),
+      ...(pr ? { pr } : {}),
     });
     for (const child of children.get(memberId) ?? []) visit(child, depth + 1);
   };

@@ -13,7 +13,7 @@ import {
 
 /**
  * The conversation scroll engine's transaction logic, independent of React and
- * of the DOM. The adapter (`use-conversation-scroll-engine.tsx`) and the model
+ * of the DOM. The adapter (`engine-conversation-scroller.tsx`) and the model
  * tests' simulator both drive it through {@link ScrollHost}.
  *
  * Design, invariants I1–I8 and the coverage lemma:
@@ -78,6 +78,8 @@ export interface ScrollHost {
   readPaddingBottom(): number;
   /** Current heights of the given mounted rows; undefined for a row not in the DOM. */
   measure(keys: readonly string[]): ReadonlyArray<number | undefined>;
+  /** Positive-only origin shift; hosts opt in only with reliable native scrollend. */
+  setContentShift?(px: number): void;
   setExtent(px: number): void;
   setReplyRoom(px: number): void;
   writeScrollTop(value: number): void;
@@ -197,10 +199,13 @@ export class ScrollController {
   private glide: Glide | null = null;
   private viewportHeight: number;
   private contentTop = 0;
+  private contentShift = 0;
   private paddingBottom = 0;
   private viewportKnown = false;
   private extent = 0;
   private replyRoom = 0;
+  /** Temporary room below a manually toggled disclosure, released by reader movement. */
+  private disclosureSpace = false;
   private lastObserved: Observed | null = null;
   private pendingExternalMove = false;
   private tx: Transaction | null = null;
@@ -340,24 +345,25 @@ export class ScrollController {
 
   // ---- The commit protocol ------------------------------------------------
 
-  /** Call from the layout effect of every list commit. */
-  afterCommit(): void {
-    if (this.disposed) return;
+  /** Call from every list commit; true once its measured layout has settled. */
+  afterCommit(): boolean {
+    if (this.disposed) return false;
     if (this.updateLoopError) throw this.updateLoopError;
     const previous = this.committedPlan;
     this.committedPlan = this.lastPlan;
-    if (this.rows.length === 0 || this.hidden) return;
+    if (this.rows.length === 0 || this.hidden) return false;
     // A parent setState from `onScroll` (hydration, the top fade) re-commits
     // the list with the same layout. Starting a fresh cycle every time, then
     // reporting the offset again, is the React #185 nested-update loop.
     if (!this.tx) {
-      if (this.isSettled()) return;
+      if (this.isSettled()) return true;
     }
     this.checkSynchronousCommitBudget();
     if (!this.tx) {
       this.beginTransaction(this.reshown ? 'reshow' : 'commit', previous);
     }
     this.continueTransaction();
+    return this.tx === null;
   }
 
   /** Mounted rows changed size (ResizeObserver). */
@@ -419,6 +425,10 @@ export class ScrollController {
       // Reaching the exact edge needs no correction. Keep native input alive;
       // near-edge snapping and stale-range recovery wait for scrollend.
       this.setIntent({ kind: 'follow' }, true);
+    }
+    if (this.contentShift > 0 && scrollTop <= 0.5) {
+      this.run('origin-boundary', true);
+      return;
     }
     if (this.intent.kind !== 'read') {
       // A move that was not the reader's: the mode's position wins.
@@ -516,6 +526,9 @@ export class ScrollController {
       this.compensationPendingCheck = false;
       this.momentumStats = { compensations: 0, interruptions: 0 };
     }
+    if (!active && !continuesAfterRelease && this.contentShift > 0) {
+      this.run('origin-settle', true);
+    }
   }
 
   /** The native `scrollend` event. */
@@ -531,9 +544,33 @@ export class ScrollController {
     this.compensationPendingCheck = false;
     this.momentumStats = { compensations: 0, interruptions: 0 };
     this.rearmAtGestureBottom();
+    if (this.contentShift > 0) this.run('origin-settle', true);
   }
 
   // ---- Commands -----------------------------------------------------------
+
+  /** Hold a disclosure header in place before its body changes the layout. */
+  preserveDisclosure(rowKey: string, offsetPx: number, revealOffsetPx?: number): void {
+    if (this.disposed || this.hidden) return;
+    const index = this.geometry.indexOfKey(rowKey);
+    const row = this.rows[index];
+    if (!row) return;
+    this.refreshViewport();
+    const rowY = this.contentTop + this.geometry.offset(index) - this.readScrollTop();
+    let screenY = rowY + offsetPx;
+    // Mobile only asks for a preview when none of the details would be visible.
+    if (revealOffsetPx !== undefined && rowY + revealOffsetPx >= this.viewportHeight - 0.5) {
+      screenY -=
+        rowY + revealOffsetPx - this.viewportHeight + Math.min(96, this.viewportHeight / 4);
+    }
+    this.resetReaderInput();
+    this.cancelGlide();
+    this.gesture = null;
+    this.setIntent({ kind: 'read', anchor: anchorOfRow(row, offsetPx), screenY });
+    this.disclosureSpace = true;
+    // The click's state update and this commit are batched; measure the new body.
+    this.host.requestCommit(false);
+  }
 
   scrollToBottom(): void {
     if (this.disposed) return;
@@ -625,8 +662,17 @@ export class ScrollController {
     return this.intent;
   }
 
-  get scrollOffset(): number {
+  get physicalScrollOffset(): number {
     return this.lastObserved?.scrollTop ?? this.readScrollTop();
+  }
+
+  /** Consumer coordinates omit the temporary native-touch origin shift. */
+  get scrollOffset(): number {
+    return this.physicalScrollOffset + this.contentShift;
+  }
+
+  get contentOffset(): number {
+    return this.contentTop + this.contentShift;
   }
 
   get viewportSize(): number {
@@ -634,14 +680,14 @@ export class ScrollController {
   }
 
   get scrollSize(): number {
-    return this.contentTop + this.geometry.total() + this.replyRoom + this.paddingBottom;
+    return this.contentOffset + this.geometry.total() + this.replyRoom + this.paddingBottom;
   }
 
   get snapshot(): ScrollSnapshot {
     return {
       sourceGeneration: this.sourceGeneration,
       geometryRevision: this.geometry.revision,
-      scrollTop: this.scrollOffset,
+      scrollTop: this.physicalScrollOffset,
       viewportHeight: this.viewportHeight,
       extent: this.extent,
       contentTop: this.contentTop,
@@ -793,6 +839,22 @@ export class ScrollController {
       }
     }
     if (this.intent.kind === 'follow') room = 0;
+    if (this.intent.kind === 'read' && this.disclosureSpace) {
+      const resolved = resolveAnchor(this.rows, this.intent.anchor, this.geometry);
+      if (resolved) {
+        const position =
+          this.contentTop +
+          this.geometry.offset(resolved.index) +
+          resolved.offsetPx -
+          this.intent.screenY;
+        // A collapse near the end must not let the browser clamp away the header.
+        // One viewport bounds this space; scrolling shrinks it like sent reply room.
+        room = Math.min(
+          this.viewportHeight,
+          Math.max(0, position + this.viewportHeight - this.paddingBottom - bottomLimit)
+        );
+      }
+    }
 
     const extentBefore = this.extent;
     const roomBefore = this.replyRoom;
@@ -811,6 +873,32 @@ export class ScrollController {
     this.recordBottom(Math.max(0, this.host.readScrollHeight() - this.viewportHeight));
     this.host.setExtent(Math.max(extentBefore, total));
     this.host.setReplyRoom(Math.max(roomBefore, room));
+    // Growing history above a touch reader must not write the native offset:
+    // WebKit ends its fling on compensation. Move only the content origin up,
+    // keeping every logical row at the same screen line. A positive shift never
+    // opens a leading hole. Shrinkage still compensates immediately.
+    const nativeTouch = this.momentum || this.touchActive;
+    if (this.contentShift > 0 && (!nativeTouch || !tx.relative || tx.logicalSampled <= 0.5)) {
+      this.contentTop += this.contentShift;
+      this.contentShift = 0;
+      this.host.setContentShift?.(0);
+      target = this.targetScrollTop();
+    }
+    if (
+      this.host.setContentShift &&
+      nativeTouch &&
+      (this.gesture !== null || this.contentShift > 0) &&
+      tx.relative &&
+      tx.logicalSampled > 0.5 &&
+      target > tx.logicalSampled &&
+      Math.abs(tx.sampled - tx.logicalSampled) < 0.5
+    ) {
+      const growth = target - tx.logicalSampled;
+      this.contentShift += growth;
+      this.contentTop -= growth;
+      this.host.setContentShift(this.contentShift);
+      target = this.targetScrollTop();
+    }
     let expected: number;
     if (tx.relative) {
       expected = target;
@@ -946,7 +1034,8 @@ export class ScrollController {
     return true;
   }
 
-  private reportScroll(offset: number): void {
+  private reportScroll(physicalOffset: number): void {
+    const offset = physicalOffset + this.contentShift;
     if (this.lastReportedScroll !== null && Math.abs(this.lastReportedScroll - offset) < 0.5) {
       return;
     }
@@ -1151,6 +1240,7 @@ export class ScrollController {
     if (movement === 'none' || movement === 'own-write') return;
     const last = this.lastObserved;
     if (movement === 'reader') {
+      this.disclosureSpace = false;
       // Scroll steps precede animation callbacks. Actual movement confirms the
       // input for this sequence; a no-op input expires without needing scrollend.
       if (this.readerInputFrame !== null) this.host.cancelFrame(this.readerInputFrame);
@@ -1268,6 +1358,7 @@ export class ScrollController {
   }
 
   private setIntent(intent: Intent, preserveInput = false): void {
+    this.disclosureSpace = false;
     this.intent = intent;
     if (intent.kind !== 'read' && !preserveInput) this.resetReaderInput();
     const sticky = intent.kind !== 'read';

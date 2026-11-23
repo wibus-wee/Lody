@@ -16,6 +16,8 @@ export class ScheduleConfigurationError extends Error {
   }
 }
 
+const CAPACITY_EXHAUSTED = 'CAPACITY_EXHAUSTED';
+
 export type ScheduleEnginePorts<Prepared> = {
   workspaceId: string;
   machineId: string;
@@ -27,12 +29,19 @@ export type ScheduleEnginePorts<Prepared> = {
   encrypted?: boolean;
   authorize?: (request: ScheduleAuthorizationRequest) => Promise<boolean>;
   list: () => Promise<ScheduleRegistryRow[]>;
+  /** True for an activation a workspace import carried in; it never runs automatically here. */
+  importFenced?: (row: ScheduleRegistryRow) => Promise<boolean>;
   read: (scheduleId: string) => Promise<ScheduleDocument | null>;
   validateTarget: (run: ScheduleRun<Prepared>) => Promise<void>;
+  /**
+   * Quota reset time when the run's agent binding is definitively exhausted.
+   * Undefined for available, unknown or stale capacity, which dispatches as usual.
+   */
+  capacityRetryAt?: (run: ScheduleRun<Prepared>) => Promise<number | undefined>;
   prepare: (run: ScheduleRun<Prepared>) => Promise<Prepared>;
   materialize: (prepared: Prepared) => Promise<void>;
   isDispatched: (prepared: Prepared) => Promise<boolean>;
-  dispatch: (prepared: Prepared) => Promise<void>;
+  dispatch: (prepared: Prepared, run: ScheduleRun<Prepared>) => Promise<void | 'discarded'>;
   isFinished: (run: ScheduleRun<Prepared>) => Promise<boolean>;
   publish: (runtime: ScheduleRuntimeRow) => Promise<void>;
   onError: (error: unknown) => void;
@@ -110,6 +119,7 @@ export class ScheduleEngine<Prepared> {
     }
     for (const row of rows) {
       if (!this.owned(row) || !row.enabled) continue;
+      if (await p.importFenced?.(row)) continue;
       if (row.scheduledMessage && p.store.messageDispatch(p.workspaceId, row.scheduleId)) {
         await this.project(row, { nextScheduledAt: undefined });
         continue;
@@ -178,6 +188,7 @@ export class ScheduleEngine<Prepared> {
         });
         continue;
       }
+      if (await this.deferForCapacity(row, run, now)) continue;
       try {
         await this.authorize(run);
         let current = p.store.transition(run.runKey, [run.state], {
@@ -229,7 +240,15 @@ export class ScheduleEngine<Prepared> {
           continue;
         }
         await this.authorize(run);
-        await p.dispatch(current.prepared!);
+        const result = await p.dispatch(current.prepared!, current);
+        if (result === 'discarded') {
+          this.skip(p.store.get(current.runKey)!, 'QUOTA_RECOVERY_ALREADY_ACCEPTED');
+          await this.project(row, {
+            queueState: 'blocked',
+            blockedCode: 'QUOTA_RECOVERY_ALREADY_ACCEPTED',
+          });
+          continue;
+        }
         p.store.transition(run.runKey, ['session_prepared'], {
           state: 'dispatched',
           dispatchedAt: p.now(),
@@ -280,6 +299,51 @@ export class ScheduleEngine<Prepared> {
       if (this.owned(row) && row.scheduledMessage) await this.project(row, {});
   }
 
+  /**
+   * Defers a run whose agent quota is definitively exhausted until its reset,
+   * instead of dispatching it to fail. One deferred run per Schedule: later
+   * occurrences during the same exhaustion are skipped, so a reset never
+   * releases a burst. A run that could not start before its dispatch window
+   * closes is skipped. Any capacity read failure dispatches as usual.
+   */
+  private async deferForCapacity(
+    row: ScheduleRegistryRow,
+    run: ScheduleRun<Prepared>,
+    now: number
+  ): Promise<boolean> {
+    const eligible =
+      run.state === 'pending' ||
+      (run.state === 'retry_wait' && run.errorCode === CAPACITY_EXHAUSTED);
+    if (!eligible) return false;
+    const resetAt = await this.ports.capacityRetryAt?.(run).catch(() => undefined);
+    if (resetAt === undefined || resetAt <= now) return false;
+    const deferred = this.ports.store
+      .unfinished(this.ports.workspaceId)
+      .some(
+        (other) =>
+          other.runKey !== run.runKey &&
+          other.scheduleId === run.scheduleId &&
+          other.errorCode === CAPACITY_EXHAUSTED
+      );
+    if (deferred || resetAt - run.plannedAt >= run.definition.retryPolicy.dispatchMaxAgeMs) {
+      this.skip(run, CAPACITY_EXHAUSTED);
+    } else {
+      this.ports.store.transition(run.runKey, [run.state], {
+        state: 'retry_wait',
+        retryAt: resetAt,
+        errorCode: CAPACITY_EXHAUSTED,
+      });
+      this.ports.onEvent?.({
+        type: 'blocked',
+        scheduleId: run.scheduleId,
+        runKey: run.runKey,
+        code: CAPACITY_EXHAUSTED,
+      });
+    }
+    await this.project(row, { queueState: 'blocked', blockedCode: CAPACITY_EXHAUSTED });
+    return true;
+  }
+
   private async authorize(run: ScheduleRun<Prepared>): Promise<void> {
     if (!this.ports.encrypted) return;
     if (
@@ -318,6 +382,10 @@ export class ScheduleEngine<Prepared> {
     this.projections.set(row.scheduleId, {
       ...this.projections.get(row.scheduleId),
       ...(lastDispatch ? { lastDispatch } : {}),
+      ...(last?.activationId === row.activationId &&
+      last.errorCode === 'QUOTA_RECOVERY_ALREADY_ACCEPTED'
+        ? { blockedCode: last.errorCode }
+        : {}),
       ...(row.scheduledMessage
         ? {
             messageState: lastDispatch

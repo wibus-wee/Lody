@@ -13,7 +13,9 @@ import { fileURLToPath } from 'node:url'
 // ELECTRON_RUN_AS_NODE inside the app binary) — no ABI-specific rebuild.
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const electronAppRoot = path.resolve(__dirname, '..')
-const cliAppRoot = path.resolve(electronAppRoot, '../cli')
+const cliAppRoot = process.env.LODY_CLI_SOURCE_ROOT
+  ? path.resolve(process.env.LODY_CLI_SOURCE_ROOT)
+  : path.resolve(electronAppRoot, '../cli')
 const require = createRequire(import.meta.url)
 
 // Mirror of the published CLI's runtime dependencies (enforced by
@@ -58,7 +60,9 @@ const EXCLUDED_PACKAGE_DIRS = new Set([
   'test',
   'node_modules'
 ])
-export const stagedCliDir = path.join(electronAppRoot, 'resources', 'cli')
+export const stagedCliDir = process.env.LODY_CLI_STAGING_DIR
+  ? path.resolve(process.env.LODY_CLI_STAGING_DIR)
+  : path.join(electronAppRoot, 'resources', 'cli')
 export const stagedNodeModulesDir = path.join(stagedCliDir, 'node_modules')
 export const stagedSqliteDir = path.join(stagedNodeModulesDir, 'better-sqlite3')
 export const stagedNodePtyDir = path.join(stagedNodeModulesDir, '@lydell', 'node-pty')
@@ -365,9 +369,14 @@ function resolveInstalledNodePtyBinaryDir(packageName) {
  * install across its `os`/`cpu` fields without `--force`; the download itself is
  * platform-agnostic. Installed into a throwaway prefix so the workspace tree is untouched.
  */
-function fetchNativeBinaryPackage(packageName, version) {
+export function fetchNativeBinaryPackage(
+  packageName,
+  version,
+  spawn = spawnSync,
+  baseEnvironment = process.env
+) {
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lody-native-binding-'))
-  const result = spawnSync(
+  const result = spawn(
     process.platform === 'win32' ? 'npm.cmd' : 'npm',
     [
       'install',
@@ -380,7 +389,12 @@ function fetchNativeBinaryPackage(packageName, version) {
       '--ignore-scripts',
       '--force'
     ],
-    { stdio: 'inherit' }
+    {
+      stdio: 'inherit',
+      // This child alone must revalidate the registry packument. The harness
+      // exports prefer-offline; a stale cache would otherwise hide new versions.
+      env: { ...baseEnvironment, npm_config_prefer_offline: 'false' }
+    }
   )
 
   const packageDir = path.join(downloadDir, 'node_modules', ...packageName.split('/'))

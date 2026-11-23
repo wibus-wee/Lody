@@ -17,6 +17,7 @@ interface ImportMetaEnv {
   readonly VITE_CONVEX_SITE_URL: string;
   readonly VITE_ONESIGNAL_APP_ID: string;
   readonly VITE_ONESIGNAL_SAFARI_WEB_ID: string;
+  readonly VITE_PUSH_VAPID_PUBLIC_KEY: string;
   /**
    * Escape hatch that pins the Machine RPC response live transport. Unset (the
    * normal build) uses the SSE-first policy with its long-poll fallback.
@@ -36,7 +37,4 @@ interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
 
-interface Window {
-  OneSignal?: unknown;
-  OneSignalDeferred?: Array<(OneSignal: unknown) => void>;
-}
+interface Window {}

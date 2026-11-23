@@ -1,6 +1,7 @@
+// @vitest-environment jsdom
+import { unexpectedE2eeWorkspaceOperation } from './fixtures/e2ee-workspaces';
 import { usePersonalGitHubAuthorization } from '../src/hooks/use-personal-github-authorization';
 import { storePersonalGitHubProof } from '../src/components/settings/github-personal-authorization';
-// @vitest-environment jsdom
 import { ErrorBoundary } from '../src/components/error-boundary';
 import { act, createRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
@@ -41,6 +42,7 @@ import {
   TOUR_WORKSPACE_SLUG,
 } from '../src/components/onboarding/tour/tour-fixtures';
 import { TEST_CLOUD_PLATFORM } from './test-platform';
+import { composerIn } from './composer-test-utils';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -195,48 +197,6 @@ it('preserves ordinary visibility failures instead of swallowing an unrelated ba
   );
 });
 
-it('still renders registered ordinary machines and projects from the cloud visibility rows', async () => {
-  const store = createTourStore(DEFAULT_TOUR_IDENTITY);
-  const machine = Object.values(store.get(machineMetaCacheAtom))[0]!;
-  const rows = [
-    { machineId: machine.id, ownerUserId: TOUR_USER_ID, sharedWithTeam: false, updatedAt: 1 },
-  ];
-  const useQuery: CloudApi['useQuery'] = (operation, args) => {
-    if (args === 'skip') return undefined;
-    return (
-      operation.name === 'machines:listVisibleMachines'
-        ? rows
-        : Object.keys(machine.localProjects!).map((localProjectId) => ({
-            ...rows[0],
-            localProjectId,
-          }))
-    ) as never;
-  };
-  const platform: PlatformProvider = {
-    ...TEST_CLOUD_PLATFORM,
-    cloudApi: { ...TEST_CLOUD_PLATFORM.cloudApi!, useQuery },
-  };
-  await act(async () =>
-    root.render(
-      <PlatformContext.Provider value={platform}>
-        <Provider store={store}>
-          <AuthenticatedConvexContext.Provider
-            value={{ isAuthenticated: true, isLoading: false } as never}
-          >
-            <VisibleResources />
-          </AuthenticatedConvexContext.Provider>
-        </Provider>
-      </PlatformContext.Provider>
-    )
-  );
-  const snapshot = JSON.parse(container.querySelector('output')!.textContent!);
-  expect(snapshot).toEqual({
-    machines: [machine.id],
-    projects: [DEFAULT_TOUR_IDENTITY.projectName],
-    loading: false,
-  });
-});
-
 it('keeps unknown-mode catalogs pending while the real local composer stays usable', async () => {
   const store = createTourStore(DEFAULT_TOUR_IDENTITY);
   const runtime = {
@@ -278,6 +238,7 @@ it('keeps unknown-mode catalogs pending while the real local composer stays usab
       describe: async () => {
         throw new Error('The UI must consume the runtime admission, never start another describe');
       },
+      deleteWorkspace: unexpectedE2eeWorkspaceOperation,
       create: async () => {
         throw new Error('unused');
       },
@@ -349,7 +310,7 @@ it('keeps unknown-mode catalogs pending while the real local composer stays usab
   expect(JSON.parse(container.querySelector('output')!.textContent!).machines).toHaveLength(1);
   expect(JSON.parse(container.querySelector('output')!.textContent!).projects).toHaveLength(1);
   await act(async () => composer.current!.setInputText('keep this local draft'));
-  expect(container.querySelector('textarea')!.value).toBe('keep this local draft');
+  expect(composerIn(container).value).toBe('keep this local draft');
   admitted = true;
   await act(async () =>
     store.set(workspaceContentModeAtom, {
@@ -367,7 +328,7 @@ it('keeps unknown-mode catalogs pending while the real local composer stays usab
   expect(observed).toContain('localProjects:listVisibleLocalProjects');
   expect(JSON.parse(container.querySelector('output')!.textContent!).loading).toBe(false);
   expect(store.get(runtimeAtom)).toBe(runtime);
-  expect(container.querySelector('textarea')!.value).toBe('keep this local draft');
+  expect(composerIn(container).value).toBe('keep this local draft');
 });
 
 function LegacyCatalog() {

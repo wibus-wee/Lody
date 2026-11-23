@@ -4,10 +4,16 @@ Rules bind callers too. [Background](../../../../.agents/docs/components-package
 
 - Direct ordinary attachment uploads require trusted mode admission for the current account and workspace before sending source bytes; a provisional runtime is not that proof. Protected attachment failures never enable ordinary HTTP or plaintext local fallback.
 - Send/RPC await local commits, never Repo flush. Save `humanInputReceipts` before activation; RPC is redundant.
+- Encrypted sends refuse a host-verified machine withdrawal before any write. [Gate](../../../../.agents/notes/proposed/architecture/2026-10-28-e2ee-machine-sharing.md#sender-withdrawal-gate).
 - Retry immutable Roost input; absent receipts stay unknown. Cache/refresh keeps
   all input. Resolve owner routing per call.
 
 - Markdown caches hold bounded raw ASTs per grammar; clone per use; skip streams.
+
+Organization queries require matching authenticated sessions.
+
+Plain-text copy/paste uses `clipboard.ts`, never `navigator.clipboard`: native
+shells supply `window.__LODY_CLIPBOARD__` (Android WebView denies the web API).
 
 ## Electron IPC types
 
@@ -82,9 +88,11 @@ Rules bind callers too. [Background](../../../../.agents/docs/components-package
   readonly regardless of the index; saves stay inside the session workspace.
 - Validate file-index rows with shared Zod helpers; preserve structured lazy-directory
   entries so `@file` completion initializes directories before refreshing results.
-- Turn-scoped diffs come only from the CLI-local evidence store, never current disk,
-  All Changes, or the removed v1 capture. File/diff reads retain cross-render in-flight
-  limits; active requests release slots only on settlement.
+- Diff blobs require negotiation, current manifests, verified bytes and bounded caches.
+  Protected/local blobs never persist; hidden diffs cancel paging.
+- Turn diffs require the CLI-local store. Cross-render permits release
+  only on settlement.
+
 
 - Preview and More-menu shell actions share `useSessionFileActions`. Only Electron
   on the session's own machine may invoke them; explicit local absolute artifact

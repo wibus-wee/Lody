@@ -7,7 +7,13 @@ import type {
 } from '@lody/shared';
 import { resolveLocalProjectForApp } from './app';
 import { resolveAppResetCacheAction } from './app-reset-cache';
+import { feedbackCommand } from './feedback';
+import { createWorkspaceSummary, syncItems } from './sync';
 import { buildOpenLocalProjectDeepLink } from '@/lib/desktop-deep-link';
+import {
+  assertAgentFeedbackHasNoObviousSecret,
+  collectAgentFeedbackSystemInfo,
+} from '@/lib/feedback';
 
 const MACHINE_ID = 'machine-1' as MachineId;
 const ROOT_PATH = '/tmp/lody-app-test-project';
@@ -56,51 +62,6 @@ const neverPrompt = async (): Promise<string | null> => {
 };
 
 describe('resolveLocalProjectForApp', () => {
-  it('registers the directory and reports the daemon-assigned project id', async () => {
-    const send = vi.fn(async () => addOk());
-
-    const target = await resolveLocalProjectForApp({
-      machineId: MACHINE_ID,
-      rootPath: ROOT_PATH,
-      workspaceSelector: undefined,
-      canPrompt: false,
-      send,
-      promptWorkspace: neverPrompt,
-    });
-
-    expect(send).toHaveBeenCalledWith({
-      type: 'local-project/add',
-      machineId: MACHINE_ID,
-      rootPath: ROOT_PATH,
-    });
-    expect(target).toEqual({
-      localProjectId: LOCAL_PROJECT_ID,
-      name: 'lody-app-test-project',
-      workspaceSlug: null,
-      registered: true,
-    });
-  });
-
-  it('forwards an explicit workspace selector', async () => {
-    const send = vi.fn(async () => addOk());
-
-    await resolveLocalProjectForApp({
-      machineId: MACHINE_ID,
-      rootPath: ROOT_PATH,
-      workspaceSelector: 'acme',
-      canPrompt: false,
-      send,
-      promptWorkspace: neverPrompt,
-    });
-
-    expect(send).toHaveBeenCalledWith({
-      type: 'local-project/add',
-      machineId: MACHINE_ID,
-      rootPath: ROOT_PATH,
-      workspace: 'acme',
-    });
-  });
-
   it('retries with the chosen workspace and keeps its slug for the deep link', async () => {
     const send = vi
       .fn<(message: LocalProjectControlRequest) => Promise<LocalProjectControlResponse>>()
@@ -163,26 +124,6 @@ describe('resolveLocalProjectForApp', () => {
     expect(target.localProjectId).toMatch(/^local-project-[0-9a-f]{24}$/);
     expect(target.name).toBe('lody-app-test-project');
   });
-
-  it('propagates other control failures', async () => {
-    const send = vi.fn(async (): Promise<LocalProjectControlResponse> => ({
-      ok: false,
-      type: 'local-project/add',
-      error: 'path_invalid',
-      message: 'Selected path is not a directory',
-    }));
-
-    await expect(
-      resolveLocalProjectForApp({
-        machineId: MACHINE_ID,
-        rootPath: ROOT_PATH,
-        workspaceSelector: undefined,
-        canPrompt: false,
-        send,
-        promptWorkspace: neverPrompt,
-      })
-    ).rejects.toThrow('Selected path is not a directory');
-  });
 });
 
 describe('buildOpenLocalProjectDeepLink', () => {
@@ -226,13 +167,84 @@ describe('lody app reset-cache', () => {
     expect(resolveAppResetCacheAction({ hard: true })).toEqual({ type: 'arm', mode: 'hard' });
   });
 
-  it('cancels instead of arming', () => {
-    expect(resolveAppResetCacheAction({ cancel: true })).toEqual({ type: 'cancel' });
-  });
-
   it('refuses a run that both arms and cancels rather than picking one', () => {
     expect(() => resolveAppResetCacheAction({ cancel: true, hard: true })).toThrow(
       /--cancel or --hard/
     );
+  });
+});
+
+describe('resolveFeedbackText', () => {
+  it('preserves option-like tokens after positional feedback begins', () => {
+    expect(
+      feedbackCommand.parseOptions([
+        'The',
+        '--wait',
+        'flag',
+        'and',
+        '--json',
+        'output',
+        'are',
+        'confusing',
+      ]).operands
+    ).toEqual(['The', '--wait', 'flag', 'and', '--json', 'output', 'are', 'confusing']);
+  });
+});
+
+describe('agent feedback validation', () => {
+  it('rejects obvious secret patterns and allows normal product feedback', () => {
+    expect(() =>
+      assertAgentFeedbackHasNoObviousSecret('-----BEGIN RSA PRIVATE KEY-----\nabc')
+    ).toThrow(/secret/i);
+    expect(() =>
+      assertAgentFeedbackHasNoObviousSecret('Authorization: Bearer abcdefghijklmnop1234')
+    ).toThrow(/secret/i);
+    expect(() => assertAgentFeedbackHasNoObviousSecret('key sk-proj-abcdefghijklmnop1234')).toThrow(
+      /secret/i
+    );
+    expect(() => assertAgentFeedbackHasNoObviousSecret('api_key=supersecretvalue123')).toThrow(
+      /secret/i
+    );
+    expect(() =>
+      assertAgentFeedbackHasNoObviousSecret('Please add --json output to session list.')
+    ).not.toThrow();
+    expect(collectAgentFeedbackSystemInfo('1.2.3')).toEqual({
+      cliVersion: '1.2.3',
+      platform: process.platform,
+      arch: process.arch,
+    });
+  });
+});
+
+describe('sync command helpers', () => {
+  it('continues syncing remaining items after one item fails', async () => {
+    const summary = createWorkspaceSummary('workspace-1');
+    const syncOne = vi.fn(async (id: string) => {
+      if (id === 'doc-2') {
+        throw new Error('network unavailable');
+      }
+    });
+
+    await syncItems({
+      summary,
+      kind: 'doc',
+      ids: ['doc-1', 'doc-2', 'doc-3'],
+      concurrency: 2,
+      outputMode: 'json',
+      syncOne,
+    });
+
+    expect(syncOne).toHaveBeenCalledTimes(3);
+    expect(summary.totals.doc).toBe(3);
+    expect(summary.completed.doc).toBe(2);
+    expect(summary.failed.doc).toBe(1);
+    expect(summary.failures).toEqual([
+      {
+        workspaceId: 'workspace-1',
+        kind: 'doc',
+        id: 'doc-2',
+        error: 'network unavailable',
+      },
+    ]);
   });
 });

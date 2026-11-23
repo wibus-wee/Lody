@@ -38,24 +38,112 @@ note tools or change result delivery timing.
 ## Agent chat to a busy Session
 
 An orchestrating Agent sends corrections or new information to a Session that is
-still working. `lody_session_chat` and `lody_session_chat_many` steer that input
-into the running turn whenever the target runs on the calling Machine and its
-agent accepts steering, regardless of the human's queue or guide preference and
-of who started the running turn. The steered input gets its own reply, which
-becomes the Operation result; an earlier turn it interrupts ends at that point.
+still working. `lody_session_chat`, in single or batch mode, steers that input
+into the running turn on either Machine when its agent accepts steering, regardless
+of the human's queue or guide preference and of who started the running turn. A
+target whose agent cannot acknowledge a steer queues the input as its next ordinary
+turn. The steered input gets its own reply, which becomes its Operation result.
 
-A steer that is provably not delivered becomes the next ordinary turn, as it
-does for a human. An uncertain delivery is never replayed: the item fails with
+Steering hands off the running work; it does not fail it. A delegated input whose
+running turn is handed off to a steered input continues through that successor.
+Its Operation completes when the work completes, with the successor's final reply,
+and never reports `TARGET_FAILED` merely because it was steered.
+
+A chat that sends its input returns a delivery receipt saying what actually
+happened: `steered`, `queued` behind the running turn, or `dispatched` to an idle
+target. A steer that falls back to the queue reports `queued`. The receipt is
+response-only and never persisted, so older readers are unaffected. It is absent
+when the outcome is uncertain or was decided by an earlier attempt or replay.
+
+On the calling Machine, a steer that is provably not delivered becomes the next
+ordinary turn, as it does for a human. An uncertain delivery is never replayed: the item fails with
 non-retryable `STEER_DELIVERY_UNKNOWN`, and the requesting Agent decides whether
-to resend. Idle targets, targets on other Machines and recovery replay keep
-ordinary dispatch. Evidence: `sendSessionChatResult` in
+to resend.
+
+Remote targets use the shared active-assistant history resolver. Connection setup
+has a separate 15-second deadline; once connected, the steer request gets its own
+five-second response timeout, matching the UI. Late setup cannot send after fallback.
+If remote setup or delivery cannot confirm an outcome and no daemon owns recovery, promote only
+an unchanged `pending_apply` turn to ordinary dispatch. This favors availability
+over duplicate avoidance: a lost acknowledgement can cause a duplicate follow-up,
+but must never strand an input whose RPC did not arrive. Never resend the steer
+or cancel the target. An execution-owned settled outcome remains authoritative.
+Remote recovery replay promotes an orphan still awaiting steer without a new offer.
+Idle targets and missing active-turn evidence keep ordinary dispatch. Evidence: `sendSessionChatResult` in
 `apps/cli/src/commands/session.ts`, its suite `session-default-fallback.test.ts`,
 and item reconciliation in `apps/cli/src/orchestration/coordinator-workflow.ts`.
+Remote fallback rationale: [decision note](../.agents/notes/implemented/feature/2026-11-02-cross-machine-agent-steer.md).
+
+## Coordinating many Sessions
+
+One Agent coordinates a dozen long-running Sessions across Machines. It must tell
+what each Session is doing and why delegated work stopped, without reading full
+transcripts or inspecting processes on the Machine. Lody makes this state observable.
+Judging whether two pieces of work overlap is left to the coordinating Agent,
+because tasks cannot be enumerated as fixed keys. Lody does not claim tasks,
+lock tasks or reject sends as duplicates.
+
+- **Pull request lookup.** `lody_session_list` filters by pull request URL or
+  number using Session metadata `pullRequests`, without opening Session rooms.
+- **Identity, not content.** List and status items carry the title, associated
+  pull requests and branch. They carry no message text: previews of message
+  content must not enter Session metadata.
+- **Live activity.** `lody_session_status_many` asks the Machine that owns a busy
+  Session for turn start, last output time, the current action and queued inputs
+  at query time. The data is not published on presence channels. When the Machine
+  cannot answer, status keeps the existing `idle`/`busy` value with activity
+  `unknown`.
+- **Sender provenance.** An Agent-authored input reaches the target agent with
+  a Lody header naming the source Session and stating it is not human input.
+  Human inputs are unchanged. The header is derived from the recorded author at
+  execution time and is not written to history.
+- **Quoted authority.** An Agent relaying a human instruction may cite the
+  original message. Lody appends the original text with its recorded author,
+  checked against history. An unresolvable citation is delivered marked as an
+  unverified relay rather than rejected. No delegation token exists.
+- **Failure causes.** A failed target keeps its top-level code and adds a
+  normalized `reason` (`usage_limit`, `context_overflow`, `model_error`,
+  `permission_denied`, `cancelled`, `agent_crash`, or `unknown`), a redacted and
+  bounded `detail`, and the failed assistant Turn when recorded. `usage_limit`
+  carries `resetAt` when the notice names one, and `retryable` follows the
+  reason. An unclassifiable failure is `unknown`, never a guessed cause.
+  `lody_session_status_many` exposes the latest failure as `lastTurnFailure`
+  (`reason`, `detail`, `at`, `resetAt`), and failed `lody_session_history`
+  entries carry `isError` and `errorReason`.
+- **Result timing.** Completion results carry when the input was sent and how
+  many later inputs the target received meanwhile. Lody does not mark results
+  as superseded; the coordinating Agent judges staleness.
+- **History reads.** `lody_session_history` accepts `direction` (`backward`, the
+  default newest-first paging, or `forward` from the oldest), `role`, `since` and
+  `maxChars`. Cursors keep absolute positions, so later inputs never shift a page.
+  Text over `maxChars` is truncated with `truncated` and the original length,
+  never dropped.
+- **Short Session ids.** A unique prefix of a Session id in the workspace
+  resolves to that Session. An ambiguous prefix fails with
+  `SESSION_ID_AMBIGUOUS` listing at most eight candidates with id and title.
+- **Queued inputs.** A requester may list, withdraw or replace its own queued
+  inputs that have not started. A started input returns `ALREADY_STARTED` and is
+  never cancelled by this path.
+- **Machine resources.** `lody_catalog` action `machines` reports agent quota with reset
+  times and disk usage. Its `agent_configs` action and
+  `lody_session_create_options` report an exhausted scoped quota as
+  `quota_exhausted` with `availableAt`, so a coordinator stops dispatching to
+  that config until the window resets. Lody does not manage or report agent-held
+  locks.
+
+These additions avoid errors by design rather than adding gates. Uncertain
+observations degrade to `unknown` or an informational field; only an impossible
+request fails. New failure causes are tagged Effect errors, serialized to
+`{code, cause, retryable}` only at the MCP boundary.
+
+Out of scope: Lody-managed resource locks, review prompt templates (Agent Roles
+already carry fixed instructions), a checkpoint-before-cancel API, and changing
+completion output, which already omits tool calls.
 
 ## Session creation configuration
 
 An orchestrator can select the target Agent's advertised configuration on
-`lody_session_create` and `lody_session_create_many` without creating an Agent Role.
+`lody_session_create`, in single or batch mode, without creating an Agent Role.
 Optional `modeId` uses ACP mode ids; `configOptionValues` uses actual option ids
 with string or boolean values. All advertised options are eligible, including
 permission options without a category. Discovery reports modes and option
@@ -138,11 +226,21 @@ machine and project, and executes the same Role resolution and durable Operation
 state machine used by cloud. Hosted repository contexts remain unavailable;
 registered local projects and plain chat are supported.
 
+An Agent may keep working after its Turn ends, woken by its own background task,
+scheduled wake-up or cron. Until Stop, the Agent's exit or replacement, a
+collaboration stop or the next Turn, that same Agent's calls act for the last Turn
+that ended without Stop or cancellation, with that Turn's frozen identity. Only
+that Agent holds the Session's tool binding, so Lody does not require it to report
+its own activity; providers such as Codex report none.
+
 Recovery uses the frozen prompt, Role revision and dispatch configuration. Before
-replaying a missing target input, cloud confirms remote document catch-up; OSS
-confirms the authoritative daemon repo and rechecks the fixed Turn under the
-existing materialization claim. Missing cloud connectivity never counts as local
-authority in a cloud workspace. Completion writes directly to the native Inbox in
+replaying a missing target input, OSS and Cloud same-machine targets authored through
+the daemon's own repo confirm the authoritative daemon repo (`repo.flush()`) and
+recheck the fixed Turn under the existing materialization claim; Cloud remote-machine
+or locally absent targets confirm remote Streams document catch-up
+([availability trade-off](../.agents/notes/implemented/architecture/2026-11-21-cloud-same-machine-recovery-authority.md)).
+Missing cloud connectivity never counts as authority for remote targets or unverified
+cross-account access in a cloud workspace. Completion writes directly to the native Inbox in
 the same Operation transaction; the result-consumption rules below control execution.
 This changes local persisted storage, not the hosted API.
 
@@ -249,6 +347,26 @@ Consumption and retention are implemented in
 `apps/cli/src/session/session-execution-service.ts`, and reconciliation in
 `apps/cli/src/orchestration/operation-coordinator.ts`. Their owning suites cover
 transport failure, claim/settlement races, restart and result expiry.
+
+Steer handoff completion follows applied records in the Session's
+`steerOperationLedger` (`findSteerSuccessor` in `coordinator-model.ts`), covered by
+the `steer handoff` cases in `operation-coordinator.test.ts`. Delivery receipts are
+mapped by `deliveryFromSteerResponse` in `apps/cli/src/commands/session.ts` and
+covered by `session-default-fallback.test.ts`.
+
+The Coordinating many Sessions tools live in `apps/cli/src/mcp/lody-mcp-server.ts`
+(pull request filter, short ids, history paging, quotes, `lody_session_queue`),
+with live activity, sender headers and queued-input withdrawal answered by the
+owning Machine in `apps/cli/src/lib/message-handler.ts` behind the
+`sessionLiveActivity`, `machineDiskStatus` and `sessionInputWithdraw` protocol
+capabilities; older Machines degrade to `unknown` or an error outcome. Quota and
+disk come from `apps/cli/src/lib/resource-discovery.ts`. Two items remain
+unimplemented because they would add fields to strictly validated synced results
+that older clients reject: the count of later inputs in completion results, and a
+typed failure cause with a structured reset time. Failures currently carry the
+agent's failure reason and original message as text. Withdrawal of a started
+input reports the `already_started` outcome rather than an error code. No
+mixed-version multi-Machine run has been performed.
 
 This draft records the requested limit of 16. Runtime and deployed-client
 acceptance remain to be verified after dependencies are installed.

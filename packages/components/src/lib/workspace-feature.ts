@@ -15,6 +15,9 @@ export function workspaceFeatureUnavailableMessage(
     case 'schedules':
       message = 'Encrypted workspaces do not yet support scheduled messages.';
       break;
+    case 'automations':
+      message = 'Encrypted workspaces do not yet support automations.';
+      break;
     case 'preview-comments':
       message = 'Encrypted workspaces do not yet support preview comments.';
       break;
@@ -55,7 +58,7 @@ export function workspaceFeatureUnavailableMessage(
 /** Display copy for a protected file action the verified ledger role cannot perform. */
 export function protectedFileWriteDeniedMessage(t: TFunction = i18next.t): string {
   const message =
-    'Guests have read-only file access: saving, comparing changes, loading folders and change history are unavailable.';
+    "Guests can view a shared session's changes read-only, but cannot save, load folders or open change history.";
   return t('e2ee.unavailable.guest-file-write', { defaultValue: message }) || message;
 }
 

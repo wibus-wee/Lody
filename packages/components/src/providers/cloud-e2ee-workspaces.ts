@@ -28,7 +28,16 @@ export class E2eeClientUpgradeRequiredError extends Error {
  */
 export function createCloudE2eeWorkspaces(input: {
   session: () => PlatformSessionState;
-  remote: Pick<PlatformE2eeWorkspaces, 'create' | 'describe' | 'history' | 'memberProfiles'>;
+  remote: Pick<
+    PlatformE2eeWorkspaces,
+    | 'create'
+    | 'deleteWorkspace'
+    | 'describe'
+    | 'history'
+    | 'memberProfiles'
+    | 'subscribeLedgerHead'
+    | 'reportDeviceProfile'
+  >;
   prepareCreation?: PlatformE2eeWorkspaces['prepareCreation'];
   runtime?: PlatformE2eeWorkspaces['runtime'];
   refreshWorkspaces: () => Promise<void>;
@@ -46,6 +55,32 @@ export function createCloudE2eeWorkspaces(input: {
   const intentKey = (owner: string, requestId: string) => JSON.stringify([owner, requestId]);
 
   return {
+    ...(input.remote.subscribeLedgerHead
+      ? {
+          subscribeLedgerHead: ((request, changed, failed) => {
+            const owner = account();
+            const workspaceId = request.workspaceId;
+            let stopped = false;
+            const current = () => {
+              const session = input.session();
+              return !stopped && session.status === 'authenticated' && session.user.id === owner;
+            };
+            const unsubscribe = input.remote.subscribeLedgerHead!(
+              { workspaceId },
+              (head) => {
+                if (current() && head.workspaceId === workspaceId) changed(head);
+              },
+              (error) => {
+                if (current()) failed(error);
+              }
+            );
+            return () => {
+              stopped = true;
+              unsubscribe();
+            };
+          }) satisfies NonNullable<PlatformE2eeWorkspaces['subscribeLedgerHead']>,
+        }
+      : {}),
     ...(input.remote.memberProfiles
       ? {
           memberProfiles: async (request: { workspaceId: string }) => {
@@ -57,12 +92,28 @@ export function createCloudE2eeWorkspaces(input: {
             // Keep only display fields; callers must resolve IDs through verified ledger state.
             return {
               workspaceId,
+              devices: result.devices?.map(({ signingPublicKey, profile }) => ({
+                signingPublicKey,
+                profile,
+              })),
               profiles: result.profiles.map(({ cryptoUserId, name, image }) => ({
                 cryptoUserId,
                 name,
                 image,
               })),
             };
+          },
+        }
+      : {}),
+    ...(input.remote.reportDeviceProfile
+      ? {
+          reportDeviceProfile: async (
+            request: Parameters<NonNullable<PlatformE2eeWorkspaces['reportDeviceProfile']>>[0]
+          ) => {
+            const owner = account();
+            const result = await input.remote.reportDeviceProfile!(request);
+            assertAccount(owner);
+            return result;
           },
         }
       : {}),
@@ -117,22 +168,14 @@ export function createCloudE2eeWorkspaces(input: {
         throw new Error('e2ee_creation_receipt_mismatch');
       }
       if (input.runtime) {
-        try {
-          await input.runtime.recordCreated({
-            workspaceId: result.workspaceId,
-            genesisHash: original.genesisHashHex,
-            requestId: original.requestId,
-          });
-        } catch (error) {
-          if (
-            error instanceof Error &&
-            /e2ee_(?:conflict|local-evidence-conflict|account_mismatch)/.test(error.message)
-          )
-            throw error;
-          console.warn('Encrypted workspace local binding pending', {
-            code: 'e2ee_binding_pending',
-          });
-        }
+        // A committed cloud workspace with an unbound local identity cannot open.
+        // Keep the pending creation and surface the failure so the same request can
+        // resume instead of clearing its only recovery material.
+        await input.runtime.recordCreated({
+          workspaceId: result.workspaceId,
+          genesisHash: original.genesisHashHex,
+          requestId: original.requestId,
+        });
         assertAccount(owner);
       }
       // Listing is a projection: its failure must not turn a committed, validated
@@ -144,6 +187,14 @@ export function createCloudE2eeWorkspaces(input: {
       }
       assertAccount(owner);
       return result;
+    },
+    deleteWorkspace: async ({ workspaceId }) => {
+      const owner = account();
+      const receipt = await input.remote.deleteWorkspace({ workspaceId });
+      assertAccount(owner);
+      if (receipt.workspaceId !== workspaceId || receipt.deleted !== true)
+        throw new Error('e2ee_deletion_receipt_mismatch');
+      return receipt;
     },
     describe: async (request) => {
       const owner = account();
@@ -195,7 +246,17 @@ export function createCloudE2eeWorkspaces(input: {
       });
       assertAccount(owner);
       if (result.workspaceId !== workspaceId) throw new Error('e2ee_history_scope_mismatch');
-      return result;
+      // Pass on exactly the cloud-api page. A hosted backend may add fields of its own
+      // (such as storage capacity); hosts capture the page strictly and refuse unknown keys.
+      return {
+        workspaceId: result.workspaceId,
+        genesisHash: result.genesisHash,
+        checkpoint: { headHash: result.checkpoint.headHash, length: result.checkpoint.length },
+        startIndex: result.startIndex,
+        recordsHex: [...result.recordsHex],
+        position: result.position,
+        nextCursor: result.nextCursor,
+      };
     },
   };
 }

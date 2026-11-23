@@ -195,8 +195,7 @@ const buildActivityGroupKey = (messageId: string, first: AssistantActivityRender
 
 const buildAssistantTurnRenderBlocksFromEntries = (
   messageId: string,
-  entries: readonly AssistantMessageRenderItem[],
-  separateThoughts = false
+  entries: readonly AssistantMessageRenderItem[]
 ): AssistantTurnRenderBlock[] => {
   const blocks: AssistantTurnRenderBlock[] = [];
   let pendingActivityEntries: AssistantActivityRenderItem[] = [];
@@ -218,14 +217,6 @@ const buildAssistantTurnRenderBlocksFromEntries = (
       continue;
     }
     if (isActivityGroupEntry(entry)) {
-      const previous = pendingActivityEntries[0];
-      if (
-        separateThoughts &&
-        previous &&
-        (previous.content.type === 'thought') !== (entry.content.type === 'thought')
-      ) {
-        flushActivityGroup();
-      }
       pendingActivityEntries.push(entry);
       continue;
     }
@@ -305,51 +296,50 @@ const collectSegmentEntries = (
 export const buildAssistantTurnRenderLayout = (
   messageId: string,
   items: readonly MessageContent[],
-  isTurnFinished: boolean,
-  separateThoughts = false
+  isTurnFinished: boolean
 ): AssistantTurnRenderLayout => {
   const entries = buildAssistantMessageRenderItems(items);
-  const blocks = buildAssistantTurnRenderBlocksFromEntries(messageId, entries, separateThoughts);
+  const blocks = buildAssistantTurnRenderBlocksFromEntries(messageId, entries);
   const ranges = buildSegmentBlockRanges(blocks);
 
-  // Nothing folds while the turn streams, but the segment shape does not depend
-  // on that — keep it stable so only the fold state changes at turn end.
   const segments: AssistantTurnRenderSegment[] = ranges.map((blockRange, segmentIndex) => {
     const key = `segment:${messageId}:${segmentIndex}`;
-    if (!isTurnFinished) {
-      return { key, blockRange, workBlockKeys: new Set<string>(), firstWorkBlockIndex: -1 };
-    }
 
-    // The "keep the final contiguous text run visible" rule is applied PER
-    // SEGMENT: each region has its own answer tail. Applied across the whole
-    // turn, the plan would be demoted to process output just because
-    // implementation followed it.
-    const segmentEntries = collectSegmentEntries(blocks, blockRange);
-    const segmentContents = segmentEntries.map((entry) => entry.content);
     const collapsibleItemIndexes = new Set<number>();
-    segmentEntries.forEach((entry, indexInSegment) => {
-      if (
-        shouldCollapseAssistantMessageItem({
-          content: entry.content,
-          index: indexInSegment,
-          items: segmentContents,
-          isTurnFinished,
-        })
-      ) {
-        collapsibleItemIndexes.add(entry.itemIndex);
-      }
-    });
-
+    if (isTurnFinished) {
+      const segmentEntries = collectSegmentEntries(blocks, blockRange);
+      const segmentContents = segmentEntries.map((entry) => entry.content);
+      segmentEntries.forEach((entry, index) => {
+        if (
+          shouldCollapseAssistantMessageItem({
+            content: entry.content,
+            index,
+            items: segmentContents,
+            isTurnFinished,
+          })
+        )
+          collapsibleItemIndexes.add(entry.itemIndex);
+      });
+    }
     const segmentWorkBlockKeys = new Set<string>();
     let firstWorkBlockIndex = -1;
     for (let index = blockRange[0]; index < blockRange[1]; index += 1) {
       const block = blocks[index];
       if (!block) continue;
-      if (block.kind === 'activity_group' || collapsibleItemIndexes.has(block.entry.itemIndex)) {
-        segmentWorkBlockKeys.add(block.key);
-        if (firstWorkBlockIndex === -1) {
-          firstWorkBlockIndex = index;
-        }
+      const isLiveCommentary =
+        !isTurnFinished &&
+        block.kind === 'content' &&
+        block.entry.content.type === 'text' &&
+        block.entry.content.messagePhase === 'commentary';
+      if (
+        block.kind !== 'activity_group' &&
+        !isLiveCommentary &&
+        !collapsibleItemIndexes.has(block.entry.itemIndex)
+      )
+        continue;
+      segmentWorkBlockKeys.add(block.key);
+      if (firstWorkBlockIndex === -1) {
+        firstWorkBlockIndex = index;
       }
     }
     return { key, blockRange, workBlockKeys: segmentWorkBlockKeys, firstWorkBlockIndex };

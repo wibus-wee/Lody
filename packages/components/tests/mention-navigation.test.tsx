@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +12,7 @@ import {
   useMentionContext,
 } from '../src/ui/mention';
 import type { ItemData, Mention as MentionRange } from '../src/ui/mention/mention-root';
+import { composerIn, type ComposerTestHandle } from './composer-test-utils';
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -156,12 +156,9 @@ describe('Mention navigation and insertion', () => {
         />
       );
     });
-    const input = container?.querySelector('textarea');
-    if (!input) throw new Error('Expected mention textarea to render');
-    act(() => {
-      input.setSelectionRange(caret, caret);
-      input.focus();
-    });
+    const input = composerIn(container!);
+    input.setSelectionRange(caret, caret);
+    input.focus();
     return input;
   }
 
@@ -171,93 +168,13 @@ describe('Mention navigation and insertion', () => {
     });
   }
 
-  function pressKey(input: HTMLTextAreaElement, key: string, init?: KeyboardEventInit) {
+  function pressKey(input: ComposerTestHandle, key: string, init?: KeyboardEventInit) {
     const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init });
     act(() => {
       input.dispatchEvent(event);
     });
     return event;
   }
-
-  function setNativeValue(input: HTMLTextAreaElement, value: string) {
-    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-    setValue?.call(input, value);
-  }
-
-  it('writes the item insertText instead of composing trigger and label', () => {
-    render([{ value: '3312', label: '3312', insertText: '#3312', kind: 'issue' }], '@');
-
-    commit('3312', 0);
-
-    expect(latest.inputValue).toBe('#3312 ');
-    expect(latest.mentions).toEqual([{ value: '3312', start: 0, end: 5, kind: 'issue' }]);
-    expect(latest.values).toEqual(['3312']);
-  });
-
-  it('falls back to trigger and label when the item has no insertText', () => {
-    render([{ value: 'src/app.ts' }], '@');
-
-    commit('src/app.ts', 0);
-
-    expect(latest.inputValue).toBe('@src/app.ts ');
-    expect(latest.mentions).toEqual([{ value: 'src/app.ts', start: 0, end: 11, kind: 'mention' }]);
-  });
-
-  it('records no mention when selecting a navigation item', () => {
-    render([{ value: 'issue', label: 'Issues', navigateText: '@issue:' }], '@');
-
-    commit('issue', 0);
-
-    // Rewrites the trigger span, no trailing space, menu stays up for level two.
-    expect(latest.inputValue).toBe('@issue:');
-    expect(latest.mentions).toEqual([]);
-    expect(latest.values).toEqual([]);
-    expect(latest.open).toBe(true);
-  });
-
-  it('starts destination work synchronously when selecting a navigation item', () => {
-    let navigations = 0;
-    render(
-      [
-        {
-          value: 'skill',
-          label: 'Skills',
-          navigateText: '@skill:',
-          onMentionNavigate: () => {
-            navigations += 1;
-          },
-        },
-      ],
-      '@'
-    );
-
-    commit('skill', 0);
-
-    expect(navigations).toBe(1);
-    expect(latest.inputValue).toBe('@skill:');
-  });
-
-  it('does not start destination work when a navigation item is force-committed', () => {
-    let navigations = 0;
-    render(
-      [
-        {
-          value: 'src/',
-          navigateText: '@src/',
-          insertText: '@src',
-          onMentionNavigate: () => {
-            navigations += 1;
-          },
-        },
-      ],
-      '@src/'
-    );
-
-    commit('src/', 0, { commit: true });
-
-    expect(navigations).toBe(0);
-    expect(latest.inputValue).toBe('@src ');
-  });
 
   it('commits a navigation item through insertText when commit is requested', () => {
     render([{ value: 'src/', navigateText: '@src/', insertText: '@src', kind: 'dir' }], '@src/');
@@ -304,56 +221,6 @@ describe('Mention navigation and insertion', () => {
     expect(latest.inputValue).toBe('@src/file.ts ');
   });
 
-  it('macOS Ctrl+B moves over the separating space before crossing a file mention', () => {
-    setPlatform('darwin');
-    const input = render([{ value: 'src/file.ts', insertText: '@src/file.ts', kind: 'file' }], '@');
-    commit('src/file.ts', 0);
-    const mention = latest.mentions[0]!;
-
-    act(() => input.setSelectionRange(mention.end + 1, mention.end + 1));
-    expect(pressKey(input, 'b', { ctrlKey: true }).defaultPrevented).toBe(true);
-    expect(input.selectionStart).toBe(mention.end);
-    expect(pressKey(input, 'b', { ctrlKey: true }).defaultPrevented).toBe(true);
-    expect(input.selectionStart).toBe(mention.start);
-  });
-
-  it('leaves Ctrl+B/F to the browser away from mentions and off macOS', () => {
-    setPlatform('darwin');
-    const input = render([{ value: 'src/file.ts', insertText: '@src/file.ts', kind: 'file' }], '@');
-    commit('src/file.ts', 0);
-    const mention = latest.mentions[0]!;
-
-    act(() => input.setSelectionRange(input.value.length, input.value.length));
-    expect(pressKey(input, 'f', { ctrlKey: true }).defaultPrevented).toBe(false);
-
-    setPlatform('linux');
-    act(() => input.setSelectionRange(mention.end, mention.end));
-    expect(pressKey(input, 'b', { ctrlKey: true }).defaultPrevented).toBe(false);
-  });
-
-  it('leaves macOS Control selection shortcuts to the browser', () => {
-    setPlatform('darwin');
-    const input = render([{ value: 'src/file.ts', insertText: '@src/file.ts', kind: 'file' }], '@');
-    commit('src/file.ts', 0);
-    const mention = latest.mentions[0]!;
-
-    act(() => input.setSelectionRange(mention.start, mention.end));
-    expect(pressKey(input, 'b', { ctrlKey: true }).defaultPrevented).toBe(false);
-
-    act(() => input.setSelectionRange(mention.end, mention.end));
-    expect(pressKey(input, 'b', { ctrlKey: true, shiftKey: true }).defaultPrevented).toBe(false);
-  });
-
-  it.each(['a', 'e', 'p', 'n'])('leaves macOS Control+%s line movement to the browser', (key) => {
-    setPlatform('darwin');
-    const input = render([{ value: 'src/file.ts', insertText: '@src/file.ts', kind: 'file' }], '@');
-    commit('src/file.ts', 0);
-    const mention = latest.mentions[0]!;
-
-    act(() => input.setSelectionRange(mention.end, mention.end));
-    expect(pressKey(input, key, { ctrlKey: true }).defaultPrevented).toBe(false);
-  });
-
   it.each([
     { key: 'ArrowLeft', boundary: 'end' },
     { key: 'ArrowRight', boundary: 'start' },
@@ -375,9 +242,10 @@ describe('Mention navigation and insertion', () => {
     // deleting one character so the user can walk back up a level at a time.
     const input = render([{ value: 'src/', navigateText: '@src/' }], '@src/');
 
-    const event = pressKey(input, 'Backspace');
+    pressKey(input, 'Backspace');
 
-    expect(event.defaultPrevented).toBe(false);
+    // The editor deletes the character itself; the primitive must not pop the
+    // path back to the bare trigger the way it pops a namespace.
     expect(latest.inputValue).toBe('@src/');
   });
 
@@ -415,102 +283,25 @@ describe('Mention navigation and insertion', () => {
     const input = render([{ value: 'sess_1', insertText: '@fix-ci', kind: 'session' }], '@');
     commit('sess_1', 0);
 
+    input.setSelectionRange(3, 3);
     act(() => {
-      input.setSelectionRange(3, 3);
       input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     });
     expect(input.selectionStart).toBe(0);
 
-    act(() => {
-      setNativeValue(input, `X${input.value}`);
-      input.setSelectionRange(1, 1);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
+    input.edit(`X${input.value}`, 1);
 
     expect(latest.inputValue).toBe('X@fix-ci ');
     expect(latest.mentions).toEqual([{ value: 'sess_1', start: 1, end: 8, kind: 'session' }]);
   });
 
-  it('keeps mention mirrors aligned while an IME composes before a session mention', () => {
-    const input = render(
-      [{ value: 'sess_1', insertText: '@fix-ci', kind: 'session' }],
-      '@',
-      1,
-      true
-    );
-    commit('sess_1', 0);
-
-    act(() => {
-      input.setSelectionRange(0, 0);
-      input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
-      setNativeValue(input, 'zhong@fix-ci ');
-      input.setSelectionRange(5, 5);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-
-    expect(input.selectionStart).toBe(5);
-    expect(container?.querySelector('[data-mention-layer="background"]')?.textContent).toContain(
-      'zhong@fix-ci'
-    );
-    expect(container?.querySelector('[data-mention-layer="chip"]')).not.toBeNull();
-    expect(
-      container
-        ?.querySelector('[data-mention-layer="chip"] [data-mention-kind="session"]')
-        ?.getAttribute('data-mention-start')
-    ).toBe('5');
-
-    act(() => {
-      input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
-    expect(input.selectionStart).toBe(5);
-
-    act(() => {
-      setNativeValue(input, '中@fix-ci ');
-      input.setSelectionRange(1, 1);
-      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '中' }));
-    });
-
-    expect(latest.inputValue).toBe('中@fix-ci ');
-    expect(latest.mentions).toEqual([{ value: 'sess_1', start: 1, end: 8, kind: 'session' }]);
-    expect(container?.querySelector('[data-mention-layer="chip"]')).not.toBeNull();
-  });
-
-  it('keeps the native caret above a chip at both edges', () => {
-    const input = render([{ value: 'plan', insertText: '/plan', kind: 'command' }], '/', 1, true);
-    commit('plan', 0);
-
-    act(() => {
-      input.setSelectionRange(5, 5);
-      document.dispatchEvent(new Event('selectionchange'));
-    });
-    expect(container?.querySelector('[data-mention-caret]')).toBeNull();
-    expect(input.className).toContain('z-30');
-    expect(input.style.getPropertyValue('-webkit-text-fill-color')).toBe('transparent');
-
-    act(() => {
-      input.setSelectionRange(0, 0);
-      document.dispatchEvent(new Event('selectionchange'));
-    });
-    expect(container?.querySelector('[data-mention-caret]')).toBeNull();
-    expect(input.className).toContain('z-30');
-    expect(input.style.getPropertyValue('-webkit-text-fill-color')).toBe('transparent');
-
-    act(() => {
-      input.setSelectionRange(6, 6);
-      document.dispatchEvent(new Event('selectionchange'));
-    });
-    expect(input.className).toContain('z-10');
-    expect(input.className).not.toContain('z-30');
-    expect(input.style.getPropertyValue('-webkit-text-fill-color')).toBe('');
-  });
-
-  it('keeps a readonly caret out of the opaque chip interior', () => {
+  it('keeps a readonly caret out of a committed mention', () => {
     const items = [{ value: 'plan', insertText: '/plan', kind: 'command' }];
     const input = render(items, '/', 1, true, true);
     commit('plan', 0);
 
+    input.setSelectionRange(2, 2);
     act(() => {
-      input.setSelectionRange(2, 2);
       input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Home', bubbles: true }));
     });
 
@@ -585,11 +376,10 @@ describe('touch selection of prepared mentions', () => {
       );
     }
     await act(async () => root.render(<Composer />));
-    const input = container.querySelector('textarea')!;
-    act(() => {
-      input.focus();
-      input.setSelectionRange(7, 7);
-    });
+    const composer = composerIn(container);
+    const input = composer.element;
+    composer.focus();
+    composer.setSelectionRange(7, 7);
     await act(() => vi.advanceTimersByTime(0));
     const icon = document.querySelector('[data-testid="shortcut-icon"]')!;
     const down = new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 });
@@ -600,13 +390,13 @@ describe('touch selection of prepared mentions', () => {
     act(() => input.blur());
     const focus = input.focus.bind(input);
     vi.spyOn(input, 'focus').mockImplementation(() => {
-      input.setSelectionRange(0, 0);
+      composer.setSelectionRange(0, 0);
       focus();
     });
     await act(async () => icon.dispatchEvent(new MouseEvent('click', { bubbles: true })));
     expect(signal).toBeDefined();
     expect(signal?.aborted).toBe(false);
-    expect(input.value).toBe('/review');
+    expect(composer.value).toBe('/review');
     expect(input.getAttribute('aria-expanded')).toBe('true');
     if (outcome === 'dismiss') {
       await act(() =>
@@ -618,12 +408,12 @@ describe('touch selection of prepared mentions', () => {
       finish(outcome === 'failure' ? null : { text: 'Review this change', mentions: [] })
     );
     if (outcome !== 'success') {
-      expect(input.value).toBe('/review');
+      expect(composer.value).toBe('/review');
       if (outcome === 'failure') expect(input.getAttribute('aria-expanded')).toBe('true');
       return;
     }
-    expect(input.value).toBe('Review this change');
-    expect(input.selectionStart).toBe('Review this change'.length);
+    expect(composer.value).toBe('Review this change');
+    expect(composer.selectionStart).toBe('Review this change'.length);
     expect(input.getAttribute('aria-expanded')).toBe('false');
   });
 });

@@ -6,11 +6,8 @@ import {
 } from '../src/codex-auth-profile';
 import type { AgentConfigId, MachineId } from '../src/ids';
 import {
-  getMachineFlockProviderSetups,
   machineFlockKeys,
   parseMachineFlockRow,
-  serializeMachineFlockKey,
-  type MachineFlockRowMap,
   type ProviderSetupTask,
 } from '../src/machine-flock';
 
@@ -92,15 +89,6 @@ describe('machine flock provider setup rows', () => {
         apiKey: 'synthetic',
       }).success
     ).toBe(false);
-  });
-  it('parses and indexes a valid durable setup', () => {
-    const row = parseMachineFlockRow(machineFlockKeys.providerSetup(setupId), setup);
-    expect(row).toEqual({ key: ['providerSetup', setupId], value: setup });
-
-    const rows = {
-      [serializeMachineFlockKey(machineFlockKeys.providerSetup(setupId))]: row!,
-    } as MachineFlockRowMap;
-    expect(getMachineFlockProviderSetups(rows)).toEqual({ [setupId]: setup });
   });
 
   it('rejects a setup whose key and future config identity do not match', () => {

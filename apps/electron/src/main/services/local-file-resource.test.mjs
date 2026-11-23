@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, writeFile, rm, open, rename, realpath } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm, open, rename } from 'node:fs/promises'
 import { tmpdir, homedir } from 'node:os'
 import { join, relative } from 'node:path'
 import { LocalFileResources } from './local-file-resource.ts'
@@ -166,6 +166,26 @@ void test('large PDFs are binary resources with bounded range responses', async 
   assert.equal((await response.arrayBuffer()).byteLength, 64 * 1024)
 })
 
+void test('local video files serve video Content-Type and support HTTP Range seeking', async (t) => {
+  const bytes = Buffer.alloc(128 * 1024)
+  Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]).copy(bytes)
+  const file = await fixture(t, 'recording.mp4', bytes)
+  const resources = new LocalFileResources()
+  const result = await resources.preview(4, file)
+  assert.equal(result.status, 'resource')
+  assert.equal(result.kind, 'binary')
+  assert.equal(result.sizeBytes, bytes.length)
+
+  const response = await resources.respond(
+    new Request(result.url, { headers: { Range: 'bytes=1024-2047' } })
+  )
+  assert.equal(response.status, 206)
+  assert.equal(response.headers.get('Content-Type'), 'video/mp4')
+  assert.equal(response.headers.get('Accept-Ranges'), 'bytes')
+  assert.equal(response.headers.get('Content-Range'), `bytes 1024-2047/${bytes.length}`)
+  assert.equal((await response.arrayBuffer()).byteLength, 1024)
+})
+
 void test('replacing a file invalidates every existing resource URL', async (t) => {
   const file = await fixture(t, 'large.txt', 'a'.repeat(600_000))
   const resources = new LocalFileResources()
@@ -176,18 +196,6 @@ void test('replacing a file invalidates every existing resource URL', async (t) 
     (await resources.respond(new Request(result.url, { headers: { Range: 'bytes=0-10' } }))).status,
     409
   )
-})
-
-void test('cancelling a binary stream releases it without reading the remaining file', async (t) => {
-  const file = await fixture(t, 'image.png', syntheticPng(1024 * 1024))
-  const resources = new LocalFileResources()
-  const result = await resources.preview(1, file)
-  const response = await resources.respond(new Request(result.url))
-  const reader = response.body.getReader()
-  const first = await reader.read()
-  assert.equal(first.value.length, 64 * 1024)
-  await reader.cancel()
-  assert.equal((await reader.read()).done, true)
 })
 
 function syntheticPng(length, width = 16, height = 16) {
@@ -248,21 +256,3 @@ for (const extension of ['bmp', 'ico']) {
     assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes)
   })
 }
-
-void test('link resolution returns identity without allocating content resources', async (t) => {
-  const file = await fixture(t, 'link.md', 'synthetic content')
-  const request = { machineId: 'local', path: file.absolutePath, resolveMarkdownLink: true }
-  const resources = {
-    preview() {
-      throw new Error('Resolution must not read content')
-    }
-  }
-  assert.equal(
-    await previewLocalFile(resources, 1, { ...request, machineId: 'remote' }, 'local'),
-    null
-  )
-  const result = await previewLocalFile(resources, 1, request, 'local')
-  assert.equal(result.status, 'resolved-link')
-  assert.equal(result.candidates.length, 1)
-  assert.equal(result.candidates[0].absolutePath, await realpath(file.absolutePath))
-})

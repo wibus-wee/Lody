@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import * as stylex from '@stylexjs/stylex';
+import { useMemo, useState, type CSSProperties } from 'react';
 import type { Meta, StoryObj } from '@storybook/react';
 import { Provider, createStore } from 'jotai';
 import { createLocalPlatformProvider, createStaticStore } from '@lody/platform';
@@ -22,6 +23,25 @@ import type { UserMessageEditMentionContext } from '@/components/ai-gui/view';
 import { MessageRowView } from '@/components/ai-gui/view';
 import type { ConversationFontSize } from '@/atoms/settings';
 import type { MentionProjectSource } from '@/components/mentions/mention-project-file-source';
+
+const mergedStoryLayout = stylex.create({
+  fullWidth: {
+    containerType: 'inline-size',
+    width: '100%',
+  },
+});
+
+const storyLayout = stylex.create({
+  row: {
+    display: 'flex',
+    width: '42rem',
+    'max-width': '100%',
+    'justify-content': 'flex-end',
+  },
+  frame: {
+    width: '22rem',
+  },
+});
 
 const SHORT_TEXT = '你好';
 const LONG_TEXT = Array.from(
@@ -147,7 +167,7 @@ function EditorHarness({
     // The editor lives right-aligned in the user column, so preview it that way.
     <PlatformContext.Provider value={storyPlatform}>
       <Provider store={store}>
-        <div className="flex w-[42rem] max-w-full justify-end">
+        <div {...stylex.props(storyLayout.row)}>
           <UserMessageEditor
             value={value}
             onChange={setValue}
@@ -180,26 +200,53 @@ export const ShortMessage: Story = {
   render: () => <EditorHarness initialValue={SHORT_TEXT} />,
 };
 
-function FromMessageEditHarness() {
+export const OwnedThemeScopes: Story = {
+  render: () => (
+    <div
+      data-owned-editor-scopes=""
+      style={
+        {
+          width: 'min(42rem, calc(100vw - 32px))',
+          '--input': '220 25% 26%',
+          '--input-border': '24 80% 56%',
+        } as CSSProperties
+      }
+    >
+      <button type="button" data-editor-blur-target="">
+        Outside editor focus target
+      </button>
+      <div className="dark-scope" data-owned-editor-scope="dark">
+        <EditorHarness initialValue={SHORT_TEXT} />
+      </div>
+      <div className="dark-scope light-scope" data-owned-editor-scope="light">
+        <EditorHarness initialValue={SHORT_TEXT} />
+      </div>
+    </div>
+  ),
+};
+
+function FromMessageEditHarness({ fullWidth = false }: { fullWidth?: boolean }) {
   const store = useMemo(() => createStoryStore(), []);
   return (
     <PlatformContext.Provider value={storyPlatform}>
       <Provider store={store}>
-        <MessageRowView
-          sessionId={STORY_SESSION_ID}
-          message={
-            {
-              id: 'editable-user-message',
-              role: 'user',
-              timestamp: '2026-09-12T10:00:00.000Z',
-              status: 'seen',
-              read: true,
-              items: [{ type: 'text', text: 'Clarify this instruction' }],
-            } satisfies SessionHistoryParsed
-          }
-          onEdit={async () => true}
-          editMentionContext={storyEditMentionContext}
-        />
+        <div {...stylex.props(fullWidth && mergedStoryLayout.fullWidth)}>
+          <MessageRowView
+            sessionId={STORY_SESSION_ID}
+            message={
+              {
+                id: 'editable-user-message',
+                role: 'user',
+                timestamp: '2026-09-12T10:00:00.000Z',
+                status: 'seen',
+                read: true,
+                items: [{ type: 'text', text: 'Clarify this instruction' }],
+              } satisfies SessionHistoryParsed
+            }
+            onEdit={async () => true}
+            editMentionContext={storyEditMentionContext}
+          />
+        </div>
       </Provider>
     </PlatformContext.Provider>
   );
@@ -207,6 +254,12 @@ function FromMessageEditHarness() {
 
 export const FromMessageEdit: Story = {
   render: () => <FromMessageEditHarness />,
+};
+
+/** Full-width user row: the 70% stack is wider than the editor's 800px cap. */
+export const FullWidthFromMessageEdit: Story = {
+  render: () => <FromMessageEditHarness fullWidth />,
+  parameters: { layout: 'fullscreen' },
 };
 
 /**
@@ -235,7 +288,7 @@ export const LargeFontSize: Story = {
 
 export const NarrowColumn: Story = {
   render: () => (
-    <div className="w-[22rem]">
+    <div {...stylex.props(storyLayout.frame)}>
       <EditorHarness initialValue={SHORT_TEXT} />
     </div>
   ),

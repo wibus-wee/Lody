@@ -8,9 +8,8 @@ import { createStore, Provider } from 'jotai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionId, SessionMeta } from '@lody/shared';
 
-import { conversationWideModeAtom, experimentalFeaturesEnabledAtom } from '../src/atoms/settings';
+import { experimentalFeaturesEnabledAtom } from '../src/atoms/settings';
 import { SessionHeaderMenu } from '../src/components/sessions/session-chat-interface';
-import { Tooltip } from '@lody/ui/tooltip';
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -73,6 +72,10 @@ describe('SessionHeaderMenu', () => {
       'button[aria-label="More actions"]'
     );
     expect(trigger).toBeInstanceOf(HTMLButtonElement);
+    await pressTrigger(trigger!);
+  }
+
+  async function pressTrigger(trigger: HTMLElement): Promise<void> {
     await act(async () => {
       trigger?.dispatchEvent(
         new TestPointerEvent('mousedown', {
@@ -125,83 +128,166 @@ describe('SessionHeaderMenu', () => {
     expect(container?.querySelector('[data-testid="fork-result"]')?.textContent).toBe('none');
   }
 
-  it('leaves pointer-opened actions unhighlighted and toggles full width only on activation', async () => {
-    const store = createStore();
-    store.set(conversationWideModeAtom, false);
-    await act(async () => {
+  async function openInfoDialog(menuOpen = false): Promise<HTMLElement> {
+    if (!menuOpen) await openMenu();
+    await act(async () => menuItem('Session info').click());
+    const dialog = document.querySelector<HTMLElement>('[data-testid="session-info-dialog"]');
+    expect(dialog).toBeInstanceOf(HTMLElement);
+    return dialog!;
+  }
+
+  it('lists where the session lives in the info dialog instead of menu rows', async () => {
+    const onOpenPr = vi.fn();
+    await act(async () =>
       root?.render(
-        <Provider store={store}>
-          <ForkMenuHarness />
-        </Provider>
-      );
-    });
-    await openMenu();
-
-    const menu = document.querySelector('[role="menu"]');
-    const fullWidth = menuItem('Full width');
-    const toggle = fullWidth.querySelector<HTMLButtonElement>('[role="switch"]')!;
-    expect(document.activeElement).toBe(menu);
-    expect(menu?.querySelector('[data-highlighted]')).toBeNull();
-    expect(store.get(conversationWideModeAtom)).toBe(false);
-
-    await act(async () => {
-      menu?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-      await vi.advanceTimersByTimeAsync(40);
-    });
-    expect(document.activeElement).toBe(fullWidth);
-    expect(fullWidth.hasAttribute('data-highlighted')).toBe(true);
-
-    await act(async () => {
-      fullWidth.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    });
-    expect(store.get(conversationWideModeAtom)).toBe(true);
-    expect(document.querySelector('[role="menu"]')).toBe(menu);
-
-    await act(async () => toggle.click());
-    expect(store.get(conversationWideModeAtom)).toBe(false);
-    expect(document.querySelector('[role="menu"]')).toBe(menu);
-  });
-
-  it('focuses the first action when the menu is opened with the keyboard', async () => {
-    await act(async () => root?.render(<ForkMenuHarness />));
-    const trigger = container!.querySelector<HTMLButtonElement>(
-      'button[aria-label="More actions"]'
-    )!;
-    await act(async () => {
-      trigger.focus();
-      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-      await vi.advanceTimersByTimeAsync(40);
-    });
-    const fullWidth = menuItem('Full width');
-    expect(document.activeElement).toBe(fullWidth);
-    expect(fullWidth.hasAttribute('data-highlighted')).toBe(true);
-
-    await act(async () => {
-      fullWidth.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(40);
-    });
-    expect(document.querySelector('[role="menu"]')).toBeNull();
-  });
-
-  it('opens the submenu and forks to a new tab', async () => {
-    await act(async () => root?.render(<ForkMenuHarness />));
-    await openForkMenu();
-    expect(menuItem('Copy context as Markdown')).toBeDefined();
-    await act(async () => menuItem('Fork to new tab').click());
-    expect(container?.querySelector('[data-testid="fork-result"]')?.textContent).toBe('shared');
-    expect(document.querySelector('[role="menu"]')).toBeNull();
-  });
-
-  it('forks into a new worktree when that destination is available', async () => {
-    await act(async () => root?.render(<ForkMenuHarness forkWorktreeAvailability="available" />));
-    await openForkMenu();
-    await act(async () => menuItem('Fork to new worktree').click());
-    expect(container?.querySelector('[data-testid="fork-result"]')?.textContent).toBe(
-      'new-worktree'
+        <SessionHeaderMenu
+          session={{
+            ...session,
+            project: { kind: 'github', repoFullName: 'acme/widgets', branch: 'main' },
+            repoFullName: 'acme/widgets',
+            baseBranch: 'main',
+            branchName: 'feat/menu',
+          }}
+          workspacePath="/work/widgets"
+          machineName="build-box"
+          pullRequest={{ number: 42, status: 'open', onOpen: onOpenPr }}
+          sharing={{
+            visibility: 'team',
+            access: 'edit',
+            canManage: true,
+            machineId: session.machineId,
+            localProjectId: null,
+            machineName: 'build-box',
+            projectName: null,
+          }}
+          onCopyUrl={() => {}}
+          t={translate}
+        />
+      )
     );
-    expect(document.querySelector('[role="menu"]')).toBeNull();
+    await openMenu();
+    const menuText = document.querySelector('[role="menu"]')?.textContent ?? '';
+    for (const hidden of [
+      'acme/widgets',
+      'feat/menu',
+      'build-box',
+      'Team can edit',
+      'new window',
+    ]) {
+      expect(menuText).not.toContain(hidden);
+    }
+
+    const dialog = await openInfoDialog(true);
+    for (const shown of [
+      'acme/widgets',
+      'feat/menu',
+      'main',
+      '#42',
+      'build-box',
+      '/work/widgets',
+    ]) {
+      expect(dialog.textContent).toContain(shown);
+    }
+    expect(dialog.textContent).toContain('Team can edit');
+    const prButton = Array.from(dialog.querySelectorAll('button')).find((button) =>
+      button.textContent?.includes('#42')
+    );
+    await act(async () => prButton?.click());
+    expect(onOpenPr).toHaveBeenCalledTimes(1);
+  });
+
+  it('lists the IDE launcher only while the header pill is hidden', async () => {
+    let pillVisible = true;
+    const openInIde = {
+      options: [vscodeLauncher],
+      selected: vscodeLauncher,
+      onOpen: () => {},
+      onSelect: () => {},
+    };
+    await act(async () =>
+      root?.render(
+        <SessionHeaderMenu
+          session={session}
+          onCopyUrl={() => {}}
+          openInIde={openInIde}
+          isLauncherPillVisible={() => pillVisible}
+          t={translate}
+        />
+      )
+    );
+    await openMenu();
+    expect(document.querySelector('[role="menu"]')?.textContent).not.toContain('Open in VS Code');
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await vi.advanceTimersByTimeAsync(40);
+    });
+    pillVisible = false;
+    await openMenu();
+    expect(menuItem('Open in VS Code')).toBeDefined();
+  });
+
+  it('keeps Open in Finder in the menu while the header pill is showing', async () => {
+    const onOpenFolder = vi.fn();
+    await act(async () =>
+      root?.render(
+        <SessionHeaderMenu
+          session={session}
+          onCopyUrl={() => {}}
+          openInIde={{
+            options: [vscodeLauncher],
+            selected: vscodeLauncher,
+            onOpen: () => {},
+            onSelect: () => {},
+          }}
+          openInFileManager={{ label: 'Open in Finder', onOpen: onOpenFolder }}
+          isLauncherPillVisible={() => true}
+          t={translate}
+        />
+      )
+    );
+    await openMenu();
+    expect(document.querySelector('[role="menu"]')?.textContent).not.toContain('Open in VS Code');
+    await act(async () => menuItem('Open in Finder').click());
+    expect(onOpenFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables owner candidates without machine access and keeps an accessible candidate selectable', async () => {
+    let assigned = 'a';
+    await act(async () =>
+      root?.render(
+        <SessionHeaderMenu
+          session={session}
+          onCopyUrl={() => {}}
+          onRename={() => {}}
+          t={translate}
+          owner={{
+            members: [
+              { userId: 'a', name: 'Alice' },
+              { userId: 'b', name: 'Bob' },
+              { userId: 'c', name: 'Carol' },
+            ],
+            ownerUserId: 'a',
+            getDisabledReason: (id) => (id === 'b' ? 'Machine is not shared' : null),
+            onChangeOwner: (id) => {
+              assigned = id;
+            },
+          }}
+        />
+      )
+    );
+    const dialog = await openInfoDialog();
+    expect(dialog.textContent).toContain('Alice');
+    const change = Array.from(dialog.querySelectorAll<HTMLElement>('button')).find(
+      (button) => button.textContent === 'Change'
+    );
+    await pressTrigger(change!);
+    const bob = menuItem('Bob');
+    expect(bob.getAttribute('aria-disabled')).toBe('true');
+    expect(bob.textContent).toContain('Machine is not shared');
+    await act(async () => bob.click());
+    expect(assigned).toBe('a');
+    await act(async () => menuItem('Carol').click());
+    expect(assigned).toBe('c');
   });
 
   it('disables native destinations while pending but still allows copying', async () => {
@@ -261,6 +347,30 @@ describe('SessionHeaderMenu', () => {
     expect(onOpenSession).not.toHaveBeenCalled();
   });
 
+  it('offers Settle alongside Move to Focus for a snoozed (Later) session', async () => {
+    const onSettle = vi.fn();
+    const onMoveToFocus = vi.fn();
+    await act(async () => {
+      root?.render(
+        <SessionHeaderMenu
+          session={{ ...session, snoozedUntil: Date.now() + 60 * 60 * 1000 }}
+          onCopyUrl={() => {}}
+          onSettle={onSettle}
+          onMoveToFocus={onMoveToFocus}
+          t={translate}
+        />
+      );
+    });
+    await openMenu();
+    await act(async () => menuItem('Change status').click());
+    await act(async () => menuItem('Settle').click());
+    expect(onSettle).toHaveBeenCalledTimes(1);
+    await openMenu();
+    await act(async () => menuItem('Change status').click());
+    await act(async () => menuItem('Move to Focus').click());
+    expect(onMoveToFocus).toHaveBeenCalledTimes(1);
+  });
+
   it('omits retired review actions even with the old opt-in and session pointer', async () => {
     const store = createStore();
     store.set(experimentalFeaturesEnabledAtom, true);
@@ -286,105 +396,6 @@ describe('SessionHeaderMenu', () => {
     } finally {
       localStorage.removeItem('lody-review-agent-enabled');
     }
-  });
-
-  it('omits the Session group heading and keeps Team as a normal-weight row', async () => {
-    await act(async () => {
-      root?.render(
-        <Tooltip.Provider>
-          <SessionHeaderMenu
-            session={
-              {
-                ...session,
-                project: { kind: 'github', repoFullName: 'loro-dev/lody', branch: 'main' },
-                repoFullName: 'loro-dev/lody',
-                branchName: 'fix/ui',
-                baseBranch: 'main',
-              } as SessionMeta
-            }
-            machineName="MacBook"
-            sharing={{
-              visibility: 'team',
-              canManage: true,
-              machineId: null,
-              localProjectId: null,
-              machineName: 'MacBook',
-              projectName: 'lody',
-            }}
-            onCopyUrl={vi.fn()}
-            t={translate}
-          />
-        </Tooltip.Provider>
-      );
-    });
-    await openMenu();
-
-    expect(
-      Array.from(document.querySelectorAll('*')).some(
-        (el) => el.childNodes.length === 1 && el.textContent === 'Session'
-      )
-    ).toBe(false);
-
-    const teamLabel = Array.from(document.querySelectorAll('span')).find(
-      (el) => el.textContent === 'Team' && el.childElementCount === 0
-    );
-    expect(teamLabel).not.toBeNull();
-    expect(teamLabel?.closest('button, a, [role="button"], [role="menuitem"]')).toBeNull();
-  });
-
-  it('omits Open in IDE when no launchers are provided', async () => {
-    await act(async () => {
-      root?.render(<SessionHeaderMenu session={session} onCopyUrl={vi.fn()} t={translate} />);
-    });
-    await openMenu();
-    expect(document.body.textContent).not.toContain('Open in VS Code');
-  });
-
-  it('opens the selected IDE from the actions menu', async () => {
-    const onOpen = vi.fn();
-    await act(async () => {
-      root?.render(
-        <SessionHeaderMenu
-          session={session}
-          onCopyUrl={vi.fn()}
-          openInIde={{
-            options: [vscodeLauncher],
-            selected: vscodeLauncher,
-            onOpen,
-            onSelect: vi.fn(),
-          }}
-          t={translate}
-        />
-      );
-    });
-    await openMenu();
-    await act(async () => menuItem('Open in VS Code').click());
-    expect(onOpen).toHaveBeenCalledTimes(1);
-  });
-
-  it('lists multiple IDE launchers in a submenu and launches the chosen one', async () => {
-    const onSelect = vi.fn();
-    await act(async () => {
-      root?.render(
-        <SessionHeaderMenu
-          session={session}
-          onCopyUrl={vi.fn()}
-          openInIde={{
-            options: [vscodeLauncher, cursorLauncher],
-            selected: vscodeLauncher,
-            onOpen: vi.fn(),
-            onSelect,
-          }}
-          t={translate}
-        />
-      );
-    });
-    await openMenu();
-    const trigger = menuItem('Open in VS Code');
-    expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
-    await act(async () => trigger.click());
-    await act(async () => menuItem('Cursor').click());
-    expect(onSelect).toHaveBeenCalledWith(cursorLauncher);
   });
   it('allows encrypted sharing, local export and preview while keeping unsupported operations restricted', async () => {
     let exported = false;
@@ -435,6 +446,7 @@ describe('SessionHeaderMenu', () => {
       'Encrypted workspaces do not yet support sharing.'
     );
     await act(async () => menuItem('Share').click());
+    await act(async () => menuItem('Public link').click());
     expect(shareOpened).toBe(true);
     await openMenu();
     expect(container?.querySelector('[data-testid="copy-result"]')?.textContent).toBe('not copied');
@@ -444,6 +456,7 @@ describe('SessionHeaderMenu', () => {
     expect(container?.querySelector('[data-testid="copy-result"]')?.textContent).toBe('copied');
     expect(container?.querySelector('[data-testid="fork-result"]')?.textContent).toBe('none');
     await openMenu();
+    await act(async () => menuItem('Share').click());
     await act(async () => menuItem('Share as image').click());
     expect(exported).toBe(true);
   });

@@ -1,3 +1,4 @@
+import { ScheduleRepository } from '@lody/shared/schedule-repository';
 import { notificationLabel } from '@lody/shared/notifications';
 import type { RepoRoomSubscription } from 'loro-repo';
 import {
@@ -7,7 +8,8 @@ import {
   getServerNow,
   getSessionRoomId,
   isLoroRepoDocDeleted,
-  ScheduleRepository,
+  isScheduleImportFenced,
+  ScheduledMessageSchema,
   scheduleDefinitionFingerprint,
   scheduleRegistryKeys,
   ScheduleRuntimeRowSchema,
@@ -48,6 +50,7 @@ import {
 import { createScheduleSyncGate } from './schedule-sync-gate';
 import { ScheduleStore } from './schedule-store';
 import { ScheduleEngine, ScheduleConfigurationError } from './schedule-engine';
+import { isQuotaReservationCandidate } from './quota-reservation';
 
 // Ticks plan Schedules serially, so this wait delays every other Schedule. A
 // timeout blocks only this definition until the next tick retries it.
@@ -67,8 +70,16 @@ export async function createScheduleWorkspace(args: {
   logger: Logger;
   /** Run completion: the chat's own Turns plus delegated Operations it still awaits. */
   hasSessionWork: (sessionId: SessionId) => boolean;
+  dispatchQuotaSchedule: (
+    run: import('./schedule-store').ScheduleRun<PreparedSessionInput>,
+    prepared: PreparedSessionInput
+  ) => Promise<'dispatched' | 'discarded'>;
   /** Message admission: only work that occupies the chat's own Turns. */
   hasSessionTurnWork: (sessionId: SessionId) => boolean;
+  /** Quota reset time for a definitively exhausted agent binding; see ScheduleEnginePorts. */
+  capacityRetryAt?: (
+    run: import('./schedule-store').ScheduleRun<PreparedSessionInput>
+  ) => Promise<number | undefined>;
 }): Promise<ScheduleWorkspaceHandle> {
   const { manager, workspace, auth } = args;
   const workspaceId = workspace.id as WorkspaceId;
@@ -146,6 +157,7 @@ export async function createScheduleWorkspace(args: {
     });
   };
   const engine = new ScheduleEngine<PreparedSessionInput>({
+    ...(args.capacityRetryAt ? { capacityRetryAt: args.capacityRetryAt } : {}),
     workspaceId,
     machineId: auth.machineId,
     userId: auth.userId,
@@ -156,6 +168,12 @@ export async function createScheduleWorkspace(args: {
     encrypted: workspace.contentMode === 'e2ee',
     authorize: args.authorize,
     list: () => repository.list(),
+    importFenced: async (row) =>
+      isScheduleImportFenced(
+        (await manager.repo.getDocMeta(getScheduleRoomId(row.scheduleId)))?.meta,
+        workspaceId,
+        row.activationId
+      ),
     read: async (id) => {
       if (!args.localOnly)
         await manager.syncDocOrThrow(getScheduleRoomId(id), {
@@ -206,7 +224,21 @@ export async function createScheduleWorkspace(args: {
         },
         target
       );
-      if (run.message) prepared = withScheduledMessageInput(prepared, run.message);
+      if (run.message) {
+        const inputBlocks = run.message.inputBlocks;
+        if (
+          inputBlocks.some(
+            (block) =>
+              block.type === 'local_attachment' &&
+              (workspace.contentMode === 'e2ee' || block.machineId !== run.machineId)
+          )
+        )
+          throw new Error('Local attachment belongs to another machine');
+        prepared = withScheduledMessageInput(
+          prepared,
+          ScheduledMessageSchema.parse({ ...run.message, inputBlocks })
+        );
+      }
       if (prepared.meta.machineId !== run.machineId || prepared.meta.userId !== auth.userId)
         throw new Error('Schedule target ownership changed');
       prepared.meta.scheduleId = run.scheduleId;
@@ -238,7 +270,13 @@ export async function createScheduleWorkspace(args: {
     },
     materialize: (prepared) => materializePreparedSessionInput(manager, prepared),
     isDispatched: (prepared) => isPreparedSessionDispatched(manager, prepared),
-    dispatch: (prepared) => commitPreparedSessionDispatch(manager, prepared),
+    dispatch: async (prepared, run) => {
+      if (workspace.contentMode !== 'e2ee' && isQuotaReservationCandidate(run))
+        return args
+          .dispatchQuotaSchedule(run, prepared)
+          .then((result) => (result === 'discarded' ? result : undefined));
+      await commitPreparedSessionDispatch(manager, prepared);
+    },
     isFinished: async (run) => {
       const id = run.sessionId as SessionId;
       if (args.hasSessionWork(id)) return false;

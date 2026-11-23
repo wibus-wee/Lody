@@ -1,5 +1,5 @@
 import { SessionExecutionService } from '../session/session-execution-service';
-import { Cause, Effect, Exit } from 'effect';
+import { Cause, Effect, Exit, FiberMap, Semaphore } from 'effect';
 import { CoordinatorWorkflow } from './coordinator-workflow';
 import type { CoordinatorActivity } from './coordinator-activity';
 import type { CoordinatorPorts } from './coordinator-ports';
@@ -661,6 +661,206 @@ describe('LodyOperationCoordinator', () => {
     }
   });
 
+  it('isolates slow remote catch-up so unrelated local Operations still finalize and stop cleanly', async () => {
+    let releaseSlowCatchUp: (() => void) | undefined;
+    let slowCatchUpStarted: (() => void) | undefined;
+    const slowCatchUpEntered = new Promise<void>((resolve) => {
+      slowCatchUpStarted = resolve;
+    });
+    const slowCatchUpGate = new Promise<void>((resolve) => {
+      releaseSlowCatchUp = resolve;
+    });
+    const harness = await makeHarness({
+      targetInputDurable: false,
+      confirmTargetReadable: async (docId) => {
+        if (docId === getSessionRoomId(harness.targetSessionId)) {
+          slowCatchUpStarted?.();
+          await slowCatchUpGate;
+        }
+      },
+    });
+    const localTargetId = 'local-fast-target' as SessionId;
+    harness.metas.set(localTargetId, {
+      id: localTargetId,
+      workspaceId: 'workspace-1' as WorkspaceId,
+      machineId: 'machine-1' as MachineId,
+      userId: 'user-1',
+      cliType: 'builtin',
+      agentType: 'codex',
+      latestUserMsgId: 'local-turn-1',
+    });
+    harness.histories.set(localTargetId, [
+      {
+        id: 'local-turn-1',
+        role: 'user',
+        timestamp: '2026-07-20T00:00:00.000Z',
+        items: [{ type: 'text', text: 'local work' }],
+        fileDiff: [],
+        status: 'handled',
+      },
+      {
+        id: 'assistant:local-turn-1',
+        role: 'assistant',
+        userTurnId: 'local-turn-1',
+        timestamp: '2026-07-20T00:00:00.500Z',
+        items: [{ type: 'text', text: 'fast local result' }],
+        fileDiff: [],
+        finished: true,
+      },
+    ]);
+    const seedStore = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+    seedStore.accept({
+      workspaceId: 'workspace-1' as WorkspaceId,
+      ownerMachineId: 'machine-1' as MachineId,
+      requesterSessionId: harness.requesterSessionId,
+      requesterUserId: 'user-1',
+      operationId: 'local-fast-op',
+      kind: 'session_chat',
+      canonicalCommand: { sessionId: localTargetId, prompt: 'local work' },
+      frozenContinuationConfig: {
+        inputConfig: { cliType: 'builtin', agentType: 'codex', chainDepth: 0 },
+      },
+      initiatorChainDepth: 0,
+      createdAt: '2026-07-19T00:00:00.000Z',
+      deadlineAt: '2026-07-21T00:00:00.000Z',
+      items: [
+        {
+          status: 'active',
+          target: { sessionId: localTargetId, userTurnId: 'local-turn-1' },
+          inputDurable: true,
+        },
+      ],
+    });
+    seedStore.close();
+
+    harness.coordinator.start();
+    try {
+      await slowCatchUpEntered;
+      await harness.coordinator.wake('check-local-op');
+      const inspectStore = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+      try {
+        expect(inspectStore.get(harness.requesterSessionId, 'local-fast-op')).toMatchObject({
+          state: 'finished',
+          completion: {
+            type: 'result',
+            value: { items: [{ status: 'succeeded', output: { text: 'fast local result' } }] },
+          },
+        });
+        expect(inspectStore.get(harness.requesterSessionId, 'review-round-1').state).toBe('active');
+      } finally {
+        inspectStore.close();
+      }
+    } finally {
+      releaseSlowCatchUp?.();
+      await harness.coordinator.stop();
+    }
+  });
+
+  it('bounds hanging catch-up via Effect Clock timeout and retries on bounded backoff', async () => {
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
+    let attempts = 0;
+    let releaseHungAttempt: (() => void) | undefined;
+    const harness = await makeHarness({
+      targetInputDurable: false,
+      confirmTargetReadable: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          await new Promise<void>((resolve) => {
+            releaseHungAttempt = resolve;
+          });
+        }
+      },
+    });
+    harness.coordinator.start();
+    try {
+      await harness.coordinator.wake('startup-kick');
+      expect(attempts).toBe(1);
+      expect(harness.materializeTarget).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      await harness.coordinator.idle();
+      expect(harness.materializeTarget).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await harness.coordinator.idle();
+      expect(attempts).toBe(2);
+      expect(harness.materializeTarget).toHaveBeenCalledTimes(1);
+      const store = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+      try {
+        expect(store.get(harness.requesterSessionId, 'review-round-1').items[0]).toMatchObject({
+          status: 'active',
+          inputDurable: true,
+        });
+      } finally {
+        store.close();
+      }
+    } finally {
+      releaseHungAttempt?.();
+      await harness.coordinator.stop();
+    }
+  });
+
+  it('passes resolved target machine to confirmTargetReadable for cold same-machine creation and does not abort post-pointer flush', async () => {
+    const seenMachineIds: Array<MachineId | undefined> = [];
+    let releasePostPointerFlush: (() => void) | undefined;
+    let pointerWritten!: () => void;
+    const pointerWrittenReady = new Promise<void>((resolve) => {
+      pointerWritten = resolve;
+    });
+    let abortedDuringFlush = false;
+    const harness = await makeHarness({
+      targetInputDurable: false,
+      operationKind: 'session_create',
+      confirmTargetReadable: async (_docId, _reason, targetMachineId) => {
+        seenMachineIds.push(targetMachineId);
+      },
+    });
+    harness.metas.delete(harness.targetSessionId);
+    harness.materializeTarget.mockImplementation(async (_op, item, _index, signal) => {
+      signal.addEventListener('abort', () => {
+        abortedDuringFlush = true;
+      });
+      harness.metas.set(item.target.sessionId, {
+        id: item.target.sessionId,
+        workspaceId: 'workspace-1' as WorkspaceId,
+        machineId: 'machine-1' as MachineId,
+        userId: 'user-1',
+        cliType: 'builtin',
+        agentType: 'codex',
+        latestUserMsgId: item.target.userTurnId,
+      });
+      harness.histories.set(item.target.sessionId, [
+        {
+          id: item.target.userTurnId,
+          role: 'user',
+          timestamp: '2026-07-20T00:00:00.000Z',
+          items: [{ type: 'text', text: 'created work' }],
+          fileDiff: [],
+          status: 'pending',
+        },
+      ]);
+      pointerWritten();
+      await new Promise<void>((resolve) => {
+        releasePostPointerFlush = resolve;
+      });
+    });
+    harness.coordinator.start();
+    try {
+      await pointerWrittenReady;
+      await harness.coordinator.wake('doc-metadata-after-pointer');
+      expect(abortedDuringFlush).toBe(false);
+      releasePostPointerFlush?.();
+      await harness.coordinator.idle();
+      expect(seenMachineIds).toEqual(['machine-1']);
+      expect(abortedDuringFlush).toBe(false);
+    } finally {
+      releasePostPointerFlush?.();
+      await harness.coordinator.stop();
+    }
+  });
+
   it('recovers local creation using daemon authority even when remote Streams is unavailable', async () => {
     const harness = await makeHarness({
       targetInputDurable: false,
@@ -1115,6 +1315,240 @@ describe('LodyOperationCoordinator', () => {
       }
     }
   );
+
+  it('explains a failed target with its recorded chat failure notice', async () => {
+    const harness = await makeHarness();
+    const targetHistory = harness.histories.get(harness.targetSessionId)!;
+    targetHistory[0] = { ...targetHistory[0]!, status: 'failed' };
+    targetHistory.push({
+      id: 'system-notice-1',
+      role: 'system',
+      timestamp: '2026-07-20T00:00:00.500Z',
+      items: [
+        {
+          type: 'system_notice',
+          name: 'chat_failed',
+          meta: {
+            reason: 'acp_upstream_api_error',
+            message: "You've hit your usage limit. Try again at 7:20 AM.",
+          },
+        },
+      ],
+      fileDiff: [],
+    } as SessionHistoryInput);
+
+    harness.coordinator.start();
+    await harness.coordinator.idle();
+    await harness.coordinator.stop();
+
+    const store = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+    try {
+      expect(store.get(harness.requesterSessionId, 'review-round-1')).toMatchObject({
+        completion: {
+          type: 'result',
+          value: {
+            items: [
+              {
+                status: 'failed',
+                error: {
+                  code: 'TARGET_FAILED',
+                  message:
+                    "Target Turn failed (acp_upstream_api_error): You've hit your usage limit. Try again at 7:20 AM.",
+                  retryable: true,
+                  reason: 'usage_limit',
+                  detail: "You've hit your usage limit. Try again at 7:20 AM.",
+                },
+              },
+            ],
+          },
+        },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('keeps context overflow distinct from a usage limit', async () => {
+    const harness = await makeHarness();
+    const targetHistory = harness.histories.get(harness.targetSessionId)!;
+    targetHistory[0] = { ...targetHistory[0]!, status: 'failed' };
+    targetHistory.push({
+      id: 'system-notice-context',
+      role: 'system',
+      timestamp: '2026-07-20T00:00:00.500Z',
+      items: [
+        {
+          type: 'system_notice',
+          name: 'chat_failed',
+          meta: {
+            reason: 'acp_internal_error',
+            message: 'API Error: 400 prompt is too long: maximum context length is 200000 tokens',
+          },
+        },
+      ],
+      fileDiff: [],
+    } as SessionHistoryInput);
+
+    harness.coordinator.start();
+    await harness.coordinator.idle();
+    await harness.coordinator.stop();
+
+    const store = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+    try {
+      expect(store.get(harness.requesterSessionId, 'review-round-1')).toMatchObject({
+        completion: {
+          type: 'result',
+          value: {
+            items: [
+              {
+                status: 'failed',
+                error: {
+                  code: 'TARGET_FAILED',
+                  reason: 'context_overflow',
+                  retryable: false,
+                },
+              },
+            ],
+          },
+        },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  describe('steer handoff', () => {
+    const steerHandoff = async (
+      successor: { status: SessionHistoryInput['status']; cancellationReason?: 'user_stop' },
+      successorFinished: boolean | 'absent',
+      deadlineAt?: string
+    ) => {
+      const harness = await makeHarness(deadlineAt ? { deadlineAt } : undefined);
+      const targetHistory = harness.histories.get(harness.targetSessionId)!;
+      targetHistory[0] = { ...targetHistory[0]!, status: 'handled' };
+      targetHistory.push(
+        {
+          id: 'assistant:turn-1',
+          role: 'assistant',
+          userTurnId: 'turn-1',
+          timestamp: '2026-07-20T00:00:00.500Z',
+          items: [{ type: 'text', text: 'partial output' }],
+          fileDiff: [],
+          finished: true,
+        },
+        {
+          id: 'turn-steer',
+          role: 'user',
+          timestamp: '2026-07-20T00:00:00.600Z',
+          items: [{ type: 'text', text: 'also cover the edge case' }],
+          fileDiff: [],
+          ...successor,
+        },
+        ...(successorFinished === 'absent'
+          ? []
+          : [
+              {
+                id: 'assistant:turn-steer',
+                role: 'assistant' as const,
+                userTurnId: 'turn-steer',
+                timestamp: '2026-07-20T00:00:00.700Z',
+                items: [{ type: 'text' as const, text: 'final summary' }],
+                fileDiff: [],
+                finished: successorFinished,
+              },
+            ])
+      );
+      harness.metas.set(harness.targetSessionId, {
+        ...harness.metas.get(harness.targetSessionId)!,
+        steerOperationLedger: {
+          'steer:turn-steer': {
+            operationId: 'steer:turn-steer',
+            userTurnId: 'turn-steer',
+            expectedTurnId: 'assistant:turn-1',
+            cancellationPolicy: 'promote',
+            phase: 'settled',
+            delivery: 'applied',
+            status: 'handled',
+            updatedAt: TEST_NOW_MS,
+          },
+        },
+      });
+      harness.coordinator.start();
+      await harness.coordinator.idle();
+      await harness.coordinator.stop();
+      const store = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+      try {
+        return store.get(harness.requesterSessionId, 'review-round-1');
+      } finally {
+        store.close();
+      }
+    };
+
+    it('completes a steered-away target with the successor final reply', async () => {
+      expect(await steerHandoff({ status: 'handled' }, true)).toMatchObject({
+        state: 'finished',
+        completion: {
+          type: 'result',
+          value: {
+            items: [
+              {
+                status: 'succeeded',
+                assistantTurnId: 'assistant:turn-steer',
+                output: { text: 'final summary' },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('keeps waiting for an unfinished successor instead of returning sealed partial output', async () => {
+      expect(
+        await steerHandoff({ status: 'processing' }, false, '2026-07-19T23:59:59.000Z')
+      ).toMatchObject({
+        state: 'finished',
+        completion: {
+          type: 'result',
+          value: { items: [{ status: 'failed', error: { code: 'TARGET_TIMEOUT' } }] },
+        },
+      });
+    });
+
+    it.each(['handled', 'failed'] as const)(
+      'keeps the original result when an applied steer settles %s without a successor turn',
+      async (status) => {
+        // stale-turn after provider acceptance, or a failure before handoff:
+        // no successor turn exists, so the original turn's reply stands.
+        expect(await steerHandoff({ status }, 'absent')).toMatchObject({
+          state: 'finished',
+          completion: {
+            type: 'result',
+            value: {
+              items: [
+                {
+                  status: 'succeeded',
+                  assistantTurnId: 'assistant:turn-1',
+                  output: { text: 'partial output' },
+                },
+              ],
+            },
+          },
+        });
+      }
+    );
+
+    it('reports a user Stop of the successor as the delegated cancellation', async () => {
+      expect(
+        await steerHandoff({ status: 'canceled', cancellationReason: 'user_stop' }, true)
+      ).toMatchObject({
+        state: 'finished',
+        completion: {
+          type: 'result',
+          value: { items: [{ status: 'cancelled', cancellationReason: 'user_stop' }] },
+        },
+      });
+    });
+  });
 
   it('uses durable local Stop before stale partial output or an expired deadline can return a receipt', async () => {
     const harness = await makeHarness({ deadlineAt: '2026-07-19T00:00:00Z' });
@@ -1596,6 +2030,7 @@ describe('native coordinator failure boundaries', () => {
         cancel: () => Effect.void,
         cancelWhere: () => Effect.void,
         has: () => false,
+        hasPending: () => false,
         drain: Effect.void,
       };
       const ports: CoordinatorPorts['Service'] = {
@@ -1605,8 +2040,6 @@ describe('native coordinator failure boundaries', () => {
         metadata: () => Effect.failCause(cause),
         session: () => Effect.fail(new Error('unexpected history access')),
         execution: () => ({}),
-        operation: () => Effect.succeed({ signal: { aborted: false } }),
-        cancelInactive: () => Effect.void,
         receipts: Effect.succeed([]),
         wakeInbox: Effect.void,
         confirmReadable: () => Effect.void,
@@ -1622,12 +2055,16 @@ describe('native coordinator failure boundaries', () => {
             Effect.gen(function* () {
               const repository = yield* OperationRepository;
               const scope = yield* Effect.scope;
+              const materializations = yield* FiberMap.make<string, void, never>();
+              const permits = yield* Semaphore.make(5);
               const core = new CoordinatorWorkflow(
                 { workspaceId: operation.workspaceId, machineId: operation.ownerMachineId },
                 ports,
                 repository,
                 activity,
-                scope
+                scope,
+                materializations,
+                permits
               );
               const exit = yield* Effect.exit(
                 scenario.startsWith('progress')

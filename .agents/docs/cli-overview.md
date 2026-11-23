@@ -42,8 +42,19 @@ Two dev-build choices are load-bearing:
   imports the generated `lody-code-review-viewer/manifest`, which does not exist until that
   package is built; inlining it would make `lody --version` fail.
 
+The CLI entry loads the normal command registry for public invocations, retaining
+the existing command order, help and options. An exact first argument of
+`__internal` registers only the MCP helper commands, so each MCP process avoids
+loading the daemon and interactive command implementations. Both paths share the
+existing application runtime, environment setup and cleanup. Shared application
+chunks stay at the output root in development and production so worker and adapter
+lookups still resolve flat sibling files; dependency chunks may remain in `chunks/`.
+The [internal MCP loading decision](../notes/implemented/architecture/2026-10-30-internal-mcp-command-loading.md)
+records the measured scope and why process isolation is retained.
+
 The CLI's own `version` comes from `@/pkg` because each build composition aliases it to the
-manifest that actually gets published (cloud builds point it at the private composing package). A
+manifest that actually gets published (`apps/cli/package.json` for both explicit cloud and
+default local builds). A
 relative `../package.json` import bakes the stale OSS version into the published bundle — that is
 what made `lody@0.82.1 --version` print `0.76.0`. The package `name` stays `lody` in every
 composition.
@@ -68,7 +79,7 @@ Write-back plans against freshly read owner meta: `pullRequests` upserts by URL 
 PR as the LAST item (legacy fields stripped once), while CI and merge state live in
 `SessionMeta.pullRequestState` (`{s,m,t}`, ≤50B per entry; legacy `r` readiness is no longer
 written and is deleted on touch). Scheduling state — never PR status — is in
-`~/.lody/pr-poller-state.json`. `LODY_PR_POLL_DISABLED=1` is the kill switch and `LODY_PR_POLL_*`
+`pr-poller-state.sqlite3` under the Lody data directory. `LODY_PR_POLL_DISABLED=1` is the kill switch and `LODY_PR_POLL_*`
 overrides live in `pr-poller-config.ts`. Module invariants: `src/lib/pr-poller/AGENTS.md`.
 
 ## Builtin agents and adapter provenance
@@ -166,11 +177,17 @@ request and Operation id, and stop after three total calls. This is bounded agen
 not an enforced counter or a change to the daemon recovery budget. An active Operation
 handle means recovery is already owned by the daemon; callers must not resubmit it.
 
-`syncMachineFlockDocsForRead` opts into strict freshness confirmation. For cloud-enabled
-managers it requires an attached, unchanged Streams generation and a successful Streams
-report. A resolved no-route or partial report is not confirmation; a genuinely local-only
-manager retains its authoritative local path. Ordinary Flock sync callers, including Role
-creation and discovery, keep their existing best-effort report semantics. Route absence is
+`syncMachineFlockDocsForRead` opts into strict freshness confirmation for Session create
+and chat validation, then continues from the local replica. For cloud-enabled managers
+this requires an attached, unchanged Streams generation and a successful Streams report.
+A resolved no-route or partial report is not confirmation; a genuinely local-only manager
+retains its authoritative local path. Daemon-hosted MCP reads, including create options,
+session list, and session status, do not start that request-scoped sync. They read the
+daemon replica. Create options return local rows when they can answer, and retryable
+`SYNC_UNAVAILABLE` when the baseline is not ready and the agent-config catalog is empty
+or the current or queried selection is absent. A ready baseline may return an empty
+catalog. Role creation and explicit fresh discovery keep their sync requirements. Ordinary
+Flock sync callers keep their existing best-effort report semantics. Route absence is
 application-level sync unavailability, not a fabricated Repo conflict.
 The [decision note](../notes/implemented/bug-fix/2026-10-10-machine-flock-cache-insufficient.md)
 records the fallback and regression coverage.
@@ -181,3 +198,12 @@ Lifecycle records are independent per URL/source; shared resolution applies GitH
 revision ordering to UI, MCP, notifications and polling targets. The legacy array
 status is a compatibility projection. See the
 [observation contract](../../specs/local-github-pr-observation.md).
+
+## Compatibility window
+
+The daemon and desktop keep no compatibility code for clients or local state from
+before 2026-10-16: draft-preparation and Code Collab v1 requests are unsupported, and
+one-time readers for the send journal, PR poller JSON, pre-v1 managed-runtime metadata
+and unassociated quota reservations are gone. Shared Session document fields, shipped
+mobile writes and backend-dependent fallbacks remain. See the
+[compatibility cut decision](../notes/implemented/simplification/2026-11-16-drop-pre-october-compatibility.md).

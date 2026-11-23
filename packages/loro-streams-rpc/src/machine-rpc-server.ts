@@ -1,11 +1,45 @@
+import type {
+  ManagedDaemonUpgradeOptions,
+  SessionHistoryPublication,
+  SessionHistorySubscription,
+  SessionHistorySubscriptionResponse,
+} from '@lody/shared';
+import {
+  SESSION_HISTORY_SUBSCRIPTION_LEASE_MS,
+  CodeCollabOpenDiffManifestRequestSchema,
+  CodeCollabReadBlobRequestSchema,
+  type CodeCollabDiffReadContext,
+  type CodeCollabOpenDiffManifestRequest,
+  type CodeCollabOpenDiffManifestResponse,
+  type CodeCollabReadBlobRequest,
+  type CodeCollabReadBlobResponse,
+} from '@lody/shared';
+import {
+  AndroidEmulatorRemoteResponseSchema,
+  type AndroidEmulatorRequest,
+  type AndroidEmulatorResponse,
+} from '@lody/shared';
+import { getAndroidEmulatorViewerSecretContext } from './rpc-secret';
 import { LoroStreamsRpcResponseSchema } from './rpc';
+import type { SessionWithdrawInputResponse } from '@lody/shared/local-machine-rpc';
 import { isE2eeReadQuery, type E2eeQueryInput, type E2eeQueryResult } from '@lody/shared/e2ee-rpc';
 import {
   FileDownloadRequestSchema,
+  SessionDirectoryListRequestSchema,
   type FileDownloadRequest,
   type FileDownloadResponse,
+  type SessionDirectoryListRequest,
+  type SessionDirectoryListResponse,
 } from '@lody/shared';
 import type { ProjectProbeLocalMemberResult } from '@lody/shared';
+import type {
+  RemoteAutomationHandshake,
+  RemoteAutomationOperation,
+  RemoteAutomationProof,
+  RemoteAutomationRpcResult,
+  RemoteAutomationEncryptedResponse,
+} from '@lody/shared/automations';
+import { remoteAutomationSecretEnvelopeSchema } from '@lody/shared/automations';
 import type {
   BugReportClientLog,
   MemoryProviderRequest,
@@ -57,10 +91,6 @@ import type {
   PreviewTarget,
   PreviewTargetApproval,
   SessionCancelResponse,
-  SessionPreparationCancelSpec,
-  SessionPreparationSpec,
-  SessionPrepareCancelResponse,
-  SessionPrepareResponse,
   SessionTerminateResponse,
   SessionDispatchTurnResponse,
   SessionHistoryReadResponse,
@@ -118,10 +148,13 @@ import {
   LORO_STREAMS_RPC_RETENTION_SECONDS,
   LORO_STREAMS_RPC_VERSION,
   SessionHistoryReadRpcPayloadSchema,
+  SessionHistorySubscriptionRpcPayloadSchema,
   SessionHistoryWriteRpcPayloadSchema,
   type LocalProjectGitStateRpcResponse,
+  type LocalProjectListBranchesRpcResponse,
   type LoroSessionLiveStatusRpcResponse,
   LoroStreamsRpcRequestSchema,
+  LoroSessionAutomationControlPayloadSchema,
   type LoroStreamsRpcRequest,
   type LoroStreamsRpcMethod,
   getLoroMachineRpcRequestStreamId,
@@ -130,6 +163,7 @@ import {
   createRpcSecretRecipient,
   encryptRpcSecret,
   getIosSimulatorViewerSecretContext,
+  getAutomationResponseSecretContext,
   getMachineAcpAuthenticationInputSecretContext,
   getMachineAcpAuthorizationCodeSecretContext,
   type RpcSecretRecipient,
@@ -154,18 +188,19 @@ const DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS = 4;
 const CONTROL_METHODS: ReadonlySet<string> = new Set([
   'machine/status',
   'machine/preview-control',
+  'machine/automation-control',
   'machine/ping',
   'machine/restart',
   'machine/upgrade',
   'machine/acp-capabilities-refresh-cancel',
   'session/cancel',
   'session/live-status',
+  'session/withdraw-input',
   'session/steer',
   'session/goal',
   'session/terminate',
   'session/dispatch-turn',
-  'session/prepare',
-  'session/prepare-cancel',
+  'session/history-unsubscribe',
 ]);
 const REQUEST_LOOP_RETRY_DELAY_MS = 1000;
 const REQUEST_LOOP_REPEAT_WARN_INTERVAL_MS = 30_000;
@@ -176,6 +211,7 @@ export const SESSION_HISTORY_PRECONDITION_CODES = [
   'session_unavailable',
   'session_identity_mismatch',
   'session_backend_mismatch',
+  'session_history_write_already_claimed',
 ] as const;
 export type SessionHistoryRpcRejection = {
   readonly code: (typeof SESSION_HISTORY_PRECONDITION_CODES)[number];
@@ -183,19 +219,27 @@ export type SessionHistoryRpcRejection = {
 };
 export type SessionHistoryRpcRequest = Extract<
   LoroStreamsRpcRequest,
-  { method: 'session/history-read' | 'session/history-watch' | 'session/history-write' }
+  {
+    method:
+      | 'session/history-read'
+      | 'session/history-subscribe'
+      | 'session/history-unsubscribe'
+      | 'session/history-write';
+  }
 >;
 /** Host-owned durable refusals. A failed lookup/save must fail closed before history. */
 export type SessionHistoryRpcRejectionStore = {
   get(request: SessionHistoryRpcRequest): Promise<SessionHistoryRpcRejection | null>;
   put(
     request: SessionHistoryRpcRequest,
-    rejection: SessionHistoryRpcRejection
+    rejection: SessionHistoryRpcRejection,
+    retainUntil?: number
   ): Promise<SessionHistoryRpcRejection>;
 };
 const isHistoryRequest = (request: LoroStreamsRpcRequest): request is SessionHistoryRpcRequest =>
   request.method === 'session/history-read' ||
-  request.method === 'session/history-watch' ||
+  request.method === 'session/history-subscribe' ||
+  request.method === 'session/history-unsubscribe' ||
   request.method === 'session/history-write';
 
 const redactRpcRequestForLog = (raw: unknown): unknown => {
@@ -203,7 +247,10 @@ const redactRpcRequestForLog = (raw: unknown): unknown => {
   const request = raw as { method?: unknown; params?: unknown };
   if (
     typeof request.method === 'string' &&
-    (request.method.startsWith('session/preview-') || request.method === 'ios-simulator/control')
+    (request.method.startsWith('session/preview-') ||
+      request.method === 'session/automation-control' ||
+      request.method === 'ios-simulator/control' ||
+      request.method === 'android-emulator/control')
   ) {
     return { method: request.method, params: '[REDACTED PREVIEW CONTROL]' };
   }
@@ -366,10 +413,22 @@ type RpcServerDeps = {
   maxPendingRequests?: number;
   /** Required for history writes; retain a refusal until the original request expires. */
   historyRequestRejections?: SessionHistoryRpcRejectionStore;
-  getMachineStatus: () => Promise<MachineStatusResponse>;
+  getMachineStatus: (args?: {
+    includeDisk?: boolean;
+    includeDaemonUpdate?: boolean;
+  }) => Promise<MachineStatusResponse>;
   getPreviewControl?: () => Promise<MachinePreviewControlResponse>;
+  getAutomationControl?: () => Promise<RemoteAutomationHandshake>;
+  controlAutomation?: (args: {
+    sessionId: string;
+    requesterUserId: string;
+    operation: RemoteAutomationOperation;
+    proof: RemoteAutomationProof;
+    responseKey: RpcSecretPublicKey;
+  }) => Promise<RemoteAutomationRpcResult>;
   pingMachine?: (args: { requestId: string }) => Promise<MachinePingResponse>;
   restartMachine?: (args: {
+    restoreMachineId?: string;
     requesterUserId: string;
     requestToken: string;
     requestId: string;
@@ -379,6 +438,7 @@ type RpcServerDeps = {
     requestToken: string;
     requestId: string;
     targetVersion?: string;
+    upgrade?: ManagedDaemonUpgradeOptions;
   }) => Promise<MachineUpgradeResponse>;
   /** Accepted operations proceed after the ACK succeeds, fails, or reaches its deadline. */
   onMachineLifecycleResponseSettled?: (
@@ -392,6 +452,7 @@ type RpcServerDeps = {
   refreshMachineAcpCapabilities: (args: {
     configId: AgentConfigId;
     force?: boolean;
+    readModelOptions?: true;
     onAcpBinaryProgress?: (message: MachineAcpBinaryProgressMessage) => void;
     signal: AbortSignal;
   }) => Promise<MachineAcpCapabilitiesRefreshResponse>;
@@ -400,7 +461,7 @@ type RpcServerDeps = {
       requestId: string;
       onProgress?: (message: MachineAcpAuthenticationProgressMessage) => void;
     } & (
-      | { action: 'start'; configId: AgentConfigId }
+      | { action: 'start'; configId: AgentConfigId; methodId?: string }
       | { action: 'cancel'; authenticationRequestId: string }
       | {
           action: 'submit-code';
@@ -441,7 +502,14 @@ type RpcServerDeps = {
   }) => Promise<SessionCancelResponse>;
   getSessionLiveStatus?: (args: {
     sessionId: SessionId;
+    includeActivity?: boolean;
   }) => Promise<LoroSessionLiveStatusRpcResponse>;
+  withdrawSessionInput?: (args: {
+    sessionId: SessionId;
+    userTurnId: string;
+    requesterSessionId: SessionId;
+    userId: string;
+  }) => Promise<SessionWithdrawInputResponse>;
   steerSession?: (args: {
     sessionId: SessionId;
     expectedTurnId: string;
@@ -475,21 +543,31 @@ type RpcServerDeps = {
     inputOrigin?: 'human' | 'agent';
     inputConfig: SessionTurnInputConfig;
   }) => Promise<SessionDispatchTurnResponse>;
-  prepareSession?: (args: SessionPreparationSpec) => Promise<SessionPrepareResponse>;
-  cancelSessionPreparation?: (
-    args: SessionPreparationCancelSpec
-  ) => Promise<SessionPrepareCancelResponse>;
   /** Encrypted Roost-backed logical history access for remote renderers. */
+  /** Ordinary cloud reads need an online, operation-bound control-plane verdict. */
+  authorizeSessionHistoryRead?: (args: {
+    sessionId: SessionId;
+    readProof?: string;
+  }) => Promise<boolean>;
+  authorizeSessionHistoryWrite?: (args: {
+    sessionId: SessionId;
+    writeProof?: string;
+    requestId: string;
+    operation: SessionHistoryWriteOperation;
+    payload: Record<string, unknown>;
+  }) => Promise<{ expiresAt: number } | null>;
   readSessionHistory?: (args: {
     sessionId: SessionId;
     query: SessionHistoryReadQuery;
     signal?: AbortSignal;
   }) => Promise<SessionHistoryReadResponse>;
-  waitForSessionHistoryChanges?: (args: {
+  subscribeSessionHistory?: (args: {
     sessionId: SessionId;
-    checkpoint: string;
-    waitMs: number;
+    subscriber: string;
+    subscription: SessionHistorySubscription;
     signal: AbortSignal;
+    admit: () => Promise<void>;
+    publish: (publication: SessionHistoryPublication, signal: AbortSignal) => Promise<void>;
   }) => Promise<void>;
   writeSessionHistory?: (args: {
     sessionId: SessionId;
@@ -505,10 +583,22 @@ type RpcServerDeps = {
   /** File Preview v3 — a plain read; must not activate Code Collab. */
   previewFile?: (args: FilePreviewV3Request) => Promise<FilePreviewV3Response>;
   downloadFileChunk?: (args: FileDownloadRequest) => Promise<FileDownloadResponse>;
+  /** `file/list-dir`: one folder of the session's own workspace; a plain read like previewFile. */
+  listSessionDirectory?: (
+    args: SessionDirectoryListRequest
+  ) => Promise<SessionDirectoryListResponse>;
   refreshCodeCollabText?: (
     args: CodeCollabV2RefreshTextRequest
   ) => Promise<CodeCollabV2RefreshTextResponse>;
   saveCodeCollabText?: (args: CodeCollabV2SaveTextRequest) => Promise<CodeCollabV2SaveTextResponse>;
+  openCodeCollabDiffManifest?: (
+    args: CodeCollabOpenDiffManifestRequest,
+    context: CodeCollabDiffReadContext
+  ) => Promise<CodeCollabOpenDiffManifestResponse>;
+  readCodeCollabBlob?: (
+    args: CodeCollabReadBlobRequest,
+    context: CodeCollabDiffReadContext
+  ) => Promise<CodeCollabReadBlobResponse>;
   openCodeCollabCurrentDiff?: (
     args: CodeCollabV2OpenCurrentDiffRequest
   ) => Promise<CodeCollabV2OpenCurrentDiffResponse>;
@@ -538,6 +628,9 @@ type RpcServerDeps = {
   controlIosSimulator?: (
     args: IosSimulatorRequest & { proof: PreviewControlProof; responseKey: RpcSecretPublicKey }
   ) => Promise<IosSimulatorResponse>;
+  controlAndroidEmulator?: (
+    args: AndroidEmulatorRequest & { proof: PreviewControlProof; responseKey: RpcSecretPublicKey }
+  ) => Promise<AndroidEmulatorResponse>;
   getSessionPreviewStatus?: (args: {
     sessionId: SessionId;
     requestedByUserId: string;
@@ -557,6 +650,7 @@ type RpcServerDeps = {
     requestedByUserId: string;
     proof: PreviewControlProof;
     reason?: string;
+    stopProcess?: boolean;
   }) => Promise<SessionPreviewRevokeResponse>;
   probeLocalProjectMember?: (args: {
     localProjectId: LocalProjectId;
@@ -566,6 +660,13 @@ type RpcServerDeps = {
     localProjectId: LocalProjectId;
     requestedByUserId: string;
   }) => Promise<LocalProjectGitStateRpcResponse>;
+  listLocalProjectBranches?: (args: {
+    localProjectId: LocalProjectId;
+    requestedByUserId: string;
+    query?: string;
+    limit?: number;
+    cursor?: string;
+  }) => Promise<LocalProjectListBranchesRpcResponse>;
   dispatchLocalProjectControl?: (
     request: LocalProjectControlRequest
   ) => Promise<LocalProjectControlResponse>;
@@ -578,6 +679,16 @@ type RpcServerDeps = {
   onFatalAuthFailure?: (error: LoroStreamsTokenAuthError) => void;
 };
 
+/** Served by their ordinary handler after the receiver's authorization and claim. */
+export const ENCRYPTED_ORDINARY_HANDLER_WRITES = [
+  'local-project/control',
+  'machine/acp-binary-install',
+  'machine/provider-rate-limits-refresh',
+] as const;
+const isEncryptedOrdinaryHandlerMethod = (method: string, params: unknown): boolean =>
+  isE2eeReadQuery(method, params) ||
+  (ENCRYPTED_ORDINARY_HANDLER_WRITES as readonly string[]).includes(method);
+
 export class LoroStreamsMachineRpcServer {
   private readonly requestStreamId: string;
   private readonly requestState: LoroJsonStreamState = { nextOffset: '-1' };
@@ -586,8 +697,8 @@ export class LoroStreamsMachineRpcServer {
   private readonly historyWriteConcurrency = new Semaphore(4);
   private readonly overloadConcurrency = new Semaphore(4);
   private readonly ordinaryTasks = new Set<Promise<void>>();
-  private readonly historyWatchConcurrency = new Semaphore(128);
-  private readonly historyWatchTasks = new Set<Promise<void>>();
+  private readonly historySubscriptionConcurrency = new Semaphore(128);
+  private readonly historySubscriptionTasks = new Set<Promise<void>>();
   private readonly historyWriteTasks = new Set<Promise<void>>();
   private readonly controlTasks = new Set<Promise<void>>();
   private readonly overloadTasks = new Set<Promise<void>>();
@@ -679,32 +790,38 @@ export class LoroStreamsMachineRpcServer {
           logError(
             `[rpc-server:${this.deps.machineId}] Loro Streams token rejected (status=${error.status}); the CLI token is invalid or has been revoked. Stopping request loop.`
           );
-          this.stopped = true;
+          // A full stop also aborts handlers and capability work in flight.
+          this.stop();
           this.deps.onFatalAuthFailure?.(error);
           return;
         }
 
+        let failure: unknown = error;
         if (error instanceof LoroStreamsGatewayError) {
           if (error.status === 404) {
             this.deps.logger.warn(
               `[rpc-server:${this.deps.machineId}] request stream returned 404; recreating ${this.requestStreamId}`
             );
-            await this.streamClient.ensureJsonStream(
-              this.requestStreamId,
-              this.deps.retentionSeconds ?? LORO_STREAMS_RPC_RETENTION_SECONDS
-            );
-            this.requestState.nextOffset = '-1';
-            this.requestState.cursor = undefined;
-            continue;
-          }
-          if (error.status === 410) {
+            try {
+              await this.streamClient.ensureJsonStream(
+                this.requestStreamId,
+                this.deps.retentionSeconds ?? LORO_STREAMS_RPC_RETENTION_SECONDS
+              );
+              this.requestState.nextOffset = '-1';
+              this.requestState.cursor = undefined;
+              continue;
+            } catch (ensureError) {
+              // Retry like any other loop error; never let it end the listener.
+              failure = ensureError;
+            }
+          } else if (error.status === 410) {
             this.requestState.nextOffset = '-1';
             this.requestState.cursor = undefined;
             continue;
           }
         }
 
-        const message = error instanceof Error ? error.message : String(error);
+        const message = failure instanceof Error ? failure.message : String(failure);
         this.logRequestLoopError(message);
         await delay(REQUEST_LOOP_RETRY_DELAY_MS);
       }
@@ -782,7 +899,7 @@ export class LoroStreamsMachineRpcServer {
           : raw &&
               typeof raw === 'object' &&
               'method' in raw &&
-              raw.method === 'session/history-watch'
+              raw.method === 'session/history-subscribe'
             ? 3
             : 2;
     const ordered = batch.messages
@@ -800,7 +917,7 @@ export class LoroStreamsMachineRpcServer {
           : priority === 1
             ? this.historyWriteTasks
             : priority === 3
-              ? this.historyWatchTasks
+              ? this.historySubscriptionTasks
               : this.ordinaryTasks;
       if (priority >= 2 && tasks.size >= (priority === 3 ? 128 : limit)) {
         // Shed unstarted ordinary work rather than blocking intake of a later
@@ -835,7 +952,7 @@ export class LoroStreamsMachineRpcServer {
           : priority === 1
             ? this.historyWriteConcurrency
             : priority === 3
-              ? this.historyWatchConcurrency
+              ? this.historySubscriptionConcurrency
               : this.requestConcurrency;
       this.trackRequestTask(this.runRequestTask(raw, lane), tasks);
     }
@@ -984,15 +1101,40 @@ export class LoroStreamsMachineRpcServer {
    * ordinary RPC's inner owner envelope inside this compatibility boundary. */
   async readFeatureQuery(
     raw: LocalMachineRpcRequest,
-    context: { requestId: string; expiresAt: number; signal: AbortSignal }
+    context: {
+      requestId: string;
+      expiresAt: number;
+      signal: AbortSignal;
+      authority?: { isCurrent: () => boolean; signal: AbortSignal };
+    }
   ): Promise<LocalMachineRpcResponse> {
     const input = LocalMachineRpcRequestSchema.parse(raw);
     if (
       input.workspaceId !== this.deps.workspaceId ||
       input.machineId !== this.deps.machineId ||
-      !isE2eeReadQuery(input.method, input.params)
+      !isEncryptedOrdinaryHandlerMethod(input.method, input.params)
     )
       throw new Error('e2ee_query_method');
+    if (input.method === 'session/history-read') {
+      const denied = {
+        ok: false as const,
+        code: 'session_history_read_denied',
+        error: 'Session history read access was refused.',
+      };
+      const authority = context.authority;
+      if (!authority || !this.deps.readSessionHistory) return denied;
+      const signal = AbortSignal.any([context.signal, authority.signal]);
+      const current = () =>
+        !this.stopped && !signal.aborted && context.expiresAt > this.now() && authority.isCurrent();
+      if (!current()) return denied;
+      const owner = await this.deps.resolveSessionHistoryOwnerSessionId?.(input.params.sessionId, {
+        signal,
+      });
+      if (!owner || (input.ownerSessionId && owner !== input.ownerSessionId) || !current())
+        return denied;
+      const result = await this.deps.readSessionHistory({ ...input.params, signal });
+      return current() ? LocalMachineRpcResponseSchema.parse({ ok: true, result }) : denied;
+    }
     let owner: string | undefined;
     let params: unknown = input.params;
     if (isOwnerScopedEncryptedRpcMethod(input.method)) {
@@ -1004,10 +1146,11 @@ export class LoroStreamsMachineRpcServer {
       if (!owner) throw new Error('e2ee_query_owner');
       params = await encryptCodeCollabV2RpcPayload(owner, params);
     }
-    const outcome = await this.readQuery(
+    const outcome = await this.serveNative(
       { queryId: context.requestId, method: input.method, params },
       context.expiresAt,
-      context.signal
+      context.signal,
+      context.authority
     );
     if (outcome.error)
       return LocalMachineRpcResponseSchema.parse({
@@ -1040,9 +1183,19 @@ export class LoroStreamsMachineRpcServer {
   async readQuery(
     input: E2eeQueryInput,
     expiresAt: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    historyAuthority?: { isCurrent: () => boolean; signal: AbortSignal }
   ): Promise<E2eeQueryResult> {
     if (!isE2eeReadQuery(input.method, input.params)) throw new Error('e2ee_query_method');
+    return this.serveNative(input, expiresAt, signal, historyAuthority);
+  }
+
+  private async serveNative(
+    input: { queryId: string; method: string; params: unknown },
+    expiresAt: number,
+    signal: AbortSignal,
+    historyAuthority?: { isCurrent: () => boolean; signal: AbortSignal }
+  ): Promise<E2eeQueryResult> {
     const request = LoroStreamsRpcRequestSchema.parse({
       jsonrpc: '2.0',
       id: input.queryId,
@@ -1070,7 +1223,9 @@ export class LoroStreamsMachineRpcServer {
             }
           : { result: response.result };
       },
-      signal
+      signal,
+      true,
+      historyAuthority
     );
     return (
       result ?? {
@@ -1087,7 +1242,9 @@ export class LoroStreamsMachineRpcServer {
   private async handleRequest(
     request: LoroStreamsRpcRequest,
     reply?: (payload: unknown) => Promise<void>,
-    signal = this.stopController.signal
+    signal = this.stopController.signal,
+    authenticatedNativeRead = false,
+    historyAuthority?: { isCurrent: () => boolean; signal: AbortSignal }
   ): Promise<void> {
     const appendResultResponse = (
       replyTo: string,
@@ -1135,7 +1292,7 @@ export class LoroStreamsMachineRpcServer {
       }
       switch (request.method) {
         case 'machine/status': {
-          const response = await this.deps.getMachineStatus();
+          const response = await this.deps.getMachineStatus(request.params);
           await appendResultResponse(request.replyTo, request.id, request.method, response);
           return;
         }
@@ -1149,6 +1306,39 @@ export class LoroStreamsMachineRpcServer {
           }
           const response = await this.deps.getPreviewControl();
           await appendResultResponse(request.replyTo, request.id, request.method, response);
+          return;
+        }
+        case 'machine/automation-control': {
+          if (!this.deps.getAutomationControl) throw new Error('Automation control unavailable');
+          const response = await this.deps.getAutomationControl();
+          await this.appendResultResponse(request.replyTo, request.id, request.method, response);
+          return;
+        }
+        case 'session/automation-control': {
+          if (!this.deps.controlAutomation) throw new Error('Automation control unavailable');
+          const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
+          codeCollabOwnerSessionId = decoded.ownerSessionId;
+          const params = LoroSessionAutomationControlPayloadSchema.parse(decoded.payload);
+          if (decoded.ownerSessionId !== params.sessionId)
+            throw new Error('Automation Session mismatch');
+          const response = await this.deps.controlAutomation(params);
+          const result: RemoteAutomationEncryptedResponse = {
+            type: 'session/automation-control_encrypted',
+            payload: await encryptRpcSecret(
+              params.responseKey,
+              JSON.stringify(response),
+              getAutomationResponseSecretContext({
+                workspaceId: this.deps.workspaceId,
+                machineId: this.deps.machineId,
+                sessionId: params.sessionId,
+                requestId: params.proof.requestId,
+              }),
+              remoteAutomationSecretEnvelopeSchema
+            ),
+          };
+          await this.appendResultResponse(request.replyTo, request.id, request.method, result, {
+            codeCollabOwnerSessionId,
+          });
           return;
         }
         case 'machine/ping': {
@@ -1174,6 +1364,9 @@ export class LoroStreamsMachineRpcServer {
             return;
           }
           const response = await this.deps.restartMachine({
+            ...(request.params.restoreMachineId
+              ? { restoreMachineId: request.params.restoreMachineId }
+              : {}),
             requesterUserId: request.params.requesterUserId,
             requestToken: request.params.requestToken,
             requestId: request.params.requestId,
@@ -1197,6 +1390,7 @@ export class LoroStreamsMachineRpcServer {
             requestToken: request.params.requestToken,
             requestId: request.params.requestId,
             targetVersion: request.params.targetVersion,
+            upgrade: request.params.upgrade,
           });
           await this.settleMachineLifecycleResponse(request.replyTo, request.id, {
             action: 'upgrade',
@@ -1231,6 +1425,7 @@ export class LoroStreamsMachineRpcServer {
             const response = await this.deps.refreshMachineAcpCapabilities({
               configId: request.params.configId as AgentConfigId,
               force: request.params.force === true,
+              ...(request.params.readModelOptions ? { readModelOptions: true as const } : {}),
               onAcpBinaryProgress: appendProgress,
               signal: controller.signal,
             });
@@ -1343,6 +1538,7 @@ export class LoroStreamsMachineRpcServer {
                     requestId: request.params.requestId,
                     action: request.params.action,
                     configId: request.params.configId as AgentConfigId,
+                    methodId: request.params.methodId,
                     onProgress: appendProgress,
                   });
                 case 'cancel':
@@ -1474,6 +1670,23 @@ export class LoroStreamsMachineRpcServer {
           await appendResultResponse(request.replyTo, request.id, request.method, response);
           return;
         }
+        case 'session/withdraw-input': {
+          if (!this.deps.withdrawSessionInput) {
+            await appendErrorResponse(request.replyTo, request.id, request.method, {
+              code: LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
+              message: 'Queued input withdrawal is not available on this machine.',
+            });
+            return;
+          }
+          const response = await this.deps.withdrawSessionInput({
+            sessionId: request.params.sessionId as SessionId,
+            userTurnId: request.params.userTurnId,
+            requesterSessionId: request.params.requesterSessionId as SessionId,
+            userId: request.params.userId,
+          });
+          await appendResultResponse(request.replyTo, request.id, request.method, response);
+          return;
+        }
         case 'session/cancel': {
           if (!this.deps.cancelSession) {
             await appendErrorResponse(request.replyTo, request.id, request.method, {
@@ -1504,6 +1717,7 @@ export class LoroStreamsMachineRpcServer {
           }
           const response = await this.deps.getSessionLiveStatus({
             sessionId: request.params.sessionId as SessionId,
+            ...(request.params.includeActivity ? { includeActivity: true } : {}),
           });
           await appendResultResponse(request.replyTo, request.id, request.method, response);
           return;
@@ -1635,43 +1849,10 @@ export class LoroStreamsMachineRpcServer {
           await appendResultResponse(request.replyTo, request.id, request.method, response);
           return;
         }
-        case 'session/prepare': {
-          if (!this.deps.prepareSession) {
-            await appendErrorResponse(request.replyTo, request.id, request.method, {
-              code: LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
-              message: 'Session preparation is not available on this machine.',
-            });
-            return;
-          }
-          const response = await this.deps.prepareSession(request.params);
-          await appendResultResponse(request.replyTo, request.id, request.method, response);
-          return;
-        }
-        case 'session/prepare-cancel': {
-          if (!this.deps.cancelSessionPreparation) {
-            await appendErrorResponse(request.replyTo, request.id, request.method, {
-              code: LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
-              message: 'Session preparation cancellation is not available on this machine.',
-            });
-            return;
-          }
-          const response = await this.deps.cancelSessionPreparation(request.params);
-          await appendResultResponse(request.replyTo, request.id, request.method, response);
-          return;
-        }
-        case 'session/history-read':
-        case 'session/history-watch': {
+        case 'session/history-read': {
           const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
           codeCollabOwnerSessionId = decoded.ownerSessionId;
           const params = SessionHistoryReadRpcPayloadSchema.parse(decoded.payload);
-          if (
-            (request.method === 'session/history-watch') !==
-            (params.query.kind === 'watchChanges')
-          )
-            throw new LoroStreamsRpcHandlerError(
-              'invalid_request',
-              'History observation method mismatch'
-            );
           await this.verifySessionHistoryOwnerSession(decoded.ownerSessionId, params.sessionId);
           if (signal.aborted || request.expiresAt <= this.now()) return;
           if (!this.deps.readSessionHistory) {
@@ -1687,45 +1868,139 @@ export class LoroStreamsMachineRpcServer {
             );
             return;
           }
-          historyOperationStarted = true;
-          let query = params.query;
-          let readPermit = false;
-          if (query.kind === 'watchChanges') {
-            if (!this.deps.waitForSessionHistoryChanges)
+          const admit = async () => {
+            // Native encrypted entry already verified the signer and the exact session.
+            if (authenticatedNativeRead) {
+              if (
+                !historyAuthority ||
+                historyAuthority.signal.aborted ||
+                !historyAuthority.isCurrent()
+              )
+                throw new LoroStreamsRpcHandlerError(
+                  'session_history_read_denied',
+                  'Session history read access was withdrawn.'
+                );
+              return;
+            }
+            if (
+              !(await this.deps.authorizeSessionHistoryRead?.({
+                sessionId: params.sessionId,
+                readProof: params.readProof,
+              }))
+            )
               throw new LoroStreamsRpcHandlerError(
-                LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
-                'History observation unavailable'
+                'session_history_read_denied',
+                'Session history read access was refused.'
               );
-            await this.deps.waitForSessionHistoryChanges({
-              sessionId: params.sessionId,
-              checkpoint: query.checkpoint,
-              waitMs: Math.min(query.waitMs, Math.max(0, request.expiresAt - this.now() - 1000)),
-              signal: signal,
-            });
-            if (this.stopped || request.expiresAt <= this.now()) return;
-            query = {
-              kind: 'readChanges',
-              checkpoint: query.checkpoint,
-              includeBodiesFrom: query.includeBodiesFrom,
-              ...(query.withPatches ? { withPatches: true as const } : {}),
-            };
-            await this.requestConcurrency.acquire();
-            readPermit = true;
-          }
-          let response: SessionHistoryReadResponse;
-          try {
-            if (this.stopped || request.expiresAt <= this.now()) return;
-            response = await this.deps.readSessionHistory({
-              sessionId: params.sessionId as SessionId,
-              query,
-              signal: signal,
-            });
-          } finally {
-            if (readPermit) this.requestConcurrency.release();
-          }
+          };
+          await admit();
+          historyOperationStarted = true;
+          if (this.stopped || signal.aborted || request.expiresAt <= this.now()) return;
+          const response = await this.deps.readSessionHistory({
+            sessionId: params.sessionId,
+            query: params.query,
+            signal,
+          });
+          await admit();
           await appendResultResponse(request.replyTo, request.id, request.method, response, {
             codeCollabOwnerSessionId,
+            beforeSend: async () => {
+              if (signal.aborted || request.expiresAt <= this.now())
+                throw new Error('history_read_expired');
+              await admit();
+            },
           });
+          return;
+        }
+        case 'session/history-subscribe':
+        case 'session/history-unsubscribe': {
+          const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
+          codeCollabOwnerSessionId = decoded.ownerSessionId;
+          const { sessionId, readProof, subscription } =
+            SessionHistorySubscriptionRpcPayloadSchema.parse(decoded.payload);
+          if ((request.method === 'session/history-subscribe') !== (subscription.action === 'open'))
+            throw new LoroStreamsRpcHandlerError(
+              'invalid_request',
+              'History subscription method mismatch'
+            );
+          await this.verifySessionHistoryOwnerSession(decoded.ownerSessionId, sessionId);
+          if (signal.aborted || request.expiresAt <= this.now()) return;
+          const assertCurrent = () => {
+            if (signal.aborted || request.expiresAt <= this.now())
+              throw new LoroStreamsRpcHandlerError(
+                'request_expired',
+                'History subscription expired.'
+              );
+          };
+          const admit = async () => {
+            assertCurrent();
+            if (!(await this.deps.authorizeSessionHistoryRead?.({ sessionId, readProof })))
+              throw new LoroStreamsRpcHandlerError(
+                'session_history_read_denied',
+                'Session history read access was refused.'
+              );
+            assertCurrent();
+          };
+          await admit();
+          const subscribe = this.deps.subscribeSessionHistory;
+          if (!subscribe)
+            throw new LoroStreamsRpcHandlerError(
+              LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
+              'History subscription unavailable'
+            );
+          const leaseSignal = AbortSignal.any([
+            signal,
+            AbortSignal.timeout(
+              Math.min(
+                SESSION_HISTORY_SUBSCRIPTION_LEASE_MS,
+                Math.max(0, request.expiresAt - this.now() - 1000)
+              )
+            ),
+          ]);
+          const response = {
+            type: 'session/history-subscription_response' as const,
+            sessionId,
+            subscriptionId: subscription.id,
+          };
+          historyOperationStarted = true;
+          const senderDigest = await crypto.subtle.digest(
+            'SHA-256',
+            new TextEncoder().encode(readProof)
+          );
+          await subscribe({
+            sessionId,
+            subscriber: JSON.stringify([request.replyTo, Array.from(new Uint8Array(senderDigest))]),
+            subscription,
+            signal: leaseSignal,
+            admit,
+            publish: async (publication, publicationSignal) => {
+              if (publicationSignal.aborted || leaseSignal.aborted) return;
+              await appendResultResponse(
+                request.replyTo,
+                request.id,
+                request.method,
+                { ...response, event: 'publication', publication },
+                {
+                  codeCollabOwnerSessionId,
+                  beforeSend: async () => {
+                    publicationSignal.throwIfAborted();
+                    leaseSignal.throwIfAborted();
+                    await admit();
+                    publicationSignal.throwIfAborted();
+                    leaseSignal.throwIfAborted();
+                  },
+                }
+              );
+            },
+          });
+          if (!signal.aborted && request.expiresAt > this.now())
+            await appendResultResponse(
+              request.replyTo,
+              request.id,
+              request.method,
+              { ...response, event: 'closed' },
+              { codeCollabOwnerSessionId }
+            );
           return;
         }
         case 'session/history-write': {
@@ -1747,6 +2022,37 @@ export class LoroStreamsMachineRpcServer {
             );
             return;
           }
+          const proof = await this.deps.authorizeSessionHistoryWrite?.({
+            sessionId: params.sessionId,
+            writeProof: params.writeProof,
+            requestId: request.id,
+            operation: params.operation,
+            payload: params.payload,
+          });
+          if (!proof || !Number.isSafeInteger(proof.expiresAt) || proof.expiresAt <= this.now())
+            throw new LoroStreamsRpcHandlerError(
+              'session_history_write_denied',
+              'Session history editing was refused.'
+            );
+          if (this.stopped || signal.aborted || request.expiresAt <= this.now()) return;
+          // Retain the claim until its bearer proof expires, including across restart.
+          // An uncertain write outcome never permits executing that proof twice.
+          await this.deps.historyRequestRejections!.put(
+            request,
+            {
+              code: 'session_history_write_already_claimed',
+              message:
+                'This history write was already admitted; its outcome may be unknown. Do not replay it.',
+            },
+            Math.max(request.expiresAt, proof.expiresAt)
+          );
+          if (
+            this.stopped ||
+            signal.aborted ||
+            request.expiresAt <= this.now() ||
+            proof.expiresAt <= this.now()
+          )
+            return;
           historyOperationStarted = true;
           const response = await this.deps.writeSessionHistory({
             sessionId: params.sessionId as SessionId,
@@ -1820,6 +2126,74 @@ export class LoroStreamsMachineRpcServer {
             baseDigest: params.baseDigest,
             text: params.text,
             ...(params.format === undefined ? {} : { format: params.format }),
+          });
+          await appendResultResponse(request.replyTo, request.id, request.method, response, {
+            codeCollabOwnerSessionId: decoded.ownerSessionId,
+          });
+          return;
+        }
+        case 'code-collab/open-diff-manifest': {
+          const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
+          codeCollabOwnerSessionId = decoded.ownerSessionId;
+          const params = CodeCollabOpenDiffManifestRequestSchema.parse(decoded.payload);
+          await this.verifyCodeCollabV2OwnerSession(decoded.ownerSessionId, params.sessionId);
+          const handler = this.deps.openCodeCollabDiffManifest;
+          if (!handler) {
+            await appendErrorResponse(request.replyTo, request.id, request.method, {
+              code: LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
+              message: 'Diff blob transport is unavailable.',
+            });
+            return;
+          }
+          const response = await handler(params, {
+            plane: 'remote',
+            measureResponse: async (value) => {
+              const result = await encryptCodeCollabV2RpcPayload(decoded.ownerSessionId, value);
+              return new TextEncoder().encode(
+                JSON.stringify({
+                  jsonrpc: JSON_RPC_VERSION,
+                  id: request.id,
+                  method: request.method,
+                  rpcVersion: this.deps.rpcVersion ?? LORO_STREAMS_RPC_VERSION,
+                  machineId: this.deps.machineId,
+                  result,
+                })
+              ).byteLength;
+            },
+          });
+          await appendResultResponse(request.replyTo, request.id, request.method, response, {
+            codeCollabOwnerSessionId: decoded.ownerSessionId,
+          });
+          return;
+        }
+        case 'code-collab/read-blob': {
+          const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
+          codeCollabOwnerSessionId = decoded.ownerSessionId;
+          const params = CodeCollabReadBlobRequestSchema.parse(decoded.payload);
+          await this.verifyCodeCollabV2OwnerSession(decoded.ownerSessionId, params.sessionId);
+          const handler = this.deps.readCodeCollabBlob;
+          if (!handler) {
+            await appendErrorResponse(request.replyTo, request.id, request.method, {
+              code: LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
+              message: 'Diff blob transport is unavailable.',
+            });
+            return;
+          }
+          const response = await handler(params, {
+            plane: 'remote',
+            measureResponse: async (value) => {
+              const result = await encryptCodeCollabV2RpcPayload(decoded.ownerSessionId, value);
+              return new TextEncoder().encode(
+                JSON.stringify({
+                  jsonrpc: JSON_RPC_VERSION,
+                  id: request.id,
+                  method: request.method,
+                  rpcVersion: this.deps.rpcVersion ?? LORO_STREAMS_RPC_VERSION,
+                  machineId: this.deps.machineId,
+                  result,
+                })
+              ).byteLength;
+            },
           });
           await appendResultResponse(request.replyTo, request.id, request.method, response, {
             codeCollabOwnerSessionId: decoded.ownerSessionId,
@@ -1974,6 +2348,23 @@ export class LoroStreamsMachineRpcServer {
           });
           return;
         }
+        case 'file/list-dir': {
+          const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
+          codeCollabOwnerSessionId = decoded.ownerSessionId;
+          const params = SessionDirectoryListRequestSchema.parse(decoded.payload);
+          // Same owner binding as file/preview: a client cannot list another
+          // session's workspace by swapping the session id.
+          await this.verifyCodeCollabV2OwnerSession(decoded.ownerSessionId, params.sessionId);
+          const response: SessionDirectoryListResponse = this.deps.listSessionDirectory
+            ? await this.deps.listSessionDirectory(params)
+            : filePreviewV3Error('unsupported_protocol', {
+                message: 'Session folder listing is not available on this machine.',
+              });
+          await appendResultResponse(request.replyTo, request.id, request.method, response, {
+            codeCollabOwnerSessionId: decoded.ownerSessionId,
+          });
+          return;
+        }
         case 'file/preview': {
           const decoded = await this.decryptCodeCollabV2RequestParams(request.params);
           codeCollabOwnerSessionId = decoded.ownerSessionId;
@@ -2036,6 +2427,30 @@ export class LoroStreamsMachineRpcServer {
           await appendResultResponse(request.replyTo, request.id, request.method, wire);
           return;
         }
+        case 'android-emulator/control': {
+          if (!this.deps.controlAndroidEmulator)
+            throw new Error('Android Emulator is not supported by this machine.');
+          const response = await this.deps.controlAndroidEmulator(request.params);
+          const { viewerUrl, ...preview } = response.preview ?? {};
+          const viewerUrlEnvelope = viewerUrl
+            ? await encryptRpcSecret(
+                request.params.responseKey,
+                viewerUrl,
+                getAndroidEmulatorViewerSecretContext({
+                  workspaceId: this.deps.workspaceId,
+                  machineId: this.deps.machineId,
+                  sessionId: request.params.sessionId,
+                  requestId: request.params.proof.requestId,
+                })
+              )
+            : undefined;
+          const wire = AndroidEmulatorRemoteResponseSchema.parse({
+            ...response,
+            preview: response.preview ? { ...preview, viewerUrlEnvelope } : undefined,
+          });
+          await appendResultResponse(request.replyTo, request.id, request.method, wire);
+          return;
+        }
         case 'session/preview-status': {
           if (!this.deps.getSessionPreviewStatus) {
             await appendErrorResponse(request.replyTo, request.id, request.method, {
@@ -2064,6 +2479,7 @@ export class LoroStreamsMachineRpcServer {
             requestedByUserId: request.params.requestedByUserId,
             proof: request.params.proof,
             reason: request.params.reason,
+            ...(request.params.stopProcess ? { stopProcess: true } : {}),
           });
           await appendResultResponse(request.replyTo, request.id, request.method, response);
           return;
@@ -2098,6 +2514,24 @@ export class LoroStreamsMachineRpcServer {
           await appendResultResponse(request.replyTo, request.id, request.method, response);
           return;
         }
+        case 'local-project/list-branches': {
+          if (!this.deps.listLocalProjectBranches) {
+            await appendErrorResponse(request.replyTo, request.id, request.method, {
+              code: LORO_STREAMS_RPC_ERROR_CODES.methodUnavailable,
+              message: 'Local project branch listing is not available on this machine.',
+            });
+            return;
+          }
+          const response = await this.deps.listLocalProjectBranches({
+            localProjectId: request.params.localProjectId as LocalProjectId,
+            requestedByUserId: request.params.requestedByUserId,
+            query: request.params.query,
+            limit: request.params.limit,
+            cursor: request.params.cursor,
+          });
+          await appendResultResponse(request.replyTo, request.id, request.method, response);
+          return;
+        }
         case 'local-project/control': {
           if (!this.deps.dispatchLocalProjectControl) {
             await appendErrorResponse(request.replyTo, request.id, request.method, {
@@ -2117,7 +2551,8 @@ export class LoroStreamsMachineRpcServer {
       if (
         signal.aborted &&
         (request.method === 'session/history-read' ||
-          request.method === 'session/history-watch' ||
+          request.method === 'session/history-subscribe' ||
+          request.method === 'session/history-unsubscribe' ||
           request.method === 'session/history-write')
       )
         return;
@@ -2166,7 +2601,9 @@ export class LoroStreamsMachineRpcServer {
       }
       const codeCollabError = request.method.startsWith('code-collab/')
         ? toCodeCollabRpcError(failure)
-        : request.method === 'file/preview' || request.method === 'file/download-chunk'
+        : request.method === 'file/preview' ||
+            request.method === 'file/download-chunk' ||
+            request.method === 'file/list-dir'
           ? toFilePreviewRpcError(failure, message)
           : null;
       await appendErrorResponse(
@@ -2271,6 +2708,9 @@ export class LoroStreamsMachineRpcServer {
     requestId: string,
     method: LoroStreamsRpcMethod,
     result:
+      | RemoteAutomationHandshake
+      | RemoteAutomationRpcResult
+      | RemoteAutomationEncryptedResponse
       | MachineStatusResponse
       | MachinePreviewControlResponse
       | MachinePingResponse
@@ -2288,20 +2728,22 @@ export class LoroStreamsMachineRpcServer {
       | MachinePiExtensionsResponse
       | SessionCancelResponse
       | LoroSessionLiveStatusRpcResponse
+      | SessionWithdrawInputResponse
       | SessionSteerResponse
       | SessionGoalResponse
       | SessionTerminateResponse
       | SessionForkResponse
       | SessionEditAndResendResponse
       | SessionDispatchTurnResponse
-      | SessionPrepareResponse
-      | SessionPrepareCancelResponse
       | SessionHistoryReadResponse
+      | SessionHistorySubscriptionResponse
       | SessionHistoryWriteResponse
       | CodeCollabV2Error
       | CodeCollabV2OpenTextOk
       | CodeCollabV2RefreshTextResponse
       | CodeCollabV2SaveTextResponse
+      | CodeCollabOpenDiffManifestResponse
+      | CodeCollabReadBlobResponse
       | CodeCollabV2OpenCurrentDiffResponse
       | CodeCollabV2OpenAllChangesDiffResponse
       | CodeCollabV2OpenTurnDiffResponse
@@ -2309,21 +2751,30 @@ export class LoroStreamsMachineRpcServer {
       | CodeCollabV2LspUnsupported
       | FilePreviewV3Response
       | FileDownloadResponse
+      | SessionDirectoryListResponse
       | SessionPreviewCreateResponse
       | SessionPreviewRevokeResponse
       | SessionPreviewStatusResponse
       | IosSimulatorResponse
+      | AndroidEmulatorResponse
       | ProjectProbeLocalMemberResult
       | LocalProjectGitStateRpcResponse
+      | LocalProjectListBranchesRpcResponse
       | LocalProjectControlResponse,
-    options: { readonly codeCollabOwnerSessionId?: string } = {},
+    options: {
+      readonly codeCollabOwnerSessionId?: string;
+      readonly beforeSend?: () => Promise<void>;
+    } = {},
     response?: (payload: unknown) => Promise<void>
   ): Promise<void> {
     const wireResult =
       options.codeCollabOwnerSessionId === undefined
         ? result
         : await encryptCodeCollabV2RpcPayload(options.codeCollabOwnerSessionId, result);
-    await (response ?? ((payload: unknown) => this.appendResponse(replyTo, payload)))({
+    await options.beforeSend?.();
+    await (
+      response ?? ((payload: unknown) => this.appendResponse(replyTo, payload, options.beforeSend))
+    )({
       jsonrpc: JSON_RPC_VERSION,
       id: requestId,
       method,
@@ -2361,7 +2812,11 @@ export class LoroStreamsMachineRpcServer {
     });
   }
 
-  private async appendResponse(replyTo: string, payload: unknown): Promise<void> {
+  private async appendResponse(
+    replyTo: string,
+    payload: unknown,
+    beforeSend?: () => Promise<void>
+  ): Promise<void> {
     // The host POSTs the RPC response to the per-client response stream over
     // HTTP. That request can fail transiently — a raw network error
     // ("fetch failed", e.g. a connection reset or a stalled event loop) or a
@@ -2373,6 +2828,7 @@ export class LoroStreamsMachineRpcServer {
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
+        await beforeSend?.();
         await this.streamClient.appendJson(replyTo, payload);
         return;
       } catch (error) {
@@ -2381,6 +2837,7 @@ export class LoroStreamsMachineRpcServer {
             replyTo,
             this.deps.retentionSeconds ?? LORO_STREAMS_RPC_RETENTION_SECONDS
           );
+          await beforeSend?.();
           await this.streamClient.appendJson(replyTo, payload);
           return;
         }

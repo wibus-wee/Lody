@@ -2,12 +2,14 @@ import type { E2eeMachineSharingChange, E2eeMachineSharingView } from '@lody/pla
 import { useTranslation } from 'react-i18next';
 import * as stylex from '@stylexjs/stylex';
 import { Button } from '@lody/ui/button';
+import { Collapsible } from '@lody/ui/collapsible';
 import { Switch } from '@lody/ui/switch';
 import { Badge } from '@lody/ui/badge';
 import { Alert } from '@lody/ui/alert';
 import { Spinner } from '@lody/ui/spinner';
 import { colors } from '@lody/ui/tokens/colors.stylex';
 import { space, text } from '@lody/ui/tokens/scales.stylex';
+import { ChevronDown } from 'lucide-react';
 import { CompactSection, CompactRow } from '../compact-layout';
 
 export type SharingProject = { id: string; name: string; rootPath?: string };
@@ -19,15 +21,27 @@ export type SharingIssue =
   | 'generation'
   | 'notOwned'
   | 'notShared'
-  | 'unavailable';
+  | 'unavailable'
+  | 'unsupported';
 export const sharingIssue = (cause: unknown): SharingIssue => {
   const message = cause instanceof Error ? cause.message : '';
   if (/e2ee_machine_not_owned|e2ee_machine-not-owned/.test(message)) return 'notOwned';
   if (/e2ee_machine_not_shared|e2ee_machine-not-shared/.test(message)) return 'notShared';
+  if (message === 'e2ee_machine_sharing_unsupported') return 'unsupported';
   if (/sharing_conflict/.test(message)) return 'conflict';
   return 'retry';
 };
 const styles = stylex.create({
+  details: {
+    margin: 0,
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr',
+    columnGap: space[3],
+    rowGap: space[1],
+    color: colors.secondaryLabel,
+    fontSize: text.footnoteSize,
+  },
+  detailValue: { margin: 0 },
   root: { display: 'flex', flexDirection: 'column', gap: space[3] },
   notice: {
     padding: space[4],
@@ -38,7 +52,6 @@ const styles = stylex.create({
   },
   actions: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: space[2] },
   key: {
-    fontFamily: 'monospace',
     color: colors.secondaryLabel,
     overflowWrap: 'anywhere',
     fontSize: text.footnoteSize,
@@ -77,19 +90,18 @@ export function MachineSharingPanel({
     !view ||
     view.unavailable ||
     issue === 'unavailable' ||
+    issue === 'unsupported' ||
     issue === 'retry' ||
     issue === 'notOwned' ||
     issue === 'notShared';
   const pending = !!view?.pendingRequest || (!!retryable && issue !== 'conflict');
-  const effective =
-    !pending && !unavailable && !view.needsResign && !view.removed && view.sharedWithTeam;
+  const effective = !pending && !unavailable && !view.removed && view.sharedWithTeam;
   const disabled =
     busy ||
     loading ||
     unavailable ||
     !view?.canManage ||
     view?.removed ||
-    view?.needsResign ||
     !!view?.pendingRequest ||
     retryable ||
     (!!issue && issue !== 'generation');
@@ -105,11 +117,9 @@ export function MachineSharingPanel({
         ? 'unavailable'
         : pending
           ? 'pending'
-          : view.needsResign
-            ? 'needsResign'
-            : effective
-              ? 'shared'
-              : 'private';
+          : effective
+            ? 'shared'
+            : 'private';
   return (
     <div {...stylex.props(styles.root)} aria-busy={!!busy || !!loading}>
       <CompactSection title={t('e2ee.machineSharing.title')}>
@@ -122,29 +132,12 @@ export function MachineSharingPanel({
             <Switch
               checked={effective}
               disabled={!!disabled}
+              data-testid="machine-sharing-toggle"
               aria-label={t('e2ee.machineSharing.team')}
               onCheckedChange={(checked) => onChange({ kind: 'machine', sharedWithTeam: checked })}
             />
           ) : null}
           {busy || loading ? <Spinner size="small" /> : null}
-        </CompactRow>
-        <CompactRow
-          label={t(
-            view?.needsResign
-              ? 'e2ee.machineSharing.recordedVersion'
-              : pending
-                ? 'e2ee.machineSharing.lastVersion'
-                : 'e2ee.machineSharing.version'
-          )}
-        >
-          <span>{view?.head ? `v${view.head.revision}` : t('e2ee.machineSharing.noVersion')}</span>
-        </CompactRow>
-        <CompactRow label={t('e2ee.machineSharing.signer')}>
-          <span title={view?.signer ?? undefined} {...stylex.props(styles.key)}>
-            {view?.signer
-              ? `${view.signer.slice(0, 12)}…${view.signer.slice(-8)}`
-              : t('e2ee.machineSharing.noSigner')}
-          </span>
         </CompactRow>
         {rows.map((project) => {
           const stored = view?.projects.includes(project.id) ?? false;
@@ -166,7 +159,7 @@ export function MachineSharingPanel({
               ) : (
                 <Badge>
                   {t(
-                    `e2ee.machineSharing.state.${unavailable ? 'unavailable' : view?.needsResign ? 'needsResign' : effective && stored ? 'shared' : 'private'}`
+                    `e2ee.machineSharing.state.${unavailable ? 'unavailable' : effective && stored ? 'shared' : 'private'}`
                   )}
                 </Badge>
               )}
@@ -187,6 +180,7 @@ export function MachineSharingPanel({
           ) : null}
           {view?.needsResign ? (
             <Alert.Root>
+              <Alert.Title>{t('e2ee.machineSharing.state.needsResign')}</Alert.Title>
               <Alert.Description>{t('e2ee.machineSharing.resignHint')}</Alert.Description>
             </Alert.Root>
           ) : null}
@@ -195,10 +189,16 @@ export function MachineSharingPanel({
               {t(
                 pendingChangeShown.kind === 'machine'
                   ? 'e2ee.machineSharing.pendingMachine'
-                  : 'e2ee.machineSharing.pendingProject',
+                  : pendingChangeShown.kind === 'session'
+                    ? 'e2ee.machineSharing.pendingSession'
+                    : 'e2ee.machineSharing.pendingProject',
                 {
                   action: t(
-                    pendingChangeShown.sharedWithTeam
+                    (
+                      pendingChangeShown.kind === 'session'
+                        ? pendingChangeShown.level === 'read'
+                        : pendingChangeShown.sharedWithTeam
+                    )
                       ? 'e2ee.machineSharing.enable'
                       : 'e2ee.machineSharing.disable'
                   ),
@@ -206,7 +206,9 @@ export function MachineSharingPanel({
                     pendingChangeShown.kind === 'project'
                       ? (rows.find((project) => project.id === pendingChangeShown.localProjectId)
                           ?.name ?? pendingChangeShown.localProjectId)
-                      : undefined,
+                      : pendingChangeShown.kind === 'session'
+                        ? pendingChangeShown.sessionId
+                        : undefined,
                 }
               )}
             </p>
@@ -220,6 +222,32 @@ export function MachineSharingPanel({
               </Alert.Root>
             </div>
           ) : null}
+          {/* Version and signer help diagnose a sync problem; the switches are the page. */}
+          <Collapsible.Root>
+            <Collapsible.Trigger render={<Button variant="ghost" size="small" />}>
+              {t('e2ee.machineSharing.details')}
+              <ChevronDown size={14} aria-hidden="true" />
+            </Collapsible.Trigger>
+            <Collapsible.Panel keepMounted>
+              <dl {...stylex.props(styles.details)}>
+                <dt>
+                  {t(pending ? 'e2ee.machineSharing.lastVersion' : 'e2ee.machineSharing.version')}
+                </dt>
+                <dd {...stylex.props(styles.detailValue)}>
+                  {view?.head ? `v${view.head.revision}` : t('e2ee.machineSharing.noVersion')}
+                </dd>
+                <dt>{t('e2ee.machineSharing.signer')}</dt>
+                <dd
+                  title={view?.signer ?? undefined}
+                  {...stylex.props(styles.detailValue, view?.signer ? styles.key : undefined)}
+                >
+                  {view?.signer
+                    ? `${view.signer.slice(0, 12)}…${view.signer.slice(-8)}`
+                    : t('e2ee.machineSharing.noSigner')}
+                </dd>
+              </dl>
+            </Collapsible.Panel>
+          </Collapsible.Root>
           <div {...stylex.props(styles.actions)}>
             <Button variant="secondary" size="small" onClick={onRefresh} disabled={busy || loading}>
               {t('e2ee.machineSharing.refresh')}

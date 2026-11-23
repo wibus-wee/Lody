@@ -1,116 +1,46 @@
-import * as identityStorage from '@lody/shared/node/e2ee-identity'
-import { E2eeMemberRemovedError } from './e2ee-cloud-errors.mts'
-import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
-import { readFile, mkdtemp, rm, readdir, writeFile } from 'node:fs/promises'
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
-import { createRequire } from 'node:module'
-import { runInNewContext } from 'node:vm'
-import test from 'node:test'
-import ts from 'typescript'
-import { Effect, Scope, Exit, Result } from 'effect'
 import {
   Bytes,
+  DatabaseSync,
+  E2eeDeviceRevokedError,
+  E2eeMemberRemovedError,
+  Effect,
+  EventEmitter,
+  Exit,
+  Layer,
+  Result,
+  Scope,
+  TestClock,
+  account,
+  assert,
+  createAccountWorkspace,
+  createDesktopQuitBarrier,
+  createRequire,
+  desktopE2eeFailure,
+  drainMainProcessQuitResources,
+  electronIpc,
   hashRecordBytes,
-  verifyLedger,
+  holdWorkspaceTurn,
+  identityStorage,
+  isIpcInvokeChannel,
+  join,
+  load,
+  makeDesktopE2eeBootstrap,
+  makeDesktopE2eeCustody,
+  makeDesktopE2eeRuntimeHost,
+  makeOfflineAuthIdentityCache,
+  nativeAccountFixture,
+  personalJoinFixture,
   prepareLedgerCommand,
-  signLedgerRecord
-} from '@lody/e2ee-core/protocol'
-import { makeDesktopE2eeCustody } from '../e2ee-custody.mts'
-import { makeDesktopE2eeBootstrap } from './e2ee-bootstrap.mts'
-import { makeDesktopE2eeRuntimeHost } from './e2ee-runtime.mts'
-import { makeOfflineAuthIdentityCache } from '../auth-storage.ts'
-import * as electronIpc from '../../../../../packages/shared/src/electron-ipc.ts'
-import { isIpcInvokeChannel } from '../../preload/ipc-invoke-policy.ts'
-import * as memberJoining from './e2ee-member-join.mts'
-import { PersonalPairingOfferSchema } from './e2ee-personal-pairing.mts'
-import { desktopE2eeFailure } from './e2ee-diagnostics.mts'
-const require = createRequire(import.meta.url)
-async function load(relative, dependencies, console = globalThis.console, env = {}) {
-  const source = await readFile(new URL(relative, import.meta.url), 'utf8')
-  const exports = {}
-  runInNewContext(
-    ts.transpileModule(source.replaceAll('import.meta.env', JSON.stringify(env)), {
-      compilerOptions: {
-        target: ts.ScriptTarget.ES2022,
-        module: ts.ModuleKind.CommonJS,
-        experimentalDecorators: true
-      }
-    }).outputText,
-    {
-      exports,
-      Error,
-      crypto: globalThis.crypto,
-      Buffer,
-      URL,
-      setTimeout,
-      clearTimeout,
-      console,
-      require: (id) =>
-        Object.hasOwn(dependencies, id)
-          ? dependencies[id]
-          : id === '../../services/e2ee-member-join.mjs'
-            ? memberJoining
-            : id === '../../services/e2ee-cloud-errors.mjs'
-              ? { E2eeMemberRemovedError }
-              : id === '../../services/e2ee-personal-pairing.mjs'
-                ? { PersonalPairingOfferSchema }
-                : require(id)
-    }
-  )
-  return exports
-}
-async function account(options = {}) {
-  const identity = { userId: 'account', generation: 1 }
-  let identityListener = () => {}
-  const auth = {
-    subscribeCachedSessionIdentity: (listener) => {
-      identityListener = listener
-      return () => {}
-    },
-    getCachedSessionIdentity: () => ({ ...identity }),
-    getBootstrapSession: () => new Promise(() => {})
-  }
-  const warnings = []
-  const api = await load(
-    './e2ee-account-runtime.ts',
-    {
-      electron: { app: { getPath: () => options.directory ?? '/synthetic-user-data' } },
-      '@lody/shared/node/e2ee-identity': options.identityStorage ?? {
-        leaseE2eeIdentity: () => Effect.void
-      },
-      '../e2ee-custody-electron': {
-        makeElectronE2eeCustody: options.custody ?? (() => Effect.succeed({}))
-      },
-      './e2ee-bootstrap.mjs': {
-        makeDesktopE2eeBootstrap: options.bootstrap ?? (() => Effect.succeed({}))
-      },
-      './e2ee-cloud-client.mjs': { makeE2eeCloudClient: options.cloud },
-      './e2ee-runtime.mjs': {
-        makeDesktopE2eeRuntimeHost: options.host ?? (() => Effect.succeed({}))
-      },
-      '../ipc/ipc-service-deps': {
-        getIpcServiceDeps: () => ({
-          authService: auth
-        })
-      }
-    },
-    { warn: (...args) => warnings.push(args) }
-  )
-  return {
-    api,
-    warnings,
-    identity,
-    publishIdentity: (userId) => {
-      identity.userId = userId
-      identity.generation += 1
-      identityListener()
-    }
-  }
-}
+  proxyEnv,
+  randomUUID,
+  readFile,
+  readdir,
+  signLedgerRecord,
+  test,
+  verifyLedger,
+  writeFile
+} from './e2ee-account-runtime-test-helpers.mjs'
+
 void test('passive account inspection never reopens an absent or closed owner', async () => {
   let leases = 0,
     custody = 0,
@@ -142,7 +72,7 @@ void test('passive account inspection never reopens an absent or closed owner', 
         }
       })
   })
-  const inspect = () => api.inspectDesktopE2eeCachedState('account', 'team', 'machine')
+  const inspect = () => api.inspectDesktopE2eeCachedState('acc1', 'team', 'machine')
   assert.equal((await inspect()).ownerPresent, false)
   assert.deepEqual([leases, custody, hosts], [0, 0, 0])
   await api.withDesktopE2eeAccount(
@@ -187,6 +117,7 @@ void test('failed account cleanup cannot block sign-out or authorize replacement
     /e2ee_restart-required: Restart Lody/
   )
 })
+
 void test('cancelled quit reopens admission only after actual in-flight work and cleanup settle', async () => {
   const { api } = await account()
   const entered = Promise.withResolvers()
@@ -214,17 +145,27 @@ void test('cancelled quit reopens admission only after actual in-flight work and
   assert.equal(await api.withDesktopE2eeAccount(() => Effect.succeed('available')), 'available')
   await api.closeDesktopE2eeAccount()
 })
+
 void test('in-place and subframe navigation retain the ledger lease; document navigation releases it', async () => {
-  const sender = Object.assign(new EventEmitter(), { id: 7 })
+  const sender = Object.assign(new EventEmitter(), {
+    id: 7,
+    isDestroyed: () => false,
+    send: () => {}
+  })
   const readers = new Map()
   const owner = {
     readers,
-    host: { open: () => Effect.succeed('open'), status: () => Effect.succeed('ready') }
+    bootstrap: { removedReason: () => Effect.succeed(null) },
+    host: {
+      pendingClose: () => Effect.succeed(undefined),
+      open: () => Effect.succeed('open'),
+      status: () => Effect.succeed('ready')
+    }
   }
   const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
     '../ipc-service-deps': { getIpcServiceDeps: () => ({}) },
+    '../product-window-ipc-service': { ProductWindowIpcService: class {} },
     'electron-ipc-decorator': {
-      IpcService: class {},
       IpcMethod: () => (_target, _name, descriptor) => descriptor,
       getIpcContext: () => ({ event: { sender } })
     },
@@ -245,18 +186,36 @@ void test('in-place and subframe navigation retain the ledger lease; document na
   await assert.rejects(ipc.status('workspace'), /e2ee_not_open/)
 })
 
-void test('uncertain admission preserves append and reconciliation failures, then accepts verified retry', async () => {
-  const sender = Object.assign(new EventEmitter(), { id: 17 })
+void test('uncertain admission preserves append and reconciliation failures, then accepts verified retry with a bounded ledger handoff', async () => {
+  const sender = Object.assign(new EventEmitter(), {
+    id: 17,
+    isDestroyed: () => false,
+    send: () => {}
+  })
   const appendFailure = new Error('synthetic sanitized append failure')
   const reconciliationFailure = new Error('e2ee_invalid-input')
   const request = { workspaceId: 'workspace', requestId: 'stable-request', recordHex: 'aabb' }
   const submitted = []
   let committed = false
+  // The desktop's verified originals from genesis, handed to the local agent so it
+  // need not replay the same ledger over the network.
+  const ledgerView = (records) => ({
+    status: { length: records.length, position: `p1:workspace:${records.length}:offset:0` },
+    recordsHex: records,
+    recordPositions: records.map((_record, index) => index)
+  })
+  let ledger = ledgerView(['aa', 'bb'])
+  const activations = []
+  let activationRefusal
   const owner = {
-    accountId: 'account',
+    accountId: 'acc1',
     bootstrap: { deviceCredential: () => Effect.succeed('synthetic-credential') },
     readers: new Map([['workspace', new Set([sender.id])]]),
     host: {
+      ledgerView: () => {
+        if (ledger === null) throw new Error('synthetic ledger export failure')
+        return Effect.succeed(ledger)
+      },
       localPairingContext: () => Effect.succeed({ pairingSessionId: '44'.repeat(16) }),
       approveLocalPairing: () => Effect.succeed(request),
       confirmLocalPairing: () =>
@@ -279,12 +238,17 @@ void test('uncertain admission preserves append and reconciliation failures, the
             prepareLocalE2eeDevice: async () => {
               throw localTimeout
             },
-            activateLocalE2eeDevice: async () => {}
+            activateLocalE2eeDevice: async (message) => {
+              activations.push(JSON.parse(JSON.stringify(message)))
+              const refusal = activationRefusal
+              activationRefusal = undefined
+              if (refusal) throw refusal
+            }
           }
         })
       },
+      '../product-window-ipc-service': { ProductWindowIpcService: class {} },
       'electron-ipc-decorator': {
-        IpcService: class {},
         IpcMethod: () => (_target, _name, descriptor) => descriptor,
         getIpcContext: () => ({ event: { sender } })
       },
@@ -293,7 +257,7 @@ void test('uncertain admission preserves append and reconciliation failures, the
       '../../services/e2ee-account-runtime': {
         withDesktopE2eeAccount: (work) => Effect.runPromise(work(owner)),
         desktopE2eeCloudClient: async () => ({
-          accountId: 'account',
+          accountId: 'acc1',
           client: {
             appendRecord: (value) => {
               submitted.push(structuredClone(value))
@@ -307,7 +271,14 @@ void test('uncertain admission preserves append and reconciliation failures, the
     { warn: (...args) => warnings.push(args) }
   )
   const ipc = new E2eeIpc()
-  ipc.refresh = async () => {}
+  // Admitting the local agent sends only its envelope when this device holds the
+  // current key; a device without it keeps the full round that receives first.
+  const refreshes = []
+  let holdsKey = true
+  ipc.refresh = async (_workspaceId, options) => {
+    refreshes.push(options)
+  }
+  ipc.status = async () => ({ hasCurrentKey: holdsKey })
   const session = '44'.repeat(16)
   await assert.rejects(ipc.prepareLocalAgent('workspace'), (error) => {
     assert.equal(error.message, 'e2ee_local_agent_pending')
@@ -328,12 +299,201 @@ void test('uncertain admission preserves append and reconciliation failures, the
   // The same signed request can have committed despite the failed response.
   // Verified readback on retry wins over that attempt's lost acknowledgement.
   committed = true
+  holdsKey = false
   const result = await ipc.admitLocalAgent('workspace', session)
   assert.equal(result.admitted, true)
   assert.equal(result.ready, true)
   assert.equal(ipc.pairingFailure, undefined)
   assert.deepEqual(submitted, [request, request])
+  assert.deepEqual(
+    refreshes.map((options) => options?.keyMode),
+    ['distribute', 'full']
+  )
+  assert.deepEqual(activations, [
+    {
+      type: 'activate',
+      accountId: 'acc1',
+      workspaceId: 'workspace',
+      genesisHash: '11'.repeat(32),
+      signingPublicKey: '22'.repeat(32),
+      ledgerRecordsHex: ['aa', 'bb'],
+      ledgerPosition: 'p1:workspace:2:offset:0'
+    }
+  ])
+  // Past either IPC bound the handoff is omitted; the agent reads history itself.
+  const handoffs = []
+  for (const records of [
+    Array.from({ length: 2049 }, () => 'aa'),
+    ['aa'.repeat(8192), ...Array.from({ length: 32 }, () => 'bb'.repeat(8192))]
+  ]) {
+    ledger = ledgerView(records)
+    assert.equal((await ipc.admitLocalAgent('workspace', session)).ready, true)
+    handoffs.push(activations.at(-1).ledgerRecordsHex?.length ?? null)
+  }
+  // An older agent's strict schema refuses the fields; it is activated without them.
+  ledger = ledgerView(['aa', 'bb'])
+  activationRefusal = new Error('e2ee_local_agent_unavailable', {
+    cause: new Error('e2ee_invalid_input')
+  })
+  assert.equal((await ipc.admitLocalAgent('workspace', session)).ready, true)
+  handoffs.push(...activations.slice(-2).map((message) => message.ledgerRecordsHex?.length ?? null))
+  assert.deepEqual(handoffs, [null, null, 2, null])
+  // The handoff is optional: a failed ledger export never fails a confirmed admission.
+  ledger = null
+  assert.equal((await ipc.admitLocalAgent('workspace', session)).ready, true)
+  assert.equal(activations.at(-1).ledgerRecordsHex, undefined)
   assert.deepEqual(warnings, [])
+})
+
+void test('a stalled system proxy lookup counts as direct after its bound', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { resolveSystemProxyEnv, SYSTEM_PROXY_LOOKUP_TIMEOUT_MS } = await load(
+    './system-proxy-env.ts',
+    { electron: { session: {} }, '@lody/shared/proxy-env': proxyEnv },
+    globalThis.console,
+    {},
+    { process: { env: {} } }
+  )
+  const probes = []
+  const resolving = resolveSystemProxyEnv(['https://relay-a.example', 'https://relay-b.example'], {
+    resolveProxy: (url) => {
+      probes.push(url)
+      // A PAC script that never answers for the first URL; the second is direct.
+      return url.includes('relay-a') ? new Promise(() => {}) : Promise.resolve('PROXY proxy:8080')
+    }
+  })
+  let settled = false
+  void resolving.then(() => (settled = true))
+  await Promise.resolve()
+  assert.equal(settled, false)
+  t.mock.timers.tick(SYSTEM_PROXY_LOOKUP_TIMEOUT_MS)
+  // The sandbox realm has its own Object prototype.
+  assert.deepEqual(
+    { ...(await resolving) },
+    {
+      HTTP_PROXY: 'http://proxy:8080',
+      HTTPS_PROXY: 'http://proxy:8080',
+      ALL_PROXY: 'http://proxy:8080',
+      NO_PROXY: proxyEnv.DEFAULT_NO_PROXY
+    }
+  )
+  assert.deepEqual(probes, ['https://relay-a.example', 'https://relay-b.example'])
+})
+
+void test('a cold iroh open waiting on the system proxy never holds other workspaces', async () => {
+  const identity = { userId: 'acc1', generation: 1 }
+  const lookups = []
+  const hosts = []
+  const api = await load(
+    './e2ee-account-runtime.ts',
+    {
+      electron: {
+        app: { getPath: () => '/synthetic-user-data', isPackaged: false, getAppPath: () => '/app' }
+      },
+      '@lody/shared/node/e2ee-identity': { leaseE2eeIdentity: () => Effect.void },
+      '../e2ee-custody-electron': { makeElectronE2eeCustody: () => Effect.succeed({}) },
+      './e2ee-bootstrap.mjs': { makeDesktopE2eeBootstrap: () => Effect.succeed({}) },
+      './e2ee-runtime.mjs': {
+        makeDesktopE2eeRuntimeHost: (input) =>
+          Effect.sync(() => {
+            hosts.push(input.iroh?.proxyUrl ?? null)
+            return {}
+          })
+      },
+      './e2ee-iroh-config': {
+        desktopIrohConfig: () => ({ file: '/iroh.node', relays: { urls: ['https://relay'] } }),
+        proxyUrlFromEnv: (env) => env.HTTPS_PROXY
+      },
+      './e2ee-iroh.mjs': { loadIrohNative: () => ({}) },
+      './system-proxy-env': {
+        resolveSystemProxyEnv: () => {
+          const lookup = Promise.withResolvers()
+          lookups.push(lookup)
+          return lookup.promise
+        }
+      },
+      '../ipc/ipc-service-deps': {
+        getIpcServiceDeps: () => ({
+          authService: {
+            subscribeCachedSessionIdentity: () => () => {},
+            getCachedSessionIdentity: () => ({ ...identity })
+          }
+        })
+      }
+    },
+    globalThis.console,
+    { VITE_LODY_PLATFORM: 'cloud', VITE_IROH_RELAYS: 'https://relay' },
+    { process: { env: {}, resourcesPath: '/resources' } }
+  )
+  const first = api.withDesktopE2eeAccount((owner) => Effect.succeed(owner.directory), 'team')
+  await new Promise((resolve) => setImmediate(resolve))
+  lookups[0].resolve({ HTTPS_PROXY: 'http://proxy:1' })
+  await first
+  // Another workspace's cold open stalls in its proxy lookup, before the permit.
+  const stalled = api.withDesktopE2eeAccount((owner) => Effect.succeed(owner.directory), 'other')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(lookups.length, 2)
+  // The open workspace keeps working meanwhile.
+  assert.equal(
+    await api.withDesktopE2eeAccount((owner) => Effect.succeed(owner.accountId), 'team'),
+    'acc1'
+  )
+  lookups[1].resolve({})
+  assert.match(await stalled, /other$/)
+  assert.deepEqual(hosts, ['http://proxy:1', null])
+})
+
+void test('quit retains a supervisor whose stop failed so recovery retries the same owner', async () => {
+  const { CliService } = await load(
+    './cli-service.ts',
+    {
+      electron: { app: {}, powerSaveBlocker: {} },
+      '../platform': { mainPlatformKind: 'cloud' },
+      '@lody/shared/node/installation-profile': { getLodyDataDir: () => '/synthetic-data' },
+      '@lody/shared/node/local-cli-host-lease': {
+        getLocalCliHostEndpoint: () => '/synthetic-host'
+      },
+      '@lody/shared/node/local-ipc': { getLocalDaemonRunFilePath: () => '/synthetic-run' },
+      '@lody/shared/node/process': {},
+      '@lody/shared/node/local-session-control': {},
+      '@lody/shared/node/local-project-control': {},
+      '@lody/shared/node/local-cli-supervisor': {},
+      '@lody/shared/local-machine-rpc': {},
+      '@lody/cli-supervisor': {},
+      './shell-env': {},
+      './system-proxy-env': {},
+      '../desktop-log': {},
+      '../desktop-log-core': {},
+      './desktop-execution-host': {},
+      './local-session-control-budget': {}
+    },
+    { error() {} }
+  )
+  const service = Object.create(CliService.prototype)
+  Object.assign(service, {
+    cliAutoStartEnabled: true,
+    preventSleepEnabled: false,
+    powerSaveBlockerId: null,
+    cliState: {},
+    cliStateSenders: new Set(),
+    trackedCliChildren: new Map()
+  })
+  const stopFailure = new Error('synthetic child did not exit after SIGKILL')
+  let exited = false
+  service.supervisor = {
+    getState: () => ({ phase: exited ? 'stopped' : 'fatal', desiredState: 'stopped' }),
+    stop: async () => {
+      if (!exited) throw stopFailure
+    }
+  }
+
+  await assert.rejects(service.shutdownForQuit(0), (error) => error === stopFailure)
+  // The unresolved owner stays visible instead of reporting a stopped CLI.
+  assert.equal(service.getCliState().phase, 'fatal')
+
+  exited = true
+  await service.shutdownForQuit(0)
+  assert.equal(service.getCliState().phase, 'stopped')
 })
 
 void test('local pairing timeout remains an unknown outcome and does not poison a later CLI request', async () => {
@@ -402,7 +562,7 @@ void test('cached identity admits offline work and replaces or closes owners on 
         owner.accountId
       )
     ),
-    'account'
+    'acc1'
   )
   identity.userId = 'second'
   identity.generation++
@@ -424,6 +584,7 @@ void test('cached identity admits offline work and replaces or closes owners on 
   )
   await api.closeDesktopE2eeAccount()
 })
+
 void test('auth changes during native open close the stale owner before any work is admitted', async () => {
   const entered = Promise.withResolvers()
   const finish = Promise.withResolvers()
@@ -457,6 +618,117 @@ void test('auth changes during native open close the stale owner before any work
   assert.equal(admitted, false)
   assert.equal(released, true)
 })
+
+void test('a stale cold open closes only the old login, never a workspace the new login already opened', async () => {
+  // With workspaces opening concurrently, a turn that began before a re-login must not
+  // tear down the new login's open workspace (and its window reader) on its way out.
+  const entered = Promise.withResolvers()
+  const finish = Promise.withResolvers()
+  let opens = 0
+  const { api, identity } = await account({
+    custody: () =>
+      Effect.gen(function* () {
+        if (++opens > 1) return {}
+        yield* Effect.promise(() => {
+          entered.resolve()
+          return finish.promise
+        })
+        return {}
+      })
+  })
+  const stale = api.withDesktopE2eeAccount(() => Effect.void, 'ws-1')
+  await entered.promise
+  identity.generation++
+  const current = await api.withDesktopE2eeAccount((owner) => Effect.succeed(owner), 'ws-2')
+  finish.resolve()
+  await assert.rejects(stale, /e2ee_account_unavailable/)
+  assert.equal(
+    await api.withDesktopE2eeAccount((owner) => Effect.succeed(owner === current), 'ws-2'),
+    true
+  )
+  assert.equal(opens, 2)
+  await api.closeDesktopE2eeAccount()
+})
+
+void test('independent workspace directories run account turns concurrently while one directory stays serialized', async () => {
+  const { api } = await account()
+  const events = []
+  const held = holdWorkspaceTurn(api, 'ws-1', events)
+  await held.entered
+  const same = api.withDesktopE2eeAccount(
+    () => Effect.sync(() => events.push('ws-1 second')),
+    'ws-1'
+  )
+  // A slow turn in ws-1 must not hold an unrelated workspace's E2EE operation.
+  assert.match(
+    await api.withDesktopE2eeAccount((owner) => Effect.succeed(owner.directory), 'ws-2'),
+    /ws-2$/
+  )
+  events.push('ws-2 done')
+  held.finish()
+  await Promise.all([held.done, same])
+  assert.deepEqual([...events], ['ws-2 done', 'ws-1 end', 'ws-1 second'])
+  await api.closeDesktopE2eeAccount()
+})
+
+void test('account close drains in-flight workspace turns and fences turns started after it', async () => {
+  const { api } = await account()
+  const events = []
+  const held = holdWorkspaceTurn(api, 'ws-1', events)
+  await held.entered
+  const closing = api.closeDesktopE2eeAccount().then(() => events.push('close done'))
+  const later = api.withDesktopE2eeAccount(
+    () => Effect.sync(() => events.push('ws-2 turn')),
+    'ws-2'
+  )
+  held.finish()
+  await Promise.all([held.done, closing, later])
+  assert.deepEqual([...events], ['ws-1 end', 'ws-1 closed', 'close done', 'ws-2 turn'])
+  await api.closeDesktopE2eeAccount()
+})
+
+void test('an account switch closes the previous account only after its in-flight turns, before admitting new-account turns', async () => {
+  const { api, identity } = await account()
+  const events = []
+  const held = holdWorkspaceTurn(api, 'ws-1', events)
+  await held.entered
+  identity.userId = 'second'
+  identity.generation++
+  const turns = ['ws-2', 'ws-3'].map((workspaceId) =>
+    api.withDesktopE2eeAccount(
+      (owner) => Effect.sync(() => events.push(`${workspaceId} ${owner.accountId}`)),
+      workspaceId
+    )
+  )
+  held.finish()
+  await Promise.all([held.done, ...turns])
+  assert.deepEqual([...events].slice(0, 2), ['ws-1 end', 'ws-1 closed'])
+  assert.deepEqual([...events].slice(2).sort(), ['ws-2 second', 'ws-3 second'])
+  await api.closeDesktopE2eeAccount()
+})
+
+void test('account-wide reset archives only after in-flight workspace turns drain and fences later turns', async () => {
+  const events = []
+  const { api } = await account({
+    identityStorage: {
+      leaseE2eeIdentity: () => Effect.void,
+      completedE2eeIdentityReset: () => Effect.succeed(undefined),
+      archiveE2eeIdentity: () => Effect.sync(() => events.push('archive'))
+    }
+  })
+  const held = holdWorkspaceTurn(api, 'ws-1', events)
+  await held.entered
+  const reset = api.resetDesktopE2eeIdentity({ resetId: 'reset-1' })
+  const later = api.withDesktopE2eeAccount(
+    () => Effect.sync(() => events.push('ws-2 turn')),
+    'ws-2'
+  )
+  held.finish()
+  await Promise.all([held.done, reset, later])
+  assert.deepEqual([...events], ['ws-1 end', 'ws-1 closed', 'archive', 'ws-2 turn'])
+  await api.closeDesktopE2eeAccount()
+})
+
 void test('only unavailable custody exposes the availability fallback code', async () => {
   const unavailable = await account({ custody: () => Effect.fail({ code: 'unavailable' }) })
   await assert.rejects(
@@ -490,59 +762,21 @@ void test('only unavailable custody exposes the availability fallback code', asy
     corrupt.api.withDesktopE2eeAccount(() => Effect.void),
     /e2ee_corrupt/
   )
-})
-
-void test('main cached identity follows resolved sessions, transport failures and definitive sign-out without a new query', async () => {
-  let response = { data: { user: { id: 'first' }, session: { token: 'synthetic-token' } } }
-  let offline = false
-  const { AuthService } = await load(
-    './auth-service.ts',
-    {
-      electron: { app: {}, safeStorage: {}, shell: {} },
-      '../auth': {
-        offlineAuthIdentity: makeOfflineAuthIdentityCache({
-          get: () => null,
-          set: () => {},
-          delete: () => {}
-        }),
-        authClient: {
-          getSession: async () => {
-            if (offline) throw new Error('synthetic offline')
-            return response
-          },
-          signOut: async () => {}
-        }
-      },
-      '../posthog-error-reporting': {},
-      './desktop-login': {
-        DesktopLogin: class {
-          cancel() {}
-        }
-      },
-      '../platform': { desktopInstallationProfile: { releaseChannel: 'stable' } },
-      '@lody/shared/electron-ipc': {}
-    },
-    { warn: () => {} }
-  )
-  const service = new AuthService()
-  assert.equal(service.getCachedSessionIdentity().userId, null)
-  await service.getSession()
-  assert.equal(service.getCachedSessionIdentity().userId, 'first')
-  offline = true
-  await service.getSession()
-  assert.equal(service.getCachedSessionIdentity().userId, 'first')
-  offline = false
-  response = { data: null }
-  await service.getSession()
-  assert.equal(service.getCachedSessionIdentity().userId, null)
-  response = { data: { user: { id: 'second' }, session: { token: 'synthetic-token2' } } }
-  await service.getSession()
-  const before = service.getCachedSessionIdentity()
-  assert.equal(before.userId, 'second')
-  await service.signOut()
-  const after = service.getCachedSessionIdentity()
-  assert.equal(after.userId, null)
-  assert.ok(after.generation > before.generation)
+  const native = await account()
+  const original = new Error('synthetic private native failure')
+  for (const [source, operation] of [
+    ['account-operation', () => native.api.withDesktopE2eeAccount(() => Effect.fail(original))],
+    ['runtime-operation', () => native.api.runDesktopE2eeOperation('acc1', Effect.fail(original))]
+  ]) {
+    await assert.rejects(operation(), (error) => {
+      assert.equal(error.message, 'e2ee_host_operation_failed')
+      assert.equal(error.cause, undefined)
+      return true
+    })
+    assert.equal(desktopE2eeFailure().source, source)
+    assert.equal(desktopE2eeFailure().cause, original)
+  }
+  await native.api.closeDesktopE2eeAccount()
 })
 
 void test('confirmed identity reopens offline after restart, matches bearer or cookie, and is revoked by logout', async () => {
@@ -554,7 +788,7 @@ void test('confirmed identity reopens offline after restart, matches bearer or c
   })
   let cookie = 'better-auth.session_token=synthetic-token'
   let cookieUnavailable = false
-  let response = { data: { user: { id: 'account' }, session: { token: 'synthetic-token' } } }
+  let response = { data: { user: { id: 'acc1' }, session: { token: 'synthetic-token' } } }
   let offline = false
   const { AuthService } = await load(
     './auth-service.ts',
@@ -592,35 +826,32 @@ void test('confirmed identity reopens offline after restart, matches bearer or c
   // New service has no resolved session or auth request. The disk binding has
   // no timestamp and survives any wall-clock change, including an eight-day gap.
   const reopened = new AuthService()
-  assert.equal(reopened.getCachedSessionIdentity().userId, 'account')
+  assert.equal(reopened.getCachedSessionIdentity().userId, 'acc1')
   assert.equal(reopened.getCachedSessionIdentity().source, 'offline')
   const bearer = (token) => ({ fetchOptions: { headers: { Authorization: `Bearer ${token}` } } })
   assert.equal(reopened.getCachedSessionIdentity(bearer('wrong-token')).userId, null)
   cookie = ''
   const bearerOnly = new AuthService()
   assert.equal(bearerOnly.getCachedSessionIdentity().userId, null)
-  assert.equal(bearerOnly.getCachedSessionIdentity(bearer('synthetic-token')).userId, 'account')
-  assert.equal(bearerOnly.getCachedSessionIdentity().userId, 'account')
+  assert.equal(bearerOnly.getCachedSessionIdentity(bearer('synthetic-token')).userId, 'acc1')
+  assert.equal(bearerOnly.getCachedSessionIdentity().userId, 'acc1')
   cookieUnavailable = true
-  assert.equal(bearerOnly.getCachedSessionIdentity().userId, 'account')
-  assert.equal(
-    new AuthService().getCachedSessionIdentity(bearer('synthetic-token')).userId,
-    'account'
-  )
+  assert.equal(bearerOnly.getCachedSessionIdentity().userId, 'acc1')
+  assert.equal(new AuthService().getCachedSessionIdentity(bearer('synthetic-token')).userId, 'acc1')
   cookieUnavailable = false
   const observed = []
   bearerOnly.subscribeCachedSessionIdentity(() =>
     observed.push(bearerOnly.getCachedSessionIdentity().userId)
   )
   offline = false
-  response = { data: { user: { id: 'other-account' }, session: { token: 'other-token' } } }
+  response = { data: { user: { id: 'acc2' }, session: { token: 'other-token' } } }
   await bearerOnly.getSession()
-  assert.deepEqual(observed, ['other-account'])
+  assert.deepEqual(observed, ['acc2'])
   offline = true
   await bearerOnly.getSession()
-  assert.deepEqual(observed, ['other-account'])
+  assert.deepEqual(observed, ['acc2'])
   await bearerOnly.signOut()
-  assert.deepEqual(observed, ['other-account', null])
+  assert.deepEqual(observed, ['acc2', null])
   assert.equal(new AuthService().getCachedSessionIdentity(bearer('other-token')).userId, null)
 })
 
@@ -647,355 +878,72 @@ void test('confirmed identity changes release old custody without waiting for an
   await api.closeDesktopE2eeAccount()
 })
 
-void test('personal join cancellation preserves remote success when local retirement fails and retries without a network lock', async () => {
-  const sender = Object.assign(new EventEmitter(), { id: 18 })
-  let localFailure = true,
-    retired = false,
-    lockDepth = 0
-  const diagnostic = new Error('synthetic private storage failure')
-  const owner = {
-    accountId: 'account',
-    readers: new Map(),
-    bootstrap: {
-      pendingPersonalJoin: () => Effect.succeed({ pairingSessionId: '44'.repeat(16) }),
-      retirePersonalJoin: () =>
-        Effect.suspend(() =>
-          localFailure
-            ? Effect.fail(diagnostic)
-            : Effect.sync(() => {
-                retired = true
-              })
-        )
-    }
-  }
-  const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
-    'electron-ipc-decorator': {
-      IpcService: class {},
-      IpcMethod: () => (_t, _n, descriptor) => descriptor,
-      getIpcContext: () => ({ event: { sender } })
+void test('a confirmed link invitation closes through the quit barrier and reopens its committed encrypted identity', async (t) => {
+  const f = await personalJoinFixture(t)
+  const owner = await f.open('link-owner')
+  await owner.create()
+  const before = await owner.ipc.status(f.workspaceId)
+  let published
+  f.client.memberCreateInvitation = ({ offer }) =>
+    f.remote(() => {
+      published = structuredClone(offer)
+      return { offer }
+    })
+  const invitation = await owner.ipc.createMemberInvitation({
+    workspaceId: f.workspaceId,
+    mode: 'link'
+  })
+  assert.deepEqual(invitation, published)
+  let didQuit = false
+  const barrier = createDesktopQuitBarrier({
+    stop: async () =>
+      assert.deepEqual(
+        await drainMainProcessQuitResources([{ name: 'e2ee', close: owner.close }]),
+        []
+      ),
+    quit: () => {
+      didQuit = true
     },
-    '../../platform': { isLocalPlatform: () => false },
-    '../../services/e2ee-bootstrap.mjs': {},
-    '../ipc-service-deps': { getIpcServiceDeps: () => ({}) },
-    '../assert-sender': { assertProductWindowSender: () => {} },
-    '../../services/e2ee-account-runtime': {
-      withDesktopE2eeAccount: async (work) => {
-        lockDepth++
-        try {
-          return await Effect.runPromise(work(owner))
-        } finally {
-          lockDepth--
-        }
-      },
-      desktopE2eeCloudClient: async () => ({
-        accountId: 'account',
-        client: {
-          joinCancel: () =>
-            Effect.sync(() => {
-              assert.equal(lockDepth, 0)
-              return { status: 'cancelled' }
-            })
-        }
-      })
+    reportFailure: (error) => {
+      throw error
     }
   })
-  const ipc = new E2eeIpc()
-  const result = await ipc.cancelPersonalJoin('workspace', '44'.repeat(16))
-  assert.equal(result.status, 'cancelled')
-  assert.equal(retired, false)
-  assert.equal(ipc.pairingFailure.errors[0], diagnostic)
-  localFailure = false
-  assert.equal((await ipc.cancelPersonalJoin('workspace', '44'.repeat(16))).status, 'cancelled')
-  assert.equal(retired, true)
+  await barrier({ preventDefault() {} })
+  assert.equal(didQuit, true)
+  const reopened = await f.open('link-owner')
+  await reopened.attach()
+  const after = await reopened.ipc.status(f.workspaceId)
+  for (const key of [
+    'genesisHash',
+    'headHash',
+    'length',
+    'epoch',
+    'hasCurrentKey',
+    'hasDeviceCredential'
+  ])
+    assert.deepEqual(after[key], before[key], key)
 })
 
-void test('cancelled personal approval uses terminal cancellation rather than retiring an uncertain signed record', async () => {
-  const sender = Object.assign(new EventEmitter(), { id: 19 })
-  let cancelled = false
-  const owner = {
-    accountId: 'account',
-    readers: new Map([['workspace', new Set([sender.id])]]),
-    bootstrap: { deviceCredential: () => Effect.succeed('synthetic-credential') },
-    host: {
-      cancelPersonalPairing: () =>
-        Effect.sync(() => {
-          cancelled = true
-        }),
-      retirePersonalPairing: () =>
-        Effect.die(new Error('uncertain record must not use generic retirement'))
-    }
-  }
-  const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
-    'electron-ipc-decorator': {
-      IpcService: class {},
-      IpcMethod: () => (_t, _n, descriptor) => descriptor,
-      getIpcContext: () => ({ event: { sender } })
-    },
-    '../../platform': { isLocalPlatform: () => false },
-    '../../services/e2ee-bootstrap.mjs': {},
-    '../ipc-service-deps': { getIpcServiceDeps: () => ({}) },
-    '../assert-sender': { assertProductWindowSender: () => {} },
-    '../../services/e2ee-account-runtime': {
-      withDesktopE2eeAccount: (work) => Effect.runPromise(work(owner)),
-      desktopE2eeCloudClient: async () => ({
-        accountId: 'account',
-        client: { joinReadRequest: () => Effect.succeed({ status: 'cancelled' }) }
-      })
-    }
-  })
-  const ipc = new E2eeIpc()
-  await assert.rejects(ipc.inspectPersonalJoin('workspace', '44'.repeat(16)), /e2ee_join_cancelled/)
-  assert.equal(cancelled, true)
+void test('a window reopening a workspace whose previous reader is still draining gets a reader after that drain, never e2ee_closed', async (t) => {
+  // Navigating from a workspace to its control page releases the workspace runtime's
+  // reader while the control page opens its own; a keyed device must not be shown
+  // as unapproved because the open arrived during the release.
+  const f = await personalJoinFixture(t)
+  const owner = await f.open('reopen-during-drain')
+  await owner.create()
+  const before = await owner.ipc.status(f.workspaceId)
+  // The releasing reader's locked half: the host entry is closing, its drain not yet run.
+  const drain = await Effect.runPromise(owner.host.beginCloseWorkspace(f.workspaceId))
+  owner.readers.delete(f.workspaceId)
+  const opened = await owner.ipc.open(f.workspaceId)
+  assert.equal(opened.genesisHash, before.genesisHash)
+  // The original releaser's late drain cannot close the replacement entry.
+  await Effect.runPromise(drain)
+  const after = await owner.ipc.status(f.workspaceId)
+  assert.equal(after.hasCurrentKey, true)
+  assert.equal(after.headHash, before.headHash)
+  assert.equal((await owner.ipc.ledgerView(f.workspaceId)).status.genesisHash, before.genesisHash)
 })
-
-// The relay below models immutable begin bytes and cancel/reservation arbitration;
-// native journals, crypto, host approval and the invoked IPC methods remain real.
-async function personalJoinFixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'lody-join-ipc-'))
-  const owners = new Set()
-  t.after(async () => {
-    for (const owner of owners) await owner.close()
-    await rm(directory, { recursive: true, force: true })
-  })
-  const accountId = 'synthetic-personal-account'
-  const workspaceId = 'synthetic-personal-workspace'
-  const wrapping = Buffer.alloc(32, 93)
-  const safeStorage = {
-    isEncryptionAvailable: () => true,
-    isAsyncEncryptionAvailable: async () => true,
-    getSelectedStorageBackend: () => 'gnome_libsecret',
-    encryptStringAsync: async (value) => {
-      const nonce = randomBytes(12)
-      const cipher = createCipheriv('aes-256-gcm', wrapping, nonce)
-      return Buffer.concat([nonce, cipher.update(value), cipher.final(), cipher.getAuthTag()])
-    },
-    decryptStringAsync: async (value) => {
-      const decipher = createDecipheriv('aes-256-gcm', wrapping, value.subarray(0, 12))
-      decipher.setAuthTag(value.subarray(-16))
-      return {
-        result: Buffer.concat([
-          decipher.update(value.subarray(12, -16)),
-          decipher.final()
-        ]).toString(),
-        shouldReEncrypt: false
-      }
-    }
-  }
-  let lockDepth = 0
-  const rows = new Map()
-  const relay = { statusFailure: null, loseCancelReceipt: false, memberRemoved: false }
-  const remote = (work) =>
-    Effect.try({
-      try: () => {
-        assert.equal(lockDepth, 0, 'cloud work cannot run under account custody lock')
-        return work()
-      },
-      catch: (error) => error
-    })
-  const getRow = ({ pairingSessionId }) => {
-    const row = rows.get(pairingSessionId)
-    if (!row) throw new Error('e2ee_not_found')
-    return row
-  }
-  const client = {
-    history: () => Effect.fail(new Error('unauthorized history')),
-    contentStreamsToken: () =>
-      relay.memberRemoved
-        ? Effect.fail(new E2eeMemberRemovedError())
-        : Effect.fail(new Error('e2ee_device_revoked')),
-    memberCreateInvitation: () => Effect.fail(new E2eeMemberRemovedError()),
-    memberPending: () => Effect.fail(new E2eeMemberRemovedError()),
-    memberRead: () => Effect.fail(new E2eeMemberRemovedError()),
-    memberReject: () => Effect.fail(new E2eeMemberRemovedError()),
-    memberRevoke: () => Effect.fail(new E2eeMemberRemovedError()),
-    joinBegin: (request) =>
-      remote(() => {
-        const existing = rows.get(request.pairingSessionId)
-        if (existing) {
-          for (const field of [
-            'workspaceId',
-            'genesisHash',
-            'requestHex',
-            'signingPublicKey',
-            'credentialHash'
-          ])
-            if (existing[field] !== request[field]) throw new Error('e2ee_conflict')
-          return { ...existing }
-        }
-        const value = { ...request, accountId, status: 'pending' }
-        rows.set(request.pairingSessionId, value)
-        return { ...value }
-      }),
-    joinReadRequest: (request) => remote(() => ({ ...getRow(request) })),
-    joinStatus: (request) =>
-      remote(() => {
-        if (relay.statusFailure) throw relay.statusFailure
-        return { ...getRow(request) }
-      }),
-    joinClaim: (request) => remote(() => ({ ...getRow(request) })),
-    joinCancel: (request) =>
-      remote(() => {
-        const row = getRow(request)
-        if (row.status === 'admitting' || row.status === 'published')
-          throw new Error('e2ee_admission_reserved')
-        row.status = 'cancelled'
-        if (relay.loseCancelReceipt) {
-          relay.loseCancelReceipt = false
-          throw new Error('synthetic lost cancel receipt')
-        }
-        return { status: 'cancelled' }
-      })
-  }
-  const open = async (name) => {
-    const path = join(directory, name)
-    const scope = await Effect.runPromise(Scope.make())
-    const material = await Effect.runPromise(
-      Effect.gen(function* () {
-        const custody = yield* makeDesktopE2eeCustody({
-          directory: join(path, 'custody'),
-          platform: 'linux',
-          safeStorage
-        })
-        const bootstrap = yield* makeDesktopE2eeBootstrap({ directory: path, accountId, custody })
-        yield* bootstrap.recordAccountIdentity({ accountId, cryptoUserId: 'aa'.repeat(32) })
-        const host = yield* makeDesktopE2eeRuntimeHost({ directory: path, custody, bootstrap })
-        return { custody, bootstrap, host }
-      }).pipe(Effect.provideService(Scope.Scope, scope))
-    )
-    const sender = Object.assign(new EventEmitter(), { id: 23 })
-    const owner = { ...material, accountId, readers: new Map() }
-    const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
-      'electron-ipc-decorator': {
-        IpcService: class {},
-        IpcMethod: () => (_t, _n, descriptor) => descriptor,
-        getIpcContext: () => ({ event: { sender } })
-      },
-      '../../platform': { isLocalPlatform: () => false },
-      '../../services/e2ee-bootstrap.mjs': {},
-      '../ipc-service-deps': {
-        getIpcServiceDeps: () => ({
-          authService: {
-            getCachedSessionIdentity: () => ({ userId: owner.accountId, source: 'offline' })
-          }
-        })
-      },
-      '../assert-sender': { assertProductWindowSender: () => {} },
-      '../../services/e2ee-account-runtime': {
-        withDesktopE2eeAccount: async (work) => {
-          lockDepth++
-          try {
-            return await Effect.runPromise(work(owner))
-          } catch (error) {
-            // Match the account boundary's public projection used by the IPC retry.
-            if (error.code === 'snapshot-history-required')
-              throw new Error('e2ee_snapshot-history-required', { cause: error })
-            throw error
-          } finally {
-            lockDepth--
-          }
-        },
-        cleanupRemovedDesktopWorkspace: async ({ workspaceId: removedWorkspaceId }) => {
-          const erased = await Effect.runPromise(
-            owner.bootstrap.resumeRemovedWorkspace(removedWorkspaceId)
-          )
-          if (erased) owner.readers.delete(removedWorkspaceId)
-          return erased
-        },
-        runDesktopE2eeOperation: (_accountId, work) => Effect.runPromise(work),
-        desktopE2eeCloudClient: async () => ({ accountId, client })
-      }
-    })
-    let closed = false
-    const value = {
-      ...owner,
-      path,
-      ipc: new E2eeIpc(),
-      close: async () => {
-        if (closed) return
-        closed = true
-        await Effect.runPromise(Scope.close(scope, Exit.void))
-      },
-      attach: async (id = workspaceId) => {
-        await Effect.runPromise(owner.host.open(id))
-        owner.readers.set(id, new Map([[sender.id, 1]]))
-      },
-      create: async (id = workspaceId) => {
-        const prepared = await Effect.runPromise(
-          owner.bootstrap.prepareCreation({
-            accountId,
-            requestId: `synthetic-request-${id}`,
-            name: 'Synthetic encrypted workspace',
-            slug: id
-          })
-        )
-        await Effect.runPromise(
-          owner.bootstrap.recordCreated({
-            workspaceId: id,
-            genesisHash: prepared.genesisHashHex,
-            requestId: `synthetic-request-${id}`
-          })
-        )
-        await value.attach(id)
-        await Effect.runPromise(
-          owner.host.ingestLedgerRecords(id, {
-            workspaceId: id,
-            genesisHash: prepared.genesisHashHex,
-            checkpoint: { length: 1, headHash: prepared.genesisHashHex },
-            startIndex: 0,
-            recordsHex: [prepared.genesisRecordHex],
-            position: `p1:${id}:1:source-1:0`,
-            nextCursor: null
-          })
-        )
-      }
-    }
-    owners.add(value)
-    return value
-  }
-  const db = (owner, name, work) => {
-    const connection = new DatabaseSync(join(owner.path, name))
-    try {
-      return work(connection)
-    } finally {
-      connection.close()
-    }
-  }
-  const append = async (owner, genesisHash, recordHex) => {
-    const status = await Effect.runPromise(owner.host.status(workspaceId))
-    await Effect.runPromise(
-      owner.host.ingestLedgerRecords(workspaceId, {
-        workspaceId,
-        genesisHash,
-        checkpoint: {
-          length: status.length + 1,
-          headHash: Buffer.from(hashRecordBytes(Buffer.from(recordHex, 'hex')).toBytes()).toString(
-            'hex'
-          )
-        },
-        startIndex: status.length,
-        recordsHex: [recordHex],
-        position: `p1:${workspaceId}:${status.length + 1}:source-${status.length + 1}:0`,
-        nextCursor: null
-      })
-    )
-  }
-  const admit = async (owner, recipient, offer) => {
-    const request = await Effect.runPromise(recipient.bootstrap.preparePersonalJoin(offer))
-    await Effect.runPromise(owner.host.previewPersonalAdmission(workspaceId, request.requestHex))
-    const admission = await Effect.runPromise(
-      owner.host.preparePersonalAdmission(workspaceId, request.requestHex)
-    )
-    await append(owner, offer.genesisHash, admission.recordHex)
-    const invitation = await Effect.runPromise(
-      owner.host.personalInvitation(workspaceId, offer.pairingSessionId)
-    )
-    const row = rows.get(offer.pairingSessionId)
-    row.status = 'published'
-    row.invitationHex = invitation.invitationHex
-    return invitation
-  }
-  return { open, rows, relay, db, workspaceId, append, admit, client, remote }
-}
 
 void test('personal join IPC bridges the control-page observation outside the account lock and retains an offline proof', async (t) => {
   const f = await personalJoinFixture(t)
@@ -1064,7 +1012,9 @@ void test('cold renderer marker recovery reads the real IPC boundary without gra
   storage.setItem(known, 'damaged marker')
   const { recoverE2eeWorkspaceIdentity } = await load(
     '../../../../../packages/components/src/lib/e2ee-workspace-storage.ts',
-    {}
+    // The VM transpiles this helper to CJS. Keep its protocol dependency on
+    // the real ESM namespace instead of requiring ESM-only crypto packages.
+    { '@lody/e2ee-core/protocol': await import('@lody/e2ee-core/protocol') }
   )
   await recoverE2eeWorkspaceIdentity({
     storage,
@@ -1100,7 +1050,7 @@ void test('cold renderer marker recovery reads the real IPC boundary without gra
   )
   assert.deepEqual([...owner.readers.get(f.workspaceId)], readers)
   await assert.rejects(
-    owner.ipc.readIdentity({ accountId: 'other-account', workspaceId: f.workspaceId }),
+    owner.ipc.readIdentity({ accountId: 'acc2', workspaceId: f.workspaceId }),
     /e2ee_account_mismatch/
   )
   assert.deepEqual([...owner.readers.get(f.workspaceId)], readers)
@@ -1258,75 +1208,64 @@ void test('confirmed cancellation survives real SQLite archival failure and the 
   )
 })
 
-for (const change of ['account switch', 'same-account logout/login'])
-  void test(`D03 registration waits outside the account lock and rejects a late response after ${change}`, async () => {
-    const entered = Promise.withResolvers()
-    const response = Promise.withResolvers()
-    let signatures = 0
-    let cached = 0
-    const { api, publishIdentity } = await account({
-      bootstrap: () =>
-        Effect.succeed({
-          creationNeedsAccountIdentity: () => Effect.succeed(true),
-          recordAccountIdentity: () =>
-            Effect.sync(() => {
-              cached++
-            }),
-          prepareCreation: () =>
-            Effect.sync(() => {
-              signatures++
-              return 'signed'
-            })
-        }),
-      cloud: () =>
-        Effect.succeed({
-          accountIdentity: () =>
-            Effect.promise(async () => {
-              entered.resolve()
-              return response.promise
-            })
-        })
-    })
-    const creation = api.prepareDesktopE2eeCreation({
-      accountId: 'account',
-      requestId: 'request-0123456789',
-      name: 'Synthetic',
-      slug: 'synthetic'
-    })
-    await entered.promise
-    assert.equal(
-      await api.withDesktopE2eeAccount((owner) => Effect.succeed(owner.accountId)),
-      'account'
-    )
-    if (change === 'account switch') publishIdentity('other-account')
-    else {
-      publishIdentity(null)
-      publishIdentity('account')
-    }
-    response.resolve({ accountId: 'account', cryptoUserId: 'aa'.repeat(32) })
-    await assert.rejects(creation, /e2ee_/)
-    assert.equal(signatures, 0)
-    assert.equal(cached, 0)
-    assert.equal(
-      await api.withDesktopE2eeAccount((owner) => Effect.succeed(owner.accountId)),
-      change === 'account switch' ? 'other-account' : 'account'
-    )
-    await api.closeDesktopE2eeAccount()
+void test('desktopE2eeCloudClient routes Convex HTTP calls through Electron net.fetch after app readiness', async () => {
+  const ready = Promise.withResolvers()
+  const events = []
+  let capturedClientFetch
+  const { api } = await account({
+    electron: {
+      app: {
+        getPath: () => '/synthetic-user-data',
+        whenReady: () => {
+          events.push('whenReady:start')
+          return ready.promise.then(() => events.push('whenReady:done'))
+        }
+      },
+      net: {
+        fetch: async (input, init) => {
+          events.push(`net.fetch:${String(input)}`)
+          return new Response(JSON.stringify({ ok: true, method: init?.method ?? 'GET' }), {
+            status: 200
+          })
+        }
+      }
+    },
+    cloud: (input) =>
+      Effect.sync(() => {
+        capturedClientFetch = input.fetch
+        return {}
+      })
   })
+  await api.desktopE2eeCloudClient()
+  assert.equal(typeof capturedClientFetch, 'function')
+  const pending = capturedClientFetch(new URL('https://synthetic.convex.cloud/api/query'), {
+    method: 'POST'
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(events, ['whenReady:start'])
+  ready.resolve()
+  const res = await pending
+  assert.deepEqual(await res.json(), { ok: true, method: 'POST' })
+  assert.deepEqual(events, [
+    'whenReady:start',
+    'whenReady:done',
+    'net.fetch:https://synthetic.convex.cloud/api/query'
+  ])
+  await api.closeDesktopE2eeAccount()
+})
 
-void test('D03 exact signed retry and registered local identity do not acquire a cloud client', async () => {
+void test('creation signing and exact retry do not acquire a cloud client', async () => {
   const original = Object.freeze({ genesisRecordHex: 'synthetic-original' })
   const { api } = await account({
     bootstrap: () =>
       Effect.succeed({
-        creationNeedsAccountIdentity: () => Effect.succeed(false),
         prepareCreation: () => Effect.succeed(original)
       }),
     cloud: () => Effect.die(new Error('unexpected cloud call'))
   })
   assert.equal(
     await api.prepareDesktopE2eeCreation({
-      accountId: 'account',
+      accountId: 'acc1',
       requestId: 'request-0123456789',
       name: 'Synthetic',
       slug: 'synthetic'
@@ -1572,109 +1511,11 @@ void test('a snapshot-joined approver cancels another recipient without retiring
   )
 })
 
-void test('management diagnostics preserve safe recovery actions without exposing native causes', async () => {
-  const { api } = await account()
-  for (const code of [
-    'rotation_candidate_unavailable',
-    'management_unauthorized',
-    'management_retry'
-  ]) {
-    await assert.rejects(
-      api.runDesktopE2eeOperation('account', Effect.fail({ code, cause: 'synthetic-secret' })),
-      (error) => {
-        assert.equal(error.message, `e2ee_${code}`)
-        assert.equal(error.cause, undefined)
-        assert.equal(JSON.stringify(error).includes('synthetic-secret'), false)
-        return true
-      }
-    )
-  }
-})
-
-async function nativeAccountFixture(t, storage = identityStorage) {
-  const directory = await mkdtemp(join(tmpdir(), 'desktop-identity-reset-'))
-  let locked = false
-  const wrapping = Buffer.alloc(32, 121)
-  const safeStorage = {
-    isEncryptionAvailable: () => !locked,
-    isAsyncEncryptionAvailable: async () => !locked,
-    getSelectedStorageBackend: () => 'gnome_libsecret',
-    encryptStringAsync: async (value) => {
-      const nonce = randomBytes(12),
-        cipher = createCipheriv('aes-256-gcm', wrapping, nonce)
-      return Buffer.concat([nonce, cipher.update(value), cipher.final(), cipher.getAuthTag()])
-    },
-    decryptStringAsync: async (value) => {
-      const cipher = createDecipheriv('aes-256-gcm', wrapping, value.subarray(0, 12))
-      cipher.setAuthTag(value.subarray(-16))
-      return {
-        result: Buffer.concat([cipher.update(value.subarray(12, -16)), cipher.final()]).toString(),
-        shouldReEncrypt: false
-      }
-    }
-  }
-  const native = await account({
-    directory,
-    identityStorage: storage,
-    custody: (path) => makeDesktopE2eeCustody({ directory: path, platform: 'linux', safeStorage }),
-    bootstrap: makeDesktopE2eeBootstrap,
-    host: makeDesktopE2eeRuntimeHost,
-    cloud: () =>
-      Effect.succeed({
-        accountIdentity: () =>
-          Effect.succeed({ accountId: 'account', cryptoUserId: 'aa'.repeat(32) })
-      })
-  })
-  t.after(async () => {
-    await native.api.closeDesktopE2eeAccount()
-    await rm(directory, { recursive: true, force: true })
-  })
-  return {
-    ...native,
-    directory,
-    setLocked: (value) => {
-      locked = value
-    }
-  }
-}
-
-async function createAccountWorkspace(api, workspaceId) {
-  return api.withDesktopE2eeAccount(
-    (owner) =>
-      Effect.gen(function* () {
-        yield* owner.bootstrap.recordAccountIdentity({
-          accountId: owner.accountId,
-          cryptoUserId: 'aa'.repeat(32)
-        })
-        const creation = yield* owner.bootstrap.prepareCreation({
-          accountId: owner.accountId,
-          requestId: `creation-${workspaceId}-request`,
-          name: workspaceId,
-          slug: workspaceId
-        })
-        yield* owner.bootstrap.recordCreated({
-          workspaceId,
-          requestId: `creation-${workspaceId}-request`,
-          genesisHash: creation.genesisHashHex
-        })
-        const status = yield* owner.host.open(workspaceId)
-        const local = yield* owner.host.localPairingContext(workspaceId)
-        return {
-          directory: owner.directory,
-          creation,
-          status,
-          signingPublicKey: local.frontendSigningPublicKey
-        }
-      }),
-    workspaceId
-  )
-}
-
 void test('isolated desktop workspace reset archives real custody and journals, retains sibling availability and requires fresh joining', async (t) => {
   const { api, setLocked } = await nativeAccountFixture(t)
   const create = (workspaceId) => createAccountWorkspace(api, workspaceId)
   const intent = {
-    accountId: 'account',
+    accountId: 'acc1',
     requestId: 'synthetic-creation-request',
     name: 'Created',
     slug: 'created'
@@ -1771,10 +1612,10 @@ for (const phase of ['queued', 'draining'])
       void test(`confirmed ${scope} reset rejects ${change} while ${phase}`, async (t) => {
         const { api, identity } = await nativeAccountFixture(t)
         const first = await createAccountWorkspace(api, 'workspace')
-        identity.userId = 'other-account'
+        identity.userId = 'acc2'
         identity.generation++
         const other = await createAccountWorkspace(api, 'workspace')
-        identity.userId = 'account'
+        identity.userId = 'acc1'
         identity.generation++
         await api.withDesktopE2eeAccount(() => Effect.void, 'workspace')
         const original = await readFile(join(first.directory, 'creations.sqlite'))
@@ -1803,7 +1644,7 @@ for (const phase of ['queued', 'draining'])
           /e2ee_account_unavailable/
         )
         if (phase === 'draining') await entered.promise
-        if (change === 'account switch') identity.userId = 'other-account'
+        if (change === 'account switch') identity.userId = 'acc2'
         identity.generation++
         finish.resolve()
         await blocker
@@ -1817,11 +1658,15 @@ void test('workspace-scoped cold identity IPC composes with isolated custody wit
   const first = await createAccountWorkspace(api, 'workspace')
   const sibling = await createAccountWorkspace(api, 'sibling')
   await api.closeDesktopE2eeAccount()
-  const sender = Object.assign(new EventEmitter(), { id: 17 })
+  const sender = Object.assign(new EventEmitter(), {
+    id: 17,
+    isDestroyed: () => false,
+    send: () => {}
+  })
   const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
     '../ipc-service-deps': { getIpcServiceDeps: () => ({}) },
+    '../product-window-ipc-service': { ProductWindowIpcService: class {} },
     'electron-ipc-decorator': {
-      IpcService: class {},
       IpcMethod: () => (_target, _name, descriptor) => descriptor,
       getIpcContext: () => ({ event: { sender } })
     },
@@ -1830,7 +1675,7 @@ void test('workspace-scoped cold identity IPC composes with isolated custody wit
     '../../services/e2ee-account-runtime': {
       ...api,
       desktopE2eeCloudClient: async () => ({
-        accountId: 'account',
+        accountId: 'acc1',
         client: {
           history: () =>
             Effect.succeed({
@@ -1866,17 +1711,14 @@ void test('workspace-scoped cold identity IPC composes with isolated custody wit
   })
   const ipc = new E2eeIpc()
   assert.deepEqual(
-    { ...(await ipc.readIdentity({ accountId: 'account', workspaceId: 'workspace' })) },
+    { ...(await ipc.readIdentity({ accountId: 'acc1', workspaceId: 'workspace' })) },
     {
       workspaceId: 'workspace',
       genesisHash: first.creation.genesisHashHex
     }
   )
   await assert.rejects(ipc.status('workspace'), /e2ee_/)
-  await assert.rejects(
-    ipc.readIdentity({ accountId: 'other-account', workspaceId: 'workspace' }),
-    /e2ee_/
-  )
+  await assert.rejects(ipc.readIdentity({ accountId: 'acc2', workspaceId: 'workspace' }), /e2ee_/)
   assert.equal(
     await api.withDesktopE2eeAccount(
       (owner) => Effect.succeed(owner.readers.has('workspace')),
@@ -1895,7 +1737,7 @@ void test('workspace-scoped cold identity IPC composes with isolated custody wit
   assert.equal(management.devices.find((entry) => entry.self).key, first.signingPublicKey)
   await ipc.updateKeys('workspace')
   await ipc.revokeDevice('workspace', sibling.signingPublicKey)
-  await ipc.readIdentity({ accountId: 'account', workspaceId: 'workspace' })
+  await ipc.readIdentity({ accountId: 'acc1', workspaceId: 'workspace' })
   assert.equal((await ipc.status('workspace')).genesisHash, first.creation.genesisHashHex)
   await ipc.close('workspace')
 })
@@ -1903,7 +1745,11 @@ void test('workspace-scoped cold identity IPC composes with isolated custody wit
 void test('real preload bridge admits only confirmed trusted reset IPC and archives native originals', async (t) => {
   const { api } = await nativeAccountFixture(t)
   const first = await createAccountWorkspace(api, 'workspace')
-  const sender = Object.assign(new EventEmitter(), { id: 18 })
+  const sender = Object.assign(new EventEmitter(), {
+    id: 18,
+    isDestroyed: () => false,
+    send: () => {}
+  })
   let trusted = true
   const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
     '../ipc-service-deps': {
@@ -1914,8 +1760,8 @@ void test('real preload bridge admits only confirmed trusted reset IPC and archi
         }
       })
     },
+    '../product-window-ipc-service': { ProductWindowIpcService: class {} },
     'electron-ipc-decorator': {
-      IpcService: class {},
       IpcMethod: () => (_target, _name, descriptor) => descriptor,
       getIpcContext: () => ({ event: { sender } })
     },
@@ -1933,7 +1779,7 @@ void test('real preload bridge admits only confirmed trusted reset IPC and archi
     electron: {
       ipcRenderer: { on: () => {}, invoke: (channel, input) => ipc[channel.split('.')[1]](input) }
     },
-    './ipc-invoke-policy': { isIpcInvokeChannel },
+    './ipc-invoke-policy': { isIpcInvokeChannel, isClientLossProbeChannel: () => false },
     '@lody/shared/electron-ipc': electronIpc
   })
   await ipc.open('workspace')
@@ -1972,16 +1818,16 @@ void test('credential-authenticated member removal drains and deletes through th
   await owner.create()
   const status = await owner.ipc.status(f.workspaceId)
   await assert.rejects(
-    owner.ipc.refresh(f.workspaceId, { installKeys: false }),
+    owner.ipc.refresh(f.workspaceId, { keyMode: 'none' }),
     /unauthorized history/
   )
   assert.equal((await owner.ipc.status(f.workspaceId)).signingPublicKey, status.signingPublicKey)
   f.relay.memberRemoved = true
   await assert.rejects(
-    owner.ipc.refresh(f.workspaceId, { installKeys: false }),
+    owner.ipc.refresh(f.workspaceId, { keyMode: 'none' }),
     /^Error: e2ee_member_removed$/
   )
-  await assert.rejects(owner.ipc.status(f.workspaceId), /e2ee_not_open/)
+  await assert.rejects(owner.ipc.status(f.workspaceId), /^Error: e2ee_member_removed$/)
   assert.equal(owner.readers.has(f.workspaceId), false)
   assert.equal(
     f.db(
@@ -1994,484 +1840,188 @@ void test('credential-authenticated member removal drains and deletes through th
   await assert.rejects(owner.ipc.open(f.workspaceId), (error) => error.code === 'member_removed')
 })
 
-void test('credential-authenticated joining management uses exact-identity removal cleanup through IPC', async (t) => {
-  const f = await personalJoinFixture(t)
-  const actions = [
-    (ipc) =>
-      ipc.createMemberInvitation({
-        workspaceId: f.workspaceId,
-        mode: 'email',
-        email: 'synthetic@example.test'
-      }),
-    (ipc) => ipc.memberJoinRequests(f.workspaceId),
-    (ipc) => ipc.approveMemberJoin(f.workspaceId, '11'.repeat(16), 'explicit'),
-    (ipc) => ipc.rejectMemberJoin(f.workspaceId, '11'.repeat(16)),
-    (ipc) => ipc.revokeMemberInvitation(f.workspaceId, '22'.repeat(32))
-  ]
-  for (const [index, invoke] of actions.entries()) {
-    const owner = await f.open(`removed-join-${index}`)
-    await owner.create()
-    const before = await owner.ipc.status(f.workspaceId)
-    await assert.rejects(invoke(owner.ipc), /^Error: e2ee_member_removed$/)
-    assert.equal(await Effect.runPromise(owner.bootstrap.hasRemovedWorkspace(f.workspaceId)), true)
-    assert.equal(owner.readers.has(f.workspaceId), false)
-    assert.equal(
-      f.db(
-        owner,
-        'creations.sqlite',
-        (db) => db.prepare('SELECT COUNT(*) AS count FROM workspace_bindings').get().count
-      ),
-      0
-    )
-    await assert.rejects(
-      readFile(join(owner.path, 'workspaces', f.workspaceId, 'history.sqlite')),
-      { code: 'ENOENT' }
-    )
-    assert.ok(before.signingPublicKey)
-  }
-})
-
-void test('automatic removal retries the exclusive native identity lease and preserves a sibling workspace', async (t) => {
-  const { api } = await nativeAccountFixture(t)
-  const first = await createAccountWorkspace(api, 'removed')
-  await createAccountWorkspace(api, 'sibling')
-  const scope = await Effect.runPromise(Scope.make())
-  await Effect.runPromise(
-    identityStorage.leaseE2eeIdentity(first.directory).pipe(Scope.provide(scope))
-  )
-  const drain = await api.withDesktopE2eeAccount(
-    (owner) =>
-      Effect.gen(function* () {
-        const status = yield* owner.host.status('removed')
-        const credential = yield* owner.bootstrap.deviceCredential('removed')
-        yield* owner.bootstrap.recordRemovedWorkspace({
-          workspaceId: 'removed',
-          genesisHash: status.genesisHash,
-          signingPublicKey: status.signingPublicKey,
-          credential
-        })
-        return yield* owner.host.beginCloseWorkspace('removed')
-      }),
-    'removed'
-  )
-  await Effect.runPromise(drain)
-  await assert.rejects(
-    api.cleanupRemovedDesktopWorkspace({ accountId: 'account', workspaceId: 'removed' }),
-    /e2ee_identity-busy/
-  )
-  const original = join(
-    first.directory,
-    'custody',
-    first.creation.genesisHashHex + '.personal.device'
-  )
-  assert.ok((await readFile(original)).length > 0)
-  await Effect.runPromise(Scope.close(scope, Exit.void))
-  assert.equal(
-    await api.cleanupRemovedDesktopWorkspace({ accountId: 'account', workspaceId: 'removed' }),
-    true
-  )
-  await assert.rejects(readFile(original), (error) => error.code === 'ENOENT')
-  const status = await api.withDesktopE2eeAccount(
-    (owner) => owner.host.status('sibling'),
-    'sibling'
-  )
-  assert.equal(status.epoch, 0)
-  await assert.rejects(
-    api.withDesktopE2eeAccount((owner) => owner.host.open('removed'), 'removed'),
-    /e2ee_member_removed/
-  )
-})
-
-void test('slow terminal deletion fences only that workspace and never holds the account lock', async (t) => {
-  const entered = Promise.withResolvers(),
-    release = Promise.withResolvers()
-  let hold = true
-  const storage = {
-    ...identityStorage,
-    leaseE2eeIdentity: (directory, exclusive) =>
-      Effect.gen(function* () {
-        yield* identityStorage.leaseE2eeIdentity(directory, exclusive)
-        if (exclusive && directory.endsWith('/removed') && hold) {
-          entered.resolve()
-          yield* Effect.promise(() => release.promise)
-        }
-      })
-  }
-  const { api } = await nativeAccountFixture(t, storage)
-  await createAccountWorkspace(api, 'removed')
-  await createAccountWorkspace(api, 'sibling')
-  const drain = await api.withDesktopE2eeAccount(
-    (owner) =>
-      Effect.gen(function* () {
-        const status = yield* owner.host.status('removed')
-        const credential = yield* owner.bootstrap.deviceCredential('removed')
-        yield* owner.bootstrap.recordRemovedWorkspace({
-          workspaceId: 'removed',
-          genesisHash: status.genesisHash,
-          signingPublicKey: status.signingPublicKey,
-          credential
-        })
-        return yield* owner.host.beginCloseWorkspace('removed')
-      }),
-    'removed'
-  )
-  await Effect.runPromise(drain)
-  const removal = api.cleanupRemovedDesktopWorkspace({
-    accountId: 'account',
-    workspaceId: 'removed'
-  })
-  try {
-    await entered.promise
-    assert.equal(
-      (await api.withDesktopE2eeAccount((owner) => owner.host.status('sibling'), 'sibling')).epoch,
-      0
-    )
-    await assert.rejects(
-      api.withDesktopE2eeAccount(() => Effect.void, 'removed'),
-      /e2ee_member_removed/
-    )
-  } finally {
-    hold = false
-    release.resolve()
-    await removal
-  }
-})
-
-void test('remote commands use workspace custody and never create an account control identity', async (t) => {
-  const { api, directory } = await nativeAccountFixture(t)
-  const first = await createAccountWorkspace(api, 'first')
-  const second = await createAccountWorkspace(api, 'second')
-  const sender = Object.assign(new EventEmitter(), { id: 19 })
-  const sessions = new Map()
-  const { E2eeIpc } = await load(
-    '../ipc/services/e2ee-ipc.ts',
-    {
-      '../ipc-service-deps': { getIpcServiceDeps: () => ({}) },
-      'electron-ipc-decorator': {
-        IpcService: class {},
-        IpcMethod: () => (_target, _name, descriptor) => descriptor,
-        getIpcContext: () => ({ event: { sender } })
-      },
-      '../../platform': { isLocalPlatform: () => false },
-      '../../services/e2ee-bootstrap.mjs': {},
-      '../../services/e2ee-account-runtime': {
-        ...api,
-        desktopE2eeCloudClient: async () => ({
-          accountId: 'account',
-          client: {
-            machineBegin: ({ workspaceId, offer }) =>
-              Effect.sync(() => {
-                sessions.set(workspaceId, {
-                  pairingSessionId: offer.pairingSessionId,
-                  status: 'pending',
-                  offer
-                })
-                return sessions.get(workspaceId)
-              }),
-            machineInspect: ({ workspaceId }) => Effect.succeed(sessions.get(workspaceId)),
-            machineCancel: ({ workspaceId }) =>
-              Effect.sync(() => {
-                const next = {
-                  ...sessions.get(workspaceId),
-                  status: 'cancelled',
-                  noAdmissionReserved: true
-                }
-                sessions.set(workspaceId, next)
-                return next
-              })
-          }
-        })
-      },
-      '../assert-sender': { assertProductWindowSender: () => {} }
-    },
-    globalThis.console,
-    {
-      VITE_CONVEX_DEPLOY_URL: 'https://cloud.synthetic.test',
-      VITE_SERVER_URL: 'https://edge.synthetic.test'
-    }
-  )
-  const ipc = new E2eeIpc()
-  const { ipcBridge } = await load('../../preload/ipc-bridge.ts', {
-    electron: {
-      ipcRenderer: {
-        on: () => {},
-        invoke: (channel, ...args) => ipc[channel.split('.')[1]](...args)
-      }
-    },
-    './ipc-invoke-policy': { isIpcInvokeChannel },
-    '@lody/shared/electron-ipc': electronIpc
-  })
-  for (const [workspaceId, expected] of [
-    ['first', first],
-    ['second', second]
+void test('prepareDispatch confirms access loss after its reader closes through the real account boundary', async (t) => {
+  for (const [name, response, code] of [
+    ['removed', Effect.fail(new E2eeMemberRemovedError()), 'member_removed'],
+    ['revoked', Effect.fail(new E2eeDeviceRevokedError()), 'device_revoked'],
+    ['allowed', Effect.succeed({ token: 'synthetic-unused-token' }), null],
+    ['network', Effect.fail(new Error('synthetic network failure')), null],
+    ['unclassified', Effect.fail(new Error('e2ee_member_removed')), null],
+    ['other-reader', Effect.succeed({ token: 'synthetic-unused-token' }), null],
+    ['account-switch', Effect.fail(new E2eeMemberRemovedError()), null],
+    ['credential-change', Effect.fail(new E2eeMemberRemovedError()), null],
+    ['credential-change-other-reader', Effect.fail(new E2eeMemberRemovedError()), null],
+    ['status-failure', Effect.succeed({ token: 'synthetic-unused-token' }), null]
   ]) {
-    await ipcBridge.invoke('e2ee.open', workspaceId)
-    const started = await ipcBridge.invoke('e2ee.beginRemoteMachinePairing', workspaceId)
-    const offer = JSON.parse(
-      Buffer.from(started.command.split(' --offer ')[1], 'base64url').toString()
-    )
-    assert.equal(offer.frontendSigningPublicKey, expected.signingPublicKey)
-    assert.equal(offer.genesisHash, expected.creation.genesisHashHex)
-    await assert.rejects(
-      ipcBridge.invoke(
-        'e2ee.approveRemoteMachinePairing',
-        workspaceId,
-        offer.pairingSessionId,
-        Array(8).fill('00000000').join(' ')
-      ),
-      /e2ee_conflict/
-    )
-    assert.equal(
-      (await ipcBridge.invoke('e2ee.beginRemoteMachinePairing', workspaceId)).command,
-      started.command
-    )
-    assert.equal(
-      (
-        await ipcBridge.invoke(
-          'e2ee.inspectRemoteMachinePairing',
-          workspaceId,
-          offer.pairingSessionId
-        )
-      ).status,
-      'pending'
-    )
-    assert.equal(
-      (
-        await ipcBridge.invoke(
-          'e2ee.cancelRemoteMachinePairing',
-          workspaceId,
-          offer.pairingSessionId
-        )
-      ).status,
-      'cancelled'
-    )
-    const next = await ipcBridge.invoke('e2ee.beginRemoteMachinePairing', workspaceId)
-    assert.notEqual(next.pairingSessionId, offer.pairingSessionId)
-    assert.equal(
-      (await ipcBridge.invoke('e2ee.status', workspaceId)).genesisHash,
-      expected.creation.genesisHashHex
-    )
-    await ipcBridge.invoke('e2ee.close', workspaceId)
-  }
-  assert.notEqual(first.signingPublicKey, second.signingPublicKey)
-  const roots = await readdir(join(directory, 'e2ee-bootstrap'))
-  assert.ok(!(await readdir(join(directory, 'e2ee-bootstrap', roots[0]))).includes('control'))
-})
-
-async function memberIpcFixture() {
-  const identity = { userId: 'A', generation: 1 }
-  const signed = [],
-    closed = []
-  const cloudEntered = deferredMember(),
-    cloudGate = deferredMember(),
-    keyEntered = deferredMember(),
-    keyGate = deferredMember()
-  let holdCloud = false
-  let trusted = true
-  const makeOwner = (accountId, label) => ({
-    accountId,
-    label,
-    readers: new Map([['team', new Map([[1, 1]])]]),
-    bootstrap: {
-      deviceCredential: () => Effect.succeed('credential'),
-      acceptMemberJoin: () => Effect.void
-    },
-    host: {
-      inspectCachedState: (workspaceId, machineId) =>
-        Effect.succeed({
-          workspaceId,
-          machineId,
-          entryPresent: false,
-          cachedPolicies: 0,
-          cachedExecutionGrants: 0
-        }),
-      memberOffer: () =>
-        Effect.sync(() => {
-          signed.push(label)
-          return { workspaceId: 'team', genesisHash: '11'.repeat(32), mode: 'link' }
-        }),
-      open: () => Effect.succeed({ hasCurrentKey: true }),
-      ingestLedgerRecords: () => Effect.void,
-      status: () => Effect.succeed({ hasCurrentKey: true }),
-      keyRound: () =>
-        Effect.promise(async () => {
-          keyEntered.resolve()
-          await keyGate.promise
-        }),
-      beginCloseWorkspace: () =>
-        Effect.sync(() => {
-          closed.push(label)
-          return Effect.void
-        })
-    }
-  })
-  let current = makeOwner('A', 'original-A')
-  const sender = Object.assign(new EventEmitter(), { id: 1 })
-  const cloud = {
-    accountId: 'A',
-    client: {
-      memberClaim: () =>
-        Effect.succeed({
-          accountId: 'A',
-          workspaceId: 'team',
-          requestId: 'request',
-          state: 'committed'
-        }),
-      appendRecord: () => Effect.void
-    }
-  }
-  const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
-    effect: { Effect },
-    'electron-ipc-decorator': {
-      IpcService: class {},
-      IpcMethod: () => (_t, _n, d) => d,
-      getIpcContext: () => ({ event: { sender } })
-    },
-    '../../platform': { isLocalPlatform: () => false },
-    '../assert-sender': {
-      assertProductWindowSender: () => {
-        if (!trusted) throw new Error('untrusted sender')
-      }
-    },
-    '../ipc-service-deps': {
-      getIpcServiceDeps: () => ({
-        authService: { getCachedSessionIdentity: () => ({ ...identity }) }
+    await t.test(name, async (subtest) => {
+      // Keep credential replacement inside the confirmation budget regardless of
+      // real filesystem speed; this test controls verdict ordering, not elapsed I/O.
+      const scope = await Effect.runPromise(Scope.make())
+      const clock = await Effect.runPromise(Layer.buildWithScope(TestClock.layer(), scope))
+      subtest.after(() => Effect.runPromise(Scope.close(scope, Exit.void)))
+      const { api, identity } = await nativeAccountFixture(subtest, identityStorage, clock)
+      let credentialReplaced = false
+      let replacement
+      let replacementBytes
+      const first = await createAccountWorkspace(api, 'workspace')
+      const sender = Object.assign(new EventEmitter(), {
+        id: 41,
+        isDestroyed: () => false,
+        send: () => {}
       })
-    },
-    '../../services/e2ee-bootstrap.mjs': {},
-    '../../services/e2ee-account-runtime': {
-      inspectDesktopE2eeCachedState: async (accountId, workspaceId, machineId) => {
-        if (current.accountId !== accountId) throw new Error('e2ee_account_mismatch')
-        return {
-          ...(await Effect.runPromise(current.host.inspectCachedState(workspaceId, machineId))),
-          accountId,
-          ownerPresent: true,
-          activeContentReaders: [...(current.readers.get(workspaceId)?.values() ?? [])].reduce(
-            (sum, n) => sum + n,
-            0
-          )
+      const { E2eeIpc } = await load('../ipc/services/e2ee-ipc.ts', {
+        '../product-window-ipc-service': { ProductWindowIpcService: class {} },
+        'electron-ipc-decorator': {
+          IpcMethod: () => (_target, _name, descriptor) => descriptor,
+          getIpcContext: () => ({ event: { sender } })
+        },
+        '../../platform': { isLocalPlatform: () => false },
+        '../../services/e2ee-bootstrap.mjs': {},
+        '../assert-sender': { assertProductWindowSender: () => {} },
+        '../ipc-service-deps': {
+          getIpcServiceDeps: () => ({
+            authService: { getCachedSessionIdentity: () => ({ ...identity }) }
+          })
+        },
+        '../../services/e2ee-account-runtime': {
+          ...api,
+          desktopE2eeCloudClient: async () => ({
+            accountId: 'acc1',
+            client: {
+              contentStreamsToken: ({ workspaceId, credential }) =>
+                Effect.gen(function* () {
+                  assert.equal(workspaceId, 'workspace')
+                  assert.equal(credential, retainedCredential)
+                  // Response delivery is explicit; no clock or scheduler race.
+                  if (name === 'account-switch') {
+                    identity.userId = 'acc2'
+                    identity.generation++
+                  }
+                  if (name.startsWith('credential-change')) {
+                    yield* Effect.promise(async () => {
+                      await api.resetDesktopE2eeIdentity({ workspaceId, resetId: randomUUID() })
+                      replacement = await createAccountWorkspace(api, workspaceId)
+                      const nextCredential = await api.withDesktopE2eeAccount(
+                        (owner) => {
+                          owner.readers.set(workspaceId, new Map([[sender.id, 1]]))
+                          return owner.bootstrap.deviceCredential(workspaceId)
+                        },
+                        workspaceId,
+                        false
+                      )
+                      assert.notEqual(nextCredential, retainedCredential)
+                      assert.notEqual(replacement.signingPublicKey, first.signingPublicKey)
+                      await ipc.close(workspaceId)
+                      const cached = await api.withDesktopE2eeAccount(
+                        (owner) => owner.host.inspectCachedState(workspaceId, 'synthetic-machine'),
+                        workspaceId,
+                        false
+                      )
+                      assert.equal(cached.entryPresent, false)
+                      if (name === 'credential-change-other-reader') {
+                        await api.withDesktopE2eeAccount(
+                          (owner) => {
+                            owner.readers.set(workspaceId, new Map([[42, 1]]))
+                            return owner.host.open(workspaceId)
+                          },
+                          workspaceId,
+                          false
+                        )
+                      }
+                      replacementBytes = await readFile(
+                        join(replacement.directory, 'creations.sqlite')
+                      )
+                    })
+                    credentialReplaced = true
+                  }
+                  return yield* response
+                }),
+              machineSharing: () => ({})
+            }
+          })
         }
-      },
-      withDesktopE2eeAccount: async (work) => Effect.runPromise(work(current)),
-      desktopE2eeCloudClient: async () => {
-        cloudEntered.resolve()
-        if (holdCloud) await cloudGate.promise
-        return cloud
-      },
-      releaseDesktopE2eeReader: () => {},
-      runDesktopE2eeOperation: async (accountId, work) => {
-        if (identity.userId !== accountId) throw new Error('e2ee_account_mismatch')
-        const result = await Effect.runPromise(work)
-        if (identity.userId !== accountId) throw new Error('e2ee_account_mismatch')
-        return result
+      })
+      const ipc = new E2eeIpc()
+      let dispatched = false
+      const retainedCredential = await api.withDesktopE2eeAccount(
+        (owner) => {
+          owner.readers.set('workspace', new Map([[sender.id, 1]]))
+          if (name === 'other-reader') owner.readers.get('workspace').set(42, 1)
+          owner.host.prepareDispatch = () =>
+            Effect.sync(() => {
+              dispatched = true
+              return { frame: 'synthetic-dispatch-must-not-escape' }
+            })
+          if (name === 'status-failure') {
+            const status = owner.host.status
+            owner.host.status = (workspaceId) =>
+              status(workspaceId).pipe(
+                Effect.flatMap(() => Effect.fail(new Error('synthetic post-open status failure')))
+              )
+          }
+          return owner.bootstrap.deviceCredential('workspace')
+        },
+        'workspace',
+        false
+      )
+      // Real close removes the calling reader and drains the native workspace.
+      await ipc.close('workspace')
+      await assert.rejects(ipc.status('workspace'))
+      const original = await readFile(join(first.directory, 'creations.sqlite'))
+      const outcome = ipc.prepareDispatch('workspace', 'synthetic-machine', {
+        sessionId: 'session',
+        userTurnId: 'turn',
+        userId: 'display-only',
+        timestamp: new Date(0).toISOString(),
+        inputConfig: {}
+      })
+      await assert.rejects(
+        outcome,
+        code
+          ? new RegExp(`^Error: e2ee_${code}$`)
+          : name === 'account-switch'
+            ? /^Error: e2ee_(?:account_mismatch|missing-binding)$/
+            : /^Error: e2ee_host_operation_failed$/
+      )
+      await Promise.all([...(ipc.dispatchCleanups?.values() ?? [])].map((slot) => slot.done))
+      assert.equal(dispatched, false)
+      if (name.startsWith('credential-change')) assert.equal(credentialReplaced, true)
+      if (code) {
+        // Cleanup retains its terminal receipt database, erasing creation/key state.
+        const db = new DatabaseSync(join(first.directory, 'creations.sqlite'))
+        try {
+          assert.equal(db.prepare('SELECT count(*) AS n FROM creations').get().n, 0)
+          assert.equal(db.prepare('SELECT count(*) AS n FROM removed_workspaces').get().n, 1)
+        } finally {
+          db.close()
+        }
+        await assert.rejects(readdir(join(first.directory, 'workspaces', 'workspace')), {
+          code: 'ENOENT'
+        })
+      } else {
+        assert.deepEqual(
+          await readFile(join(first.directory, 'creations.sqlite')),
+          replacementBytes ?? original
+        )
+        identity.userId = 'acc1'
+        identity.generation++
+        const cached = await api.withDesktopE2eeAccount(
+          (owner) => owner.host.inspectCachedState('workspace', 'synthetic-machine'),
+          'workspace',
+          false
+        )
+        const otherReader = name === 'other-reader' || name === 'credential-change-other-reader'
+        assert.equal(cached.entryPresent, otherReader)
+        if (otherReader) {
+          sender.id = 42
+          assert.equal(
+            (await ipc.status('workspace')).signingPublicKey,
+            (replacement ?? first).signingPublicKey
+          )
+          sender.id = 41
+        }
       }
-    }
-  })
-  const ipc = new E2eeIpc()
-  ipc.permissionHistory = async () => []
-  ipc.refresh = async () => {}
-  return {
-    ipc,
-    identity,
-    signed,
-    closed,
-    cloudEntered,
-    cloudGate,
-    keyEntered,
-    keyGate,
-    makeOwner,
-    setTrusted(value) {
-      trusted = value
-    },
-    setOwner(owner) {
-      current = owner
-    },
-    holdCloud() {
-      holdCloud = true
-    }
+      await assert.rejects(ipc.status('workspace'))
+    })
   }
-}
-function deferredMember() {
-  let resolve
-  const promise = new Promise((done) => {
-    resolve = done
-  })
-  return { promise, resolve }
-}
-void test('member invitation retains its original native namespace across a delayed cloud call', async () => {
-  const f = await memberIpcFixture()
-  f.holdCloud()
-  const operation = f.ipc.createMemberInvitation({ workspaceId: 'team', mode: 'link' })
-  const rejected = assert.rejects(operation, /e2ee_account_mismatch/)
-  await f.cloudEntered.promise
-  f.setOwner(f.makeOwner('A', 'replacement-A'))
-  f.cloudGate.resolve()
-  await rejected
-  assert.deepEqual(f.signed, [])
-})
-for (const sameAccount of [true, false])
-  void test(`late member installation cannot read or release a replacement namespace (same account: ${sameAccount})`, async () => {
-    const f = await memberIpcFixture()
-    const operation = f.ipc.claimMemberJoin('team', 'request')
-    const rejected = assert.rejects(operation, /e2ee_account_mismatch/)
-    await f.keyEntered.promise
-    if (!sameAccount) {
-      f.identity.userId = 'B'
-      f.identity.generation++
-    }
-    const replacement = f.makeOwner(f.identity.userId, 'replacement')
-    f.setOwner(replacement)
-    f.keyGate.resolve()
-    await rejected
-    assert.equal(replacement.readers.get('team').get(1), 1)
-    assert.deepEqual(f.closed, [])
-  })
-void test('a background reader closes only the namespace returned by its own open', async () => {
-  const f = await memberIpcFixture()
-  const opened = await f.ipc.open('team', undefined, 'A')
-  const replacement = f.makeOwner('A', 'replacement')
-  f.setOwner(replacement)
-  await f.ipc.close('team', 'A', opened.readerOwner)
-  assert.equal(replacement.readers.get('team').get(1), 1)
-  assert.deepEqual(f.closed, [])
-  f.identity.userId = 'B'
-  f.identity.generation++
-  await assert.rejects(f.ipc.open('team', undefined, 'A'), /e2ee_account_mismatch/)
-})
-
-for (const code of ['machine_not_owned', 'machine_not_shared']) {
-  void test(`encrypted execution refusal preserves ${code} at the public account boundary`, async () => {
-    const { api } = await account()
-    await assert.rejects(
-      api.withDesktopE2eeAccount(() => Effect.fail({ code })),
-      (error) => {
-        assert.equal(error.message, `e2ee_${code}`)
-        assert.equal('cause' in error, false)
-        return true
-      }
-    )
-  })
-}
-
-void test('passive cache inspection stays account/product-window bound without opening a reader or cloud call', async () => {
-  const f = await memberIpcFixture()
-  const owner = f.makeOwner('A', 'passive-A')
-  owner.readers.clear()
-  f.setOwner(owner)
-  const snapshot = await f.ipc.inspectCachedState('team', 'machine')
-  assert.equal(snapshot.accountId, 'A')
-  assert.equal(snapshot.workspaceId, 'team')
-  assert.equal(snapshot.machineId, 'machine')
-  assert.equal(snapshot.activeContentReaders, 0)
-  assert.equal(snapshot.cachedExecutionGrants, 0)
-  assert.equal(owner.readers.size, 0)
-  assert.deepEqual(f.signed, [])
-  assert.deepEqual(f.closed, [])
-  f.identity.userId = 'B'
-  await assert.rejects(f.ipc.inspectCachedState('team', 'machine'), /e2ee_account_mismatch/)
-  f.identity.userId = 'A'
-  f.setTrusted(false)
-  await assert.rejects(f.ipc.inspectCachedState('team', 'machine'), /untrusted sender/)
-  f.setTrusted(true)
-  await assert.rejects(f.ipc.inspectCachedState('', 'machine'), /e2ee_invalid-input/)
 })

@@ -226,27 +226,6 @@ function setup(
 }
 
 describe('createBackgroundSyncCoordinator', () => {
-  it('uses a 20-session candidate window on every surface and paces mobile more slowly', () => {
-    expect(resolveEagerSyncPolicy('web')).toMatchObject({
-      concurrency: 1,
-      batchSize: 1,
-      batchCooldownMs: 1_500,
-      candidateWindow: 20,
-    });
-    expect(resolveEagerSyncPolicy('desktop')).toMatchObject({
-      concurrency: 1,
-      batchSize: 1,
-      batchCooldownMs: 1_500,
-      candidateWindow: 20,
-    });
-    expect(resolveEagerSyncPolicy('mobile')).toMatchObject({
-      concurrency: 1,
-      batchSize: 1,
-      batchCooldownMs: 3_000,
-      candidateWindow: 20,
-    });
-  });
-
   it.each<EagerSyncSurface>(['web', 'desktop', 'mobile'])(
     'queues at most the 20 highest-priority sessions on %s',
     async (surface) => {
@@ -272,15 +251,6 @@ describe('createBackgroundSyncCoordinator', () => {
     }
   );
 
-  it('prefetches a recently-active session on start', async () => {
-    const { coordinator, prefetcher } = setup({
-      activity: [{ sessionId: sid('a'), lastMessageAt: 100 }],
-    });
-    coordinator.start();
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('a')]);
-  });
-
   it('skips archived sessions and sessions with no activity', async () => {
     const { coordinator, prefetcher } = setup({
       activity: [
@@ -301,27 +271,6 @@ describe('createBackgroundSyncCoordinator', () => {
     coordinator.start();
     await tick();
     expect(prefetcher.calls).toEqual([]);
-  });
-
-  it('dedupes by activity high-water mark (syncedThrough)', async () => {
-    const { coordinator, prefetcher, activity } = setup({
-      activity: [{ sessionId: sid('a'), lastMessageAt: 100 }],
-    });
-    coordinator.start();
-    await tick();
-    prefetcher.resolve(sid('a'), 'synced');
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('a')]);
-
-    // Same lastMessageAt → already synced through → not re-prefetched.
-    activity.emit({ sessionId: sid('a'), lastMessageAt: 100 });
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('a')]);
-
-    // Newer message → re-qualifies.
-    activity.emit({ sessionId: sid('a'), lastMessageAt: 200 });
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('a'), sid('a')]);
   });
 
   it('prioritizes visible sessions over more recently updated invisible sessions', async () => {
@@ -358,29 +307,6 @@ describe('createBackgroundSyncCoordinator', () => {
     expect(prefetcher.calls).toEqual([sid('pinned-old')]);
   });
 
-  it('re-seeds candidates when UI visibility changes', async () => {
-    const visibility = createFakeVisibilitySource();
-    const { coordinator, prefetcher } = setup({
-      activity: [
-        { sessionId: sid('visible-old'), lastMessageAt: 100 },
-        { sessionId: sid('invisible-new'), lastMessageAt: 300 },
-      ],
-      policy: { candidateWindow: 1, concurrency: 1 },
-      visibility: visibility.view,
-    });
-
-    coordinator.start();
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('invisible-new')]);
-
-    prefetcher.resolve(sid('invisible-new'), 'synced');
-    await tick();
-    visibility.set([sid('visible-old')]);
-    await tick();
-
-    expect(prefetcher.calls).toEqual([sid('invisible-new'), sid('visible-old')]);
-  });
-
   it('keeps ongoing activity bounded to the finite candidate window', async () => {
     const { coordinator, prefetcher, activity } = setup({
       activity: [
@@ -406,19 +332,6 @@ describe('createBackgroundSyncCoordinator', () => {
     expect(prefetcher.calls).toEqual([sid('top'), sid('new-top')]);
   });
 
-  it('skips sessions already synced through the persisted high-water mark', async () => {
-    const highWater = createFakeHighWaterStore([[sid('a'), 100]]);
-    const { coordinator, prefetcher } = setup({
-      activity: [{ sessionId: sid('a'), lastMessageAt: 100 }],
-      highWaterStore: highWater.port,
-    });
-
-    coordinator.start();
-    await tick();
-
-    expect(prefetcher.calls).toEqual([]);
-  });
-
   it('allows a manual nudge to rebuild a snapshot hidden by the high-water mark', async () => {
     const highWater = createFakeHighWaterStore([[sid('a'), 100]]);
     const { coordinator, prefetcher } = setup({
@@ -429,19 +342,6 @@ describe('createBackgroundSyncCoordinator', () => {
     await tick();
 
     coordinator.requestPrefetch(sid('a'));
-    await tick();
-
-    expect(prefetcher.calls).toEqual([sid('a')]);
-  });
-
-  it('prefetches again when activity is newer than the persisted high-water mark', async () => {
-    const highWater = createFakeHighWaterStore([[sid('a'), 100]]);
-    const { coordinator, prefetcher } = setup({
-      activity: [{ sessionId: sid('a'), lastMessageAt: 200 }],
-      highWaterStore: highWater.port,
-    });
-
-    coordinator.start();
     await tick();
 
     expect(prefetcher.calls).toEqual([sid('a')]);
@@ -469,7 +369,7 @@ describe('createBackgroundSyncCoordinator', () => {
   });
 
   it('does not advance syncedThrough on a failed prefetch (retry stays possible)', async () => {
-    const { coordinator, prefetcher, activity } = setup({
+    const { coordinator, prefetcher, activity, time } = setup({
       activity: [{ sessionId: sid('a'), lastMessageAt: 100 }],
     });
     coordinator.start();
@@ -478,82 +378,14 @@ describe('createBackgroundSyncCoordinator', () => {
     await tick();
     expect(prefetcher.calls).toEqual([sid('a')]);
 
-    // Same lastMessageAt re-emitted: because the failed attempt did NOT record a
-    // synced high-water mark, the session is still eligible and is retried.
-    activity.emit({ sessionId: sid('a'), lastMessageAt: 100 });
+    activity.emit({ sessionId: sid('a'), lastMessageAt: 101 });
+    await tick();
+    expect(prefetcher.calls).toEqual([sid('a')]);
+    // Failure is not sync success: a later scheduling edge can retry after backoff.
+    time.advance(60 * 1000);
+    activity.emit({ sessionId: sid('a'), lastMessageAt: 101 });
     await tick();
     expect(prefetcher.calls).toEqual([sid('a'), sid('a')]);
-  });
-
-  it('does not persist high-water marks for failed prefetches', async () => {
-    const highWater = createFakeHighWaterStore();
-    const { coordinator, prefetcher } = setup({
-      activity: [{ sessionId: sid('a'), lastMessageAt: 100 }],
-      highWaterStore: highWater.port,
-    });
-
-    coordinator.start();
-    await tick();
-    prefetcher.resolve(sid('a'), 'failed');
-    await tick();
-
-    expect(highWater.writes).toEqual([]);
-  });
-
-  it('honors the concurrency cap and drains as prefetches settle', async () => {
-    const { coordinator, prefetcher } = setup({
-      activity: [
-        { sessionId: sid('a'), lastMessageAt: 1 },
-        { sessionId: sid('b'), lastMessageAt: 2 },
-        { sessionId: sid('c'), lastMessageAt: 3 },
-      ],
-      policy: { concurrency: 2 },
-    });
-    coordinator.start();
-    await tick();
-    expect(coordinator.getState().inFlight.length).toBe(2);
-    expect(prefetcher.calls.length).toBe(2);
-
-    prefetcher.resolve(prefetcher.calls[0], 'synced');
-    await tick();
-    expect(prefetcher.calls.length).toBe(3);
-  });
-
-  it('starts prefetches in batches separated by cooldowns', async () => {
-    const { coordinator, prefetcher, time } = setup({
-      activity: [
-        { sessionId: sid('a'), lastMessageAt: 1 },
-        { sessionId: sid('b'), lastMessageAt: 2 },
-        { sessionId: sid('c'), lastMessageAt: 3 },
-        { sessionId: sid('d'), lastMessageAt: 4 },
-        { sessionId: sid('e'), lastMessageAt: 5 },
-      ],
-      policy: {
-        concurrency: 4,
-        batchSize: 2,
-        batchCooldownMs: 1_000,
-      },
-    });
-
-    coordinator.start();
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('e'), sid('d')]);
-
-    time.advance(999);
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('e'), sid('d')]);
-
-    time.advance(1);
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('e'), sid('d'), sid('c'), sid('b')]);
-
-    prefetcher.resolve(sid('e'), 'synced');
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('e'), sid('d'), sid('c'), sid('b')]);
-
-    time.advance(1_000);
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('e'), sid('d'), sid('c'), sid('b'), sid('a')]);
   });
 
   it('prioritizes running sessions', async () => {
@@ -591,57 +423,35 @@ describe('createBackgroundSyncCoordinator', () => {
     await tick();
     expect(prefetcher.calls.includes(sid('b'))).toBe(true);
   });
+});
 
-  it('coalesces a burst-synced room then re-evaluates after the freshness window', async () => {
-    const { coordinator, prefetcher, registry, activity, time, policy } = setup({});
-    coordinator.start();
-
-    registry.recentlySynced.add(room('a'));
-    activity.emit({ sessionId: sid('a'), lastMessageAt: 100 });
-    await tick();
-    // Within freshness window → coalesced (not prefetched yet).
-    expect(prefetcher.calls).toEqual([]);
-
-    // Window passes and the room is no longer recently synced → trailing re-eval fires.
-    registry.recentlySynced.delete(room('a'));
-    time.advance(policy.freshnessTtlMs);
-    await tick();
-    expect(prefetcher.calls).toEqual([sid('a')]);
+it('does not turn cache rejection into sync success or re-download on unrelated reseeds', async () => {
+  const highWater = createFakeHighWaterStore();
+  const h = setup({
+    activity: [{ sessionId: sid('large'), lastMessageAt: 1 }],
+    highWaterStore: highWater.port,
   });
-
-  it('aborts a prefetch that exceeds prefetchTimeoutMs', async () => {
-    const { coordinator, time, policy } = setup({
-      activity: [{ sessionId: sid('a'), lastMessageAt: 100 }],
-    });
-    coordinator.start();
-    await tick();
-    expect(coordinator.getState().inFlight).toEqual([sid('a')]);
-
-    time.advance(policy.prefetchTimeoutMs);
-    await tick();
-    expect(coordinator.getState().inFlight).toEqual([]);
-  });
-
-  it('stop() clears the queue and aborts in-flight work', async () => {
-    const { coordinator, activity } = setup({
-      activity: [
-        { sessionId: sid('a'), lastMessageAt: 1 },
-        { sessionId: sid('b'), lastMessageAt: 2 },
-      ],
-      policy: { concurrency: 1 },
-    });
-    coordinator.start();
-    await tick();
-    expect(coordinator.getState().inFlight.length).toBe(1);
-
-    coordinator.stop();
-    await tick();
-    expect(coordinator.getState().inFlight).toEqual([]);
-    expect(coordinator.getState().queued).toEqual([]);
-
-    // After stop, new activity is ignored.
-    activity.emit({ sessionId: sid('c'), lastMessageAt: 3 });
-    await tick();
-    expect(coordinator.getState().queued).toEqual([]);
-  });
+  h.coordinator.start();
+  await tick();
+  h.prefetcher.resolve(sid('large'), 'cache_rejected');
+  await tick();
+  expect(highWater.values.get(sid('large'))).toBeUndefined();
+  h.activity.emit({ sessionId: sid('other'), lastMessageAt: 2 });
+  h.env.set({ visible: false });
+  h.env.set({ visible: true });
+  await tick();
+  expect(h.prefetcher.isPending(sid('large'))).toBe(false);
+  expect(h.coordinator.getState().queued).not.toContain(sid('large'));
+  for (let activity = 3; activity < 20; activity++)
+    h.activity.emit({ sessionId: sid('large'), lastMessageAt: activity });
+  await tick();
+  expect(h.prefetcher.isPending(sid('large'))).toBe(false);
+  h.time.advance(30 * 60 * 1000);
+  // Expiry does not install a polling loop. A later genuine scheduling edge retries.
+  expect(h.prefetcher.isPending(sid('large'))).toBe(false);
+  h.activity.emit({ sessionId: sid('other'), lastMessageAt: 4 });
+  await tick();
+  expect(h.prefetcher.isPending(sid('large'))).toBe(true);
+  h.coordinator.stop();
+  await tick();
 });

@@ -1,3 +1,11 @@
+import { previewVisualCommentDocSchema } from '@lody/shared/preview-comment-schema';
+import { sessionDocSchema } from '@lody/shared/session-doc-schemas';
+import type {
+  CodeCollabOpenDiffManifestRequest,
+  CodeCollabOpenDiffManifestResponse,
+  CodeCollabReadBlobRequest,
+  CodeCollabReadBlobResponse,
+} from '@lody/shared';
 import type { FileDownloadRequest, FileDownloadResponse } from '@lody/shared';
 import type {
   MemoryProviderRequest,
@@ -56,8 +64,6 @@ import type {
   PreviewTargetApproval,
   WorkspaceId,
   LocalProjectId,
-  previewVisualCommentDocSchema,
-  sessionDocSchema,
   CodeCollabV2Error,
   CodeCollabV2FileIndexRequest,
   CodeCollabV2FileIndexSnapshot,
@@ -79,7 +85,10 @@ import type {
   FilePreviewV3Request,
   FilePreviewV3Response,
 } from '@lody/shared';
-import type { LocalProjectGitStateRpcResponse } from '@lody/loro-streams-rpc';
+import type {
+  LocalProjectGitStateRpcResponse,
+  LocalProjectListBranchesRpcResponse,
+} from '@lody/loro-streams-rpc';
 import type { WorkspaceWriter } from '../providers/workspace-writer';
 import type { CodeCollabFileIndexCache } from '@/lib/code-collab-file-index-cache';
 import { readStoredAuthToken } from '@/lib/auth-bootstrap';
@@ -156,6 +165,9 @@ export type SessionSyncInspection = {
    * applies are flowing; `timeout` means local changes stayed unsent.
    */
   readonly pendingUploadProbe: string | null;
+  readonly leaseCount: number;
+  readonly joinInFlight: boolean;
+  readonly roomSubPresent: boolean;
 };
 
 export type PreviewVisualCommentDocUpdater =
@@ -187,6 +199,12 @@ export type ScheduleDocStore = {
 };
 
 export type WorkspaceRuntime = {
+  requestSessionAutomationControl?: (
+    machineId: MachineId,
+    sessionId: SessionId,
+    requesterUserId: string,
+    operation: import('@lody/shared/automations').RemoteAutomationOperation
+  ) => Promise<import('@lody/shared/automations').RemoteAutomationResult>;
   /** Local document access is independent of permission to transmit content. */
   waitForContentAdmission?: (signal?: AbortSignal) => Promise<void>;
   /**
@@ -199,6 +217,8 @@ export type WorkspaceRuntime = {
     options?: { create?: boolean }
   ) => Promise<T>;
   acquireScheduleStore: (scheduleId: string) => Promise<ScheduleDocStore>;
+  /** Today outline pages and member date indexes (specs/today-outline.md). */
+  todayPages: import('../providers/today-page-store-cache').TodayPageStoreCache;
   releaseScheduleStoreRef: (scheduleId: string) => void;
   /**
    * The workspace id used for IndexedDB/WebSocket connections.
@@ -214,6 +234,11 @@ export type WorkspaceRuntime = {
     subscribe(listener: () => void): () => void;
   };
   readonly attachmentToken?: () => Promise<string>;
+  readonly cloudStreamsEnabled?: boolean;
+  readonly getWorkspaceStreamsGrant?: (options?: {
+    forceRefresh?: boolean;
+    signal?: AbortSignal;
+  }) => Promise<{ token: string; gatewayBaseUrl: string }>;
   readonly sendResources: SessionSendResources;
   /** In-memory sends whose attachments are still preparing; lost with the page. */
   readonly pendingSends: PendingSessionSends | null;
@@ -266,6 +291,12 @@ export type WorkspaceRuntime = {
    * entry for this app instance — the PR poller's activity signal.
    */
   publishSessionViewing: (args: { sessionId: SessionId; userId: string } | null) => void;
+  /**
+   * Publish (or clear, with null) this app instance's ephemeral
+   * `desktop-foreground` presence entry; Hosts skip mobile pushes for that user
+   * while it is fresh.
+   */
+  publishDesktopForeground: (userId: string | null) => void;
   ensureDocStream: (roomId: string) => Promise<void>;
   /**
    * Run `fn` while holding a ref on the session store, so cache eviction cannot
@@ -425,6 +456,11 @@ export type WorkspaceRuntime = {
     },
     options?: { timeoutMs?: number }
   ) => Promise<SessionDispatchTurnResponse | null>;
+  /** Encrypted only: this device's signed schedule declaration, written in the same commit. */
+  signScheduleDeclaration?: (
+    document: Pick<import('@lody/shared').ScheduleDocument, 'definition' | 'prompt' | 'message'>,
+    manualRunKey?: string
+  ) => Promise<string>;
   /** Native original preparation plus an encrypted acceleration attempt; durable activation remains independent. */
   prepareEncryptedDispatch?: (
     machineId: string,
@@ -500,6 +536,19 @@ export type WorkspaceRuntime = {
     request: CodeCollabV2SaveTextRequest,
     options?: { timeoutMs?: number; ownerSessionId?: SessionId | string }
   ) => Promise<CodeCollabV2SaveTextResponse | CodeCollabV2Error | null>;
+  getDiffBlobTransportOptions: (
+    machineId: MachineId
+  ) => Promise<{ supported: boolean; scope: string; persist: boolean }>;
+  requestCodeCollabOpenDiffManifest: (
+    machineId: MachineId,
+    request: CodeCollabOpenDiffManifestRequest,
+    options?: { timeoutMs?: number; ownerSessionId?: SessionId | string }
+  ) => Promise<CodeCollabOpenDiffManifestResponse | CodeCollabV2Error | null>;
+  requestCodeCollabReadBlob: (
+    machineId: MachineId,
+    request: CodeCollabReadBlobRequest,
+    options?: { timeoutMs?: number; ownerSessionId?: SessionId | string }
+  ) => Promise<CodeCollabReadBlobResponse | CodeCollabV2Error | null>;
   requestCodeCollabOpenCurrentDiff: (
     machineId: MachineId,
     request: CodeCollabV2OpenCurrentDiffRequest,
@@ -550,7 +599,7 @@ export type WorkspaceRuntime = {
     machineId: MachineId,
     sessionId: SessionId,
     requestedByUserId: string,
-    options?: { reason?: string; timeoutMs?: number }
+    options?: { reason?: string; stopProcess?: boolean; timeoutMs?: number }
   ) => Promise<SessionPreviewRevokeResponse | null>;
   requestLocalProjectGitState: (
     machineId: MachineId,
@@ -558,6 +607,12 @@ export type WorkspaceRuntime = {
     requestedByUserId: string,
     options?: { timeoutMs?: number }
   ) => Promise<LocalProjectGitStateRpcResponse | null>;
+  requestLocalProjectBranches: (
+    machineId: MachineId,
+    localProjectId: LocalProjectId,
+    requestedByUserId: string,
+    options?: { query?: string; limit?: number; cursor?: string; timeoutMs?: number }
+  ) => Promise<LocalProjectListBranchesRpcResponse | null>;
   /** Read-only `.gitmodules` probe of one local project, for the Project group editor. */
   requestProjectProbeLocalMember: (
     machineId: MachineId,
@@ -574,6 +629,67 @@ export type WorkspaceRuntime = {
     server: WorkspaceMcpServerMeta,
     requesterUserId?: string
   ) => Promise<McpToolListResult>;
+  requestLocalSorbetCredentials: (
+    machineId: MachineId,
+    request:
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/credentials-list' }
+          >,
+          'method' | 'params'
+        >
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/credentials-logout' }
+          >,
+          'method' | 'params'
+        >
+  ) => Promise<import('@lody/shared/local-machine-rpc').SorbetCredentialsResult>;
+  requestLocalSorbetProviders: (
+    machineId: MachineId,
+    request:
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/providers-list' }
+          >,
+          'method' | 'params'
+        >
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/providers-create' }
+          >,
+          'method' | 'params'
+        >
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/providers-update' }
+          >,
+          'method' | 'params'
+        >
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/providers-delete' }
+          >,
+          'method' | 'params'
+        >
+      | Pick<
+          Extract<
+            import('@lody/shared').LocalMachineRpcRequest,
+            { method: 'sorbet/providers-refresh' }
+          >,
+          'method' | 'params'
+        >
+      | Pick<
+          Extract<import('@lody/shared').LocalMachineRpcRequest, { method: 'sorbet/models-list' }>,
+          'method' | 'params'
+        >
+  ) => Promise<import('@lody/shared/local-machine-rpc').SorbetProvidersResult>;
   requestLocalMcpAuthentication: (
     machineId: MachineId,
     params: Extract<
@@ -612,6 +728,13 @@ export type WorkspaceRuntime = {
     command: import('@lody/shared').IosSimulatorCommand;
     timeoutMs?: number;
   }) => Promise<import('@lody/shared').IosSimulatorResponse>;
+  requestAndroidEmulatorControl: (request: {
+    machineId: MachineId;
+    sessionId: SessionId;
+    requestedByUserId: string;
+    command: import('@lody/shared').AndroidEmulatorCommand;
+    timeoutMs?: number;
+  }) => Promise<import('@lody/shared').AndroidEmulatorResponse>;
   dispose: () => Promise<void>;
 };
 
@@ -627,6 +750,8 @@ export type WorkspaceRuntimeInitFailure = {
   /** Present only when content-mode admission failed. Encryption wording is shown
    * only when the workspace is known to be encrypted or encrypted creation is on. */
   modeAdmission?: { knownEncrypted: boolean; workspaceId?: string };
+  /** Present for encrypted access loss, so the gate can route to re-pairing. */
+  workspaceId?: string;
 };
 
 export const workspaceRuntimeInitFailureAtom = atom<WorkspaceRuntimeInitFailure | null>(null);

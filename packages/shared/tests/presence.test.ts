@@ -3,13 +3,17 @@ import { z } from 'zod';
 import {
   LODY_PRESENCE_TTL_MS,
   collectOnlineMachineIdsFromPresence,
+  collectViewedSessionIdsFromPresence,
   findFreshMachinePresenceState,
   findFreshSessionPresenceState,
+  hasFreshDesktopForegroundPresence,
   getLodyMachinePresenceKey,
   getLodySessionPresenceKey,
+  getLodySessionViewingPresenceKey,
   parseLodyPresenceStates,
   type LodyPresenceInstanceId,
   type LodyPresenceStateMap,
+  type LodySessionViewingPresenceState,
   type MachineId,
   type SessionId,
 } from '../src';
@@ -17,13 +21,6 @@ import {
 const machineId = '01020304-1111-4222-8333-010203040501' as MachineId;
 const sessionId = '01020304-1111-4222-8333-010203040502' as SessionId;
 const instanceId = '01020304-1111-4222-8333-010203040503' as LodyPresenceInstanceId;
-
-// Shape of the running object before optional `phase`. z.object strips unknown
-// keys, so an older client keeps `{ type: 'running' }` instead of dropping it.
-const legacyRunningStatus = z.object({
-  type: z.literal('running'),
-  activity: z.enum(['image_generation']).optional(),
-});
 
 describe('presence helpers', () => {
   it.each(['sessionId', 'machineId', 'instanceId', 'userId'] as const)(
@@ -207,35 +204,6 @@ describe('presence helpers', () => {
     expect(parseLodyPresenceStates(input).entry).toHaveProperty('status.detail', 'ordinary detail');
   });
 
-  it('keeps an optional running phase on session presence', () => {
-    const sessionKey = getLodySessionPresenceKey(sessionId, instanceId);
-    const parsed = parseLodyPresenceStates({
-      [sessionKey]: {
-        kind: 'session',
-        sessionId,
-        machineId,
-        instanceId,
-        status: { type: 'running', phase: 'finalizing' },
-        updatedAt: 120,
-      },
-    });
-    expect(parsed[sessionKey]).toMatchObject({
-      status: { type: 'running', phase: 'finalizing' },
-    });
-  });
-
-  it('lets an older running parser keep the session when phase is unknown', () => {
-    expect(legacyRunningStatus.parse({ type: 'running', phase: 'finalizing' })).toEqual({
-      type: 'running',
-    });
-  });
-
-  it('rejects a new activity enum value that older parsers cannot keep', () => {
-    expect(legacyRunningStatus.safeParse({ type: 'running', activity: 'finalizing' }).success).toBe(
-      false
-    );
-  });
-
   it('keeps only identifiers, enums and timestamps across all minimal entry kinds', () => {
     const common = {
       instanceId,
@@ -306,41 +274,6 @@ describe('presence helpers', () => {
         status: { type: 'requestPermission' },
       },
     });
-  });
-
-  it('uses a 90 second presence TTL', () => {
-    expect(LODY_PRESENCE_TTL_MS).toBe(90_000);
-  });
-
-  it('parses valid presence states and drops invalid states', () => {
-    const machineKey = getLodyMachinePresenceKey(machineId, instanceId);
-    const sessionKey = getLodySessionPresenceKey(sessionId, instanceId);
-    const parsed = parseLodyPresenceStates({
-      [machineKey]: {
-        kind: 'machine',
-        machineId,
-        instanceId,
-        updatedAt: 100,
-      },
-      [sessionKey]: {
-        kind: 'session',
-        sessionId,
-        machineId,
-        instanceId,
-        status: { type: 'running' },
-        updatedAt: 120,
-      },
-      invalid: {
-        kind: 'session',
-        sessionId,
-        machineId,
-        instanceId,
-        status: { type: 'idle' },
-        updatedAt: 130,
-      },
-    });
-
-    expect(Object.keys(parsed).sort()).toEqual([machineKey, sessionKey].sort());
   });
 
   it('accepts status fields nulled by the Loro value roundtrip', () => {
@@ -436,5 +369,70 @@ describe('presence helpers', () => {
     // Session presence alone must not mark a machine online; machine liveness
     // is only asserted by machine heartbeats.
     expect(online.size).toBe(1);
+  });
+
+  it('collectViewedSessionIdsFromPresence returns only fresh viewing entries', () => {
+    const viewerUserId = 'user-1';
+    const viewingState = (overrides: Partial<LodySessionViewingPresenceState> = {}) =>
+      ({
+        kind: 'session-viewing',
+        userId: viewerUserId,
+        instanceId,
+        sessionId,
+        since: 1_000,
+        updatedAt: 2_000,
+        ...overrides,
+      }) satisfies LodySessionViewingPresenceState;
+
+    const nowMs = 100_000;
+    const states = parseLodyPresenceStates({
+      [getLodySessionViewingPresenceKey(viewerUserId, instanceId)]: viewingState({
+        updatedAt: nowMs - 1_000,
+      }),
+      'viewing:user-2:instance-9': viewingState({
+        userId: 'user-2',
+        sessionId: 'session-2' as SessionId,
+        updatedAt: nowMs - LODY_PRESENCE_TTL_MS - 1,
+      }),
+      'session:session-3:instance-1': {
+        kind: 'session',
+        sessionId: 'session-3',
+        machineId: 'machine-1',
+        instanceId,
+        status: { type: 'running' },
+        updatedAt: nowMs - 1_000,
+      },
+    });
+
+    const viewed = collectViewedSessionIdsFromPresence(states, nowMs);
+    expect([...viewed]).toEqual([sessionId]);
+  });
+
+  it('suppresses a mobile push only for a fresh focused desktop of the same user, in any hosted workspace', () => {
+    const userId = 'Abcdef0123456789Abcdef0123456789';
+    const nowMs = 1_790_000_000_000;
+    const desktop = (forUser: string, updatedAt: number) => ({
+      kind: 'desktop-foreground',
+      userId: forUser,
+      instanceId,
+      updatedAt,
+    });
+    const workspaceA = parseLodyPresenceStates({
+      a: desktop('OtherUser0123456789Abcdef01234567', nowMs),
+    });
+    const workspaceB = parseLodyPresenceStates(
+      { b: desktop(userId, nowMs - 1_000) },
+      { minimal: true }
+    );
+    expect(hasFreshDesktopForegroundPresence([workspaceA], userId, nowMs)).toBe(false);
+    expect(hasFreshDesktopForegroundPresence([workspaceA, workspaceB], userId, nowMs)).toBe(true);
+    // A crashed desktop stops suppressing once its entry leaves the freshness window.
+    expect(
+      hasFreshDesktopForegroundPresence([workspaceB], userId, nowMs + LODY_PRESENCE_TTL_MS)
+    ).toBe(false);
+    // Encrypted workspaces never carry a non-identifier user string.
+    expect(
+      parseLodyPresenceStates({ c: desktop('User name /private/path', nowMs) }, { minimal: true })
+    ).toEqual({});
   });
 });

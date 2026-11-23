@@ -56,9 +56,10 @@
   `form` reasons sit beside Save and disable it; everything else lets Save
   run the guard, mark and focus the first empty field. There is no project
   mark: beside the project chip it reads as "a project is required".
-- Time and date are typed only: the native picker button is hidden
-  (`[&::-webkit-calendar-picker-indicator]:hidden`). Prompt: no resize handle;
-  grow from 4 lines to `max(6lh, 50dvh)`, then scroll. Field marks are absolute.
+- Time/date: typed only. `display: none` on
+  `::-webkit-calendar-picker-indicator` removes Chromium's popup. Prompt: no
+  resize handle; grow from 4 lines to `max(6lh, 50dvh)`, then scroll.
+  Absolute field marks never narrow text.
 - No time zone control. Input, preview and kind changes use `MachineMeta.timeZone`
   (device zone for older CLIs). Once retains its instant across machine changes;
   calendar rules retain wall time. [Time contract](../../../../../specs/schedule-time.md).
@@ -90,7 +91,7 @@
   chat destination is a button that opens the chat) and status in words from
   `describeScheduleState`; colour and glyph mark only states needing a look.
   A scheduled message shows its own text (the stored title is fallback only)
-  on the viewer's clock. No status pills or dots, no resizable columns. Project
+  on the viewer's clock. No status pills or dots, no resizable columns. Project, ownership (`ownerId`),
   and status filters and sort sit above the sections. Every row has a ⋯ menu and the same
   context menu (open, run, pause/resume, open chat, last run, delete); delete
   always confirms. The hover action is Run for a manual task, Pause/Resume
@@ -112,6 +113,6 @@
   `EditorInNarrowPanel` catches regressions.
 - `AnimatePresence` children must carry their own `key` (`<Reveal key=… >`);
   a key set only inside the child reads as `""` and breaks exit animations.
-- Quota continuation is the in-banner row on a terminal session-limit failure
-  with a future exhausted 5h reset; reserve the first full minute, never parse
-  prose. [Decision](../../../../../.agents/notes/implemented/feature/2026-10-27-quota-continue.md).
+- The terminal Claude quota-failure banner enables Session capacity recovery; it does
+  not create a Schedule. Existing reservations remain under the Schedule owner.
+  [Prior shortcut](../../../../../.agents/notes/implemented/feature/2026-10-27-quota-continue.md).

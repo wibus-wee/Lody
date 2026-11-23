@@ -13,7 +13,8 @@ export const IPC_INVOKE_SERVICE_GROUPS = [
   'sessionControl',
   'storageGuard',
   'terminal',
-  'updater'
+  'updater',
+  'workspaceBundle'
 ] as const
 
 const INVOKE_SERVICE_GROUP_VALUES = new Set<string>(IPC_INVOKE_SERVICE_GROUPS)
@@ -30,6 +31,8 @@ export function isIpcInvokeChannel(channel: string): boolean {
       'prepareMemberJoin',
       'memberJoinRequests',
       'approveMemberJoin',
+      'memberKeyDeliveries',
+      'retryMemberKeyDelivery',
       'rejectMemberJoin',
       'revokeMemberInvitation',
       'claimMemberJoin',
@@ -40,6 +43,13 @@ export function isIpcInvokeChannel(channel: string): boolean {
       'approvePersonalJoin',
       'claimPersonalJoin',
       'cancelPersonalJoin',
+      'requestAccountPairing',
+      'accountPairingRequest',
+      'cancelAccountPairing',
+      'accountPairingCode',
+      'inspectAccountPairing',
+      'approveAccountPairing',
+      'declineAccountPairing',
 
       'prepareLocalAgent',
       'admitLocalAgent',
@@ -52,6 +62,10 @@ export function isIpcInvokeChannel(channel: string): boolean {
       'prepareFeatureRpc',
       'acceptFeatureRpcResponse',
       'prepareDispatch',
+      'signScheduleDeclaration',
+      'irohReady',
+      'irohPath',
+      'irohCall',
       'inspectCachedState',
       'readMachineSharing',
       'updateMachineSharing',
@@ -59,6 +73,7 @@ export function isIpcInvokeChannel(channel: string): boolean {
       'contentStreamsToken',
       'removeMember',
       'setMemberRole',
+      'transferOwnership',
       'refresh',
       'prepareCreation',
       'recordCreated',
@@ -72,7 +87,43 @@ export function isIpcInvokeChannel(channel: string): boolean {
       'ledgerView',
       'managementState',
       'updateKeys',
-      'revokeDevice'
+      'revokeDevice',
+      'createRecoveryVault',
+      'saveRecoveryVaultFile',
+      'setRecoveryPassword',
+      'removeRecoveryPassword',
+      'inspectRecoveryFile',
+      'recoveryReplacementPlan',
+      'beginRecoveryReplacement',
+      'continueRecoveryReplacement',
+      'abandonRecoveryReplacement',
+      'recentAccountSecurityEvents',
+      'setupWorkspaceRecovery',
+      'setupRecoveryForWorkspaces',
+      'restoreFromRecoveryFile',
+      'recoveryPasskeyAvailable',
+      'addRecoveryPasskey',
+      'recoveryPasskeyDefaultLabel',
+      'listRecoveryPasskeys',
+      'removeRecoveryPasskey'
     ]).has(match![2]!)
   return group !== undefined && INVOKE_SERVICE_GROUP_VALUES.has(group)
+}
+
+// Mirrors `E2EE_CLIENT_LOSS_PROBE` in `@lody/shared/electron-ipc` (pinned by the
+// IPC registration test); this policy stays dependency-free for its Node loaders.
+export const CLIENT_LOSS_PROBE_POLICY = {
+  argument: '--lody-e2ee-client-loss-probe',
+  channels: ['e2ee.inspectClientLoss', 'e2ee.clientLossEffects']
+} as const
+
+/** E2E-only probe channels: admitted only when main passed its registration argument. */
+export function isClientLossProbeChannel(
+  channel: string,
+  argv: readonly string[] = process.argv
+): boolean {
+  return (
+    (CLIENT_LOSS_PROBE_POLICY.channels as readonly string[]).includes(channel) &&
+    argv.includes(CLIENT_LOSS_PROBE_POLICY.argument)
+  )
 }
