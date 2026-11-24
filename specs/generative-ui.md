@@ -51,9 +51,12 @@ theme already in place.
   props) is always in context, while full prop tables and worked examples live
   in per-family reference documents the model reads only for the component
   families it uses. The skill and references live in
-  `.agents/skills/genui/`; the same layering is intended for the runtime
-  prompt path (a `lody.*` describe mechanism or reference documents served to
-  the answering agent).
+  `apps/cli/src/mcp/skills/genui/` and reach agents through the Lody MCP
+  server's skills extension (`skill://genui/SKILL.md`). Delivery is static, not runtime-negotiated: the
+  catalog ships inside Lody's own prompt/skill documents, so the DSL the
+  model sees is versioned with the release that renders it — no per-request
+  injection, no prompt-cache breakage, no version skew between what the
+  model may emit and what the host accepts.
 
 ## Wire format
 
@@ -78,7 +81,10 @@ theme already in place.
   refused. Evaluation runs under a step and call-depth budget.
 - Event props are ordinary expressions evaluating to functions; host
   capabilities arrive under the `lody` namespace (e.g. `lody.copy(...)`), the
-  only bridge out of the surface.
+  only bridge out of the surface. The capability set is static: a fixed
+  manifest documented in the skill and bound by the same Lody release, never
+  negotiated per surface or per request — a call to an absent member
+  produces a diagnostic like any other catalog violation.
 
 ## Guarantees
 
@@ -102,14 +108,13 @@ theme already in place.
   there is no protocol for editing a committed tree.
 - A `Slider` primitive belongs in `@lody/ui`; the catalog currently uses a
   styled native range input.
-- Action protocol for `lody.*` capabilities (submit message, open file) and
-  how capabilities declare availability per surface.
-- The error feedback loop: surface diagnostics are visible to the user but
-  not yet reported back to the agent, so a rejected surface cannot currently
+- `lody.*` capabilities: the first manifest ships `sendPrompt(text)`, which
+  submits a user message on the conversation's ordinary send path
+  (queue/guide/dispatch routing, like the composer). Further members
+  (open file, copy) extend the same static manifest.
+- The error feedback loop: surface diagnostics are model-facing but not yet
+  reported back to the agent, so a rejected surface cannot currently
   trigger a describe-and-retry repair.
-- How the layered catalog reaches the answering agent's context at runtime
-  (index in the system prompt vs. a `lody.describe(tag)` capability), given
-  the same trade-off between token cost and discovery.
 
 ## Evidence
 
@@ -121,4 +126,5 @@ theme already in place.
   `markdown-renderer.tsx` `createMarkdownComponents`; tests in
   `remark-genui-inline.test.ts`.
 - Fence dispatch: `markdown-renderer.tsx` `MarkdownPre` (`genui` language).
-- Authoring contract: `.agents/skills/genui/` (index + per-family references).
+- Authoring contract: `apps/cli/src/mcp/skills/genui/` (index + per-family
+  references, served as the `genui` skill over Lody MCP).
