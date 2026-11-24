@@ -10,8 +10,9 @@ Use ordinary Markdown for prose, lists, and tables. Embed a static `icon` or
 catalog layouts, controls, and values that depend on state. Put every control
 and display that shares state in the same fence, even across several cards.
 
-Start the fence with any `{@state}` directives, followed by JSX-like markup.
-The surface renders once the fence closes.
+Start the fence with the `{@state}` directives, then write JSX-like markup.
+A fence mounts while it streams. Each element appears when its open tag
+closes, so declare state before any markup that reads it.
 
 ```genui
 {@state const [value, setValue] = useState(65)}
@@ -102,7 +103,8 @@ Props that matter per tag; full prop tables and per-family examples live in
 
 ## Validate before shipping
 
-A surface that fails to compile renders an error view in chat. When editing the
-runtime or catalog, the ground truth is `packages/genui` (parser + evaluator) and
-`packages/components/src/components/ai-gui/genui/` (catalog renderers); run
-`pnpm --filter @lody/genui test` to check a surface end-to-end.
+A surface that fails to compile degrades to its own fenced code block in chat —
+readers never see diagnostics, so write markup as if errors were invisible. When
+editing the runtime or catalog, the ground truth is `packages/genui` (parser +
+evaluator) and `packages/components/src/components/ai-gui/genui/` (catalog
+renderers); run `pnpm --filter @lody/genui test` to check a surface end-to-end.

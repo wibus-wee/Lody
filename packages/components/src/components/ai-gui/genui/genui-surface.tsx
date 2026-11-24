@@ -12,6 +12,7 @@ import stylex from '@stylexjs/stylex';
 import {
   callValue,
   compileSurface,
+  compileSurfacePartial,
   createSurface,
   evaluate,
   isInterpretedFunction,
@@ -152,11 +153,31 @@ export interface GenuiSurfaceProps {
   surfaceId?: string;
   /** Host capabilities exposed under the `lody` namespace. */
   capabilities?: Record<string, unknown>;
+  /**
+   * The fence is still being written: tolerate a truncated tail and mount
+   * elements as their open tags commit instead of waiting for the fence.
+   */
+  streaming?: boolean;
+  /**
+   * Rendered instead of the diagnostics panel when the surface cannot mount,
+   * e.g. the fenced code block it came from. When set, diagnostics never
+   * reach the reader: they describe the author's mistake, not content.
+   */
+  fallback?: ReactNode;
 }
 
-export function GenuiSurface({ code, surfaceId, capabilities }: GenuiSurfaceProps) {
+export function GenuiSurface({
+  code,
+  surfaceId,
+  capabilities,
+  streaming,
+  fallback,
+}: GenuiSurfaceProps) {
   const key = surfaceId ?? `code:${code}`;
-  const program = useMemo(() => compileSurface(code), [code]);
+  const program = useMemo(
+    () => (streaming ? compileSurfacePartial(code) : compileSurface(code)),
+    [code, streaming]
+  );
   const surface: Surface = useMemo(
     () => createSurface(key, program, { state: stateFor(key) }),
     [key, program]
@@ -180,12 +201,14 @@ export function GenuiSurface({ code, surfaceId, capabilities }: GenuiSurfaceProp
   };
   const body = renderUiNode(surface.program.view, ctx, 0);
   const diagnostics = [...surface.diagnostics, ...ctx.diagnostics, ...eventDiagnostics.current];
-  const fatal =
-    surface.program.view.kind === 'text' && (surface.program.view.parts?.length ?? 0) === 0;
+  const empty =
+    (surface.program.view.kind === 'text' && (surface.program.view.parts?.length ?? 0) === 0) ||
+    (surface.program.view.kind === 'element' && surface.program.view.children.length === 0);
+  const fatal = empty && !streaming;
   return (
     <div {...stylex.props(styles.surface)}>
-      {fatal ? <GenuiErrorView diagnostics={diagnostics} /> : body}
-      {!fatal && diagnostics.length > 0 ? (
+      {fatal ? (fallback ?? <GenuiErrorView diagnostics={diagnostics} />) : body}
+      {!fatal && fallback === undefined && diagnostics.length > 0 ? (
         <GenuiErrorView diagnostics={diagnostics.slice(0, 3)} />
       ) : null}
     </div>
