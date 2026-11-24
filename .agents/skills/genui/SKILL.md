@@ -10,26 +10,26 @@ Use ordinary Markdown for prose, lists, and tables. Embed a static `icon` or
 catalog layouts, controls, and values that depend on state. Put every control
 and display that shares state in the same fence, even across several cards.
 
+Use a `<card>` wrapper when the request calls for a card, with its
+`<column>` or `<row>` inside. Preserve requested state slot names, exact
+button labels, and specified display text.
+
 Start the fence with the `{@state}` directives, then write JSX-like markup.
 A fence mounts while it streams. Each element appears when its open tag
 closes, so declare state before any markup that reads it.
 
 ```genui
-{@state const [value, setValue] = useState(65)}
-{@state const [enabled, setEnabled] = useState(true)}
-
+{@state const [tickets, setTickets] = useState(0)}
 <card>
-  <row>
-    <heading level={3}>Progress</heading>
-    <badge tone={enabled ? 'running' : 'neutral'}>{enabled ? 'Enabled' : 'Paused'}</badge>
-  </row>
-  <slider value={value} min={0} max={100} disabled={!enabled} onChange={(n) => setValue(n)} />
-  <row>
-    <switch checked={enabled} onCheckedChange={(v) => setEnabled(v)} />
-    <text muted={!enabled}>Enable adjustment</text>
-    <spacer />
-    <button variant="secondary" size="small" onClick={() => setValue(65)}>Reset</button>
-  </row>
+  <column gap={8}>
+    <heading>Tickets</heading>
+    <text>{tickets}</text>
+    <badge>{`Reserved: ${tickets}`}</badge>
+    <button onClick={() => {
+      setTickets(prev => prev + 1);
+      setTickets(prev => prev + 1);
+    }}>Reserve two tickets</button>
+  </column>
 </card>
 ```
 
@@ -39,6 +39,8 @@ closes, so declare state before any markup that reads it.
   It must appear before the markup, never inside it. `x` is read in expressions;
   `setX(next)` or `setX((prev) => next)` writes it. Re-declared slots keep their
   committed value across revisions — `useState` is a *default*, not a reset.
+  Each functional setter reads the latest committed value, including writes
+  earlier in the same callback.
 - `{expr}` in markup is an *expression hole*: no `const`, `if`, or statements.
   Event props take JS callbacks: `onChange={(v) => setV(v)}`, `onClick={() => …}`.
 - The evaluator is confined: literals, arithmetic, ternaries, template strings,
@@ -46,7 +48,13 @@ closes, so declare state before any markup that reads it.
   state setters and `lody.*` capabilities. No `window`/`fetch`/`import`/globals.
 - Every tag must be in the catalog below — an unknown tag renders as an
   inline `<tag>` placeholder plus a diagnostic, never a crash.
-- Text between tags is literal; wrap dynamic text in `{...}` expressions.
+- Adjacent literal text is trimmed at expression boundaries. Put the full
+  label in one template literal to preserve spaces in `text` and `badge`.
+  For a standalone value, use just `<text>{value}</text>`.
+- A slider's `onChange` sends a number. Keep text input values and
+  `onValueChange` state as strings, and convert at the point of calculation
+  with `Number(value)`. Write array totals as
+  `items.reduce((sum, item) => sum + item, 0)`.
 
 ## Inline catalog tags (no fence)
 
