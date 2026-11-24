@@ -1,110 +1,61 @@
 ---
 name: genui
-description: Author `genui` fenced blocks — declarative, stateful, interactive UI inside chat answers — or inline catalog tags in ordinary markdown. Use when a reply benefits from controls (sliders, switches, selects, buttons) instead of static text. Read a reference file only for the component families you actually use.
+description: Author GenUI fences and inline Markdown icons and badges.
 ---
 
-# GenUI surface authoring
+# GenUI authoring
 
-Use ordinary Markdown for prose, lists, and tables. Embed a static `icon` or
-`badge` directly in that Markdown. Use a fenced `genui` block for cards, other
-catalog layouts, controls, and values that depend on state. Put every control
-and display that shares state in the same fence, even across several cards.
+Use Markdown for prose, lists, and tables. Use a `genui` fence for catalog
+layouts, controls, or dynamic values. Keep controls and displays sharing state
+in one fence, even across cards.
 
-Start the fence with the `{@state}` directives, then write JSX-like markup.
-A fence mounts while it streams. Each element appears when its open tag
-closes, so declare state before any markup that reads it.
+Declare state before the JSX-like markup with
+`{@state const [x, setX] = useState(init)}`. Read `x` in expressions. Write with
+`setX(value)` or `setX(prev => prev + 1)`. Slots keep committed values across
+revisions. While streaming, complete opening tags render and the unfinished
+tail stays hidden.
 
-```genui
-{@state const [value, setValue] = useState(65)}
-{@state const [enabled, setEnabled] = useState(true)}
+Use `prop="text"`, `prop={expr}`, or bare `prop` for true. Keep tags in markup.
+Use `{expr}` for text and prop values, including ternaries. For variable-length
+lists, join strings inside one `text` tag. Keep JSX, fragments, and statements
+out of expression holes. Arrow callback bodies can use statements.
 
-<card>
-  <row>
-    <heading level={3}>Progress</heading>
-    <badge tone={enabled ? 'running' : 'neutral'}>{enabled ? 'Enabled' : 'Paused'}</badge>
-  </row>
-  <slider value={value} min={0} max={100} disabled={!enabled} onChange={(n) => setValue(n)} />
-  <row>
-    <switch checked={enabled} onCheckedChange={(v) => setEnabled(v)} />
-    <text muted={!enabled}>Enable adjustment</text>
-    <spacer />
-    <button variant="secondary" size="small" onClick={() => setValue(65)}>Reset</button>
-  </row>
-</card>
-```
+## Inline Markdown
 
-## Rules that are enforced, not conventions
+`GENUI_INLINE_TAGS` allows `<icon name="info" />` and
+`<badge tone="warning">\*Pending\*</badge>` in prose, lists, and table cells.
+Write them directly, outside backticks. Use quoted literal props and plain-text
+badge labels. Escape visible Markdown punctuation. Braces in labels are literal.
+Use a fence for state, callbacks, nested markup, or dynamic labels and tones.
 
-- `{@state const [x, setX] = useState(<expr>)}` is the *only* way to declare state.
-  It must appear before the markup, never inside it. `x` is read in expressions;
-  `setX(next)` or `setX((prev) => next)` writes it. Re-declared slots keep their
-  committed value across revisions — `useState` is a *default*, not a reset.
-- `{expr}` in markup is an *expression hole*: no `const`, `if`, or statements.
-  Event props take JS callbacks: `onChange={(v) => setV(v)}`, `onClick={() => …}`.
-- The evaluator is confined: literals, arithmetic, ternaries, template strings,
-  arrow functions, array methods (`map/filter/find/reduce/sort/…`), calls into
-  state setters and `lody.*` capabilities. No `window`/`fetch`/`import`/globals.
-- Every tag must be in the catalog below — an unknown tag renders as an
-  inline `<tag>` placeholder plus a diagnostic, never a crash.
-- Text between tags is literal; wrap dynamic text in `{...}` expressions.
-
-## Inline catalog tags (no fence)
-
-Leaf, presentational tags also work inside ordinary markdown — sentences,
-table cells, list items — with literal props only:
-
-```markdown
-| 检查项    | #2620                                        |
-| --------- | -------------------------------------------- |
-| CLI tests | <icon name="x-circle" color="danger" /> 失败 |
-
-服务在线 <badge tone="success">running</badge>，一个仍在启动 <badge tone="warning">pending</badge>。
-```
-
-- Write a self-closing `<icon ... />` or a pair
-  `<badge tone="warning">Pending</badge>` directly in Markdown. Backticks show
-  the source as code.
-- Use quoted literal prop values and a plain-text badge label. Escape Markdown
-  punctuation that should be visible, for example
-  `<badge tone="warning">\*Pending\*</badge>` for the label `*Pending*`.
-  Markup inside the label prevents the badge pair from rendering.
-- Inline tags have no state or callbacks. Braces in a badge label are literal
-  characters. Use a fenced badge for a dynamic label or tone.
-- Inline `icon` takes quoted `name` and optional `color`
-  (danger/success/warning/accent). It renders at 14 px. Use a fenced icon with
-  `size={20}` for a custom size. The legacy `inline` prop has no effect.
+Icons take a kebab-case Lucide `name` and optional `color`
+(danger/success/warning/accent). Unknown names render nothing. Inline size is
+14 px. Use fenced `size={20}` for custom sizing. The `inline` prop is ignored.
 
 ## Catalog index
 
-Props that matter per tag; full prop tables and per-family examples live in
-`references/` — read a family file only when you use it.
+- `card` groups a section. `heading` takes `level` 1–6 (default 3).
+- `row` wraps and centers vertically. `column` stacks. Both take numeric `gap` in px.
+- `divider` is self-closing. `spacer` fills space with optional minimum `size` in px.
+- `text` takes boolean `muted`. Text trims at expression boundaries. Preserve
+  spaces with one template literal, e.g. ``<text>{`Current value: ${value}%`}</text>``.
+- `badge` takes `tone`: neutral (default), success, warning, danger, running.
+- `icon` takes the props above and, in a fence, numeric `size` in px.
+- `button`: `onClick={() => setX(init)}`, `variant`, `size`.
+- `input`: string `value`, `onValueChange={(v) => setX(v)}`, `placeholder`.
+- `checkbox` / `switch`: boolean `checked`, `onCheckedChange` (boolean).
+- `select`: string `value`, `onValueChange` (string or null), `placeholder`,
+  `items` (strings or `{value, label}` objects).
+- `slider`: numeric `value`, `onChange` (number), `min` (0), `max` (100), `step` (1).
 
-| Tag | Purpose | Key props |
-|---|---|---|
-| `card` | Grouped container | — |
-| `row` / `column` | Flex row / column | `gap` (px) |
-| `divider` | Horizontal rule | — |
-| `spacer` | Pushes siblings apart | `size` |
-| `text` | Body text | `muted` |
-| `heading` | h1–h6 | `level` (default 3) |
-| `badge` | Status pill | `tone`: neutral/success/warning/danger/running |
-| `icon` | Lucide icon | `name` (kebab-case), `size` |
-| `button` | Action | `onClick`, `variant`, `size`, `disabled` |
-| `input` | Text field | `value`, `onValueChange(v)`, `placeholder`, `disabled` |
-| `checkbox` / `switch` | Boolean toggle | `checked`, `onCheckedChange(v)`, `disabled` |
-| `select` | Dropdown | `items`, `value`, `onValueChange(v)`, `placeholder` |
-| `slider` | Numeric range | `value`, `min`, `max`, `step`, `disabled`, `onChange(n)` |
+Bind controls to state and call the setter with the event value. All controls
+accept boolean `disabled`. Button variants: secondary (default), primary,
+ghost, destructive, link. Sizes: medium (default), mini, small, large.
 
-## References (read on demand)
-
-- `references/expressions.md` — confined-JS subset, state semantics, `lody.*` capabilities, error shapes.
-- `references/layout-text.md` — card, row, column, divider, spacer, text, heading, badge, icon: props, examples, misuse patterns.
-- `references/controls.md` — button, input, checkbox, switch, select, slider: props, event contracts, worked examples.
+See [expressions](references/expressions.md) for advanced state, supported JS,
+capabilities, and diagnostics.
 
 ## Validate before shipping
 
-A surface that fails to compile degrades to its own fenced code block in chat —
-readers never see diagnostics, so write markup as if errors were invisible. When
-editing the runtime or catalog, the ground truth is `packages/genui` (parser +
-evaluator) and `packages/components/src/components/ai-gui/genui/` (catalog
-renderers); run `pnpm --filter @lody/genui test` to check a surface end-to-end.
+In chat, an unmountable surface falls back to its fenced code block.
+Diagnostics stay hidden from readers.
